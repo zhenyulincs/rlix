@@ -11,29 +11,31 @@ This repository is a multi-framework workspace for SchedRL design + integration 
 ## Project Structure & Module Organization
 
 - `design_doc/`: SchedRL design docs (protocols, adaptation plans).
-- `nemo-rl/`, `nemo-gym/`: NeMo-RL and environment components.
-- `ROLL/`: ROLL framework (Ray-based multi-role pipelines).
-- `verl/`: verl RL training library.
-- `rllm/`: rLLM agentic engine built on top of verl.
-- `miles/`: Miles RL framework + rollout engines.
+- `third_party/`: third-party repos as git submodules.
+- `third_party/nemo-rl/`, `third_party/nemo-gym/`: NeMo-RL and environment components.
+- `third_party/ROLL/`: ROLL framework (Ray-based multi-role pipelines).
+- `third_party/miles/`: Miles RL framework + rollout engines.
+- `third_party/SkyRL/`: SkyRL train/agent framework.
+- `third_party/sglang/`, `third_party/vllm/`: rollout engines.
 - Each framework has its own packaging (`pyproject.toml` / `setup.py`) and its own `tests/` folder.
+
+If a submodule folder is missing locally, run `git submodule update --init`.
 
 ## Build, Test, and Development Commands
 
 Run commands from the relevant subproject root:
 
-- NeMo-RL (uses `uv`): `cd nemo-rl && uv sync` and `uv run --group test pytest -q`.
-- ROLL: `cd ROLL && make test` (pytest) and `make precommit`.
-- verl: `cd verl && pytest -q` (see `verl/tests/README.md` for CPU/GPU suites).
-- rLLM: `cd rllm && pytest -q`.
-- Miles: `cd miles && pytest -q` (or follow `miles/docs/` and examples).
+- ROLL: `cd third_party/ROLL && make test` (pytest) and `make precommit`.
+- NeMo-RL (uses `uv`): `cd third_party/nemo-rl && uv sync` and `uv run --group test pytest -q`.
+- Miles: `cd third_party/miles && pytest -q` (or follow `third_party/miles/docs/` and examples).
+- SkyRL: `cd third_party/SkyRL &&` follow `third_party/SkyRL/README.md` and `third_party/SkyRL/skyrl-train/` examples.
 
 ## Coding Style & Naming Conventions
 
 - Python: 4-space indentation; prefer explicit names over abbreviations.
 - Follow the tooling and conventions of the subproject you’re changing:
-  - `nemo-rl/`: `ruff` + `black` configured in `nemo-rl/pyproject.toml` (run via `uv`).
-  - `ROLL/`: `pre-commit` hooks (`make precommit`).
+  - `third_party/nemo-rl/`: `ruff` + `black` configured in `third_party/nemo-rl/pyproject.toml` (run via `uv`).
+  - `third_party/ROLL/`: `pre-commit` hooks (`make precommit`).
 - Keep edits scoped: avoid reformatting unrelated files.
 
 ## Testing Guidelines
@@ -44,4 +46,5 @@ Run commands from the relevant subproject root:
 ## Commit & Pull Request Guidelines
 
 - Commit history here uses short, imperative summaries (e.g., `readme`); keep subjects concise.
-- PRs should include: what changed, why, and which framework(s) it impacts. For protocol changes, update `design_doc/multi-pipeline-adaptation-plan.md` and keep `design_doc/multi-pipeline_roll_design.md` as the reference sequence.
+- PRs should include: what changed, why, and which framework(s) it impacts.
+- For protocol changes, update `design_doc/multi-pipeline-adaptation-plan_clean.md` and keep `design_doc/multi-pipeline_roll_old_design.md` as the reference sequence.
