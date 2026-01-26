@@ -4,6 +4,50 @@
 NeMo-RL is the Phase 2 target, serving as the "Structural Pilot" for SchedRL. It provides a clean, rigid abstraction (`RayWorkerGroup`) that must be extended to support subset execution, a foundational pattern for the scheduler.
 We keep the core training loop intact and introduce a **proxy layer** to intercept framework-specific operations (e.g., rollout/generation controllers). The pipeline coordinator calls the central scheduler **directly**; the proxy is unidirectional (wrapper only) and emits release ACKs.
 
+## 1.2 Simple async + multi-turn example (planned)
+
+NeMo-RL supports async GRPO and it already has a multi-turn environment example. But the repo does not yet have a ready “async + multi-turn” example that we can run as-is.
+
+- Best multi-turn task to start from: sliding puzzle
+  - Script: `nemo-rl/examples/run_grpo_sliding_puzzle.py`
+  - Config: `nemo-rl/examples/configs/grpo_sliding_puzzle.yaml` (already multi-turn; `max_rollout_turns` is set)
+- Best async reference to reuse:
+  - Guide: `nemo-rl/docs/guides/async-grpo.md`
+  - Core logic: `nemo-rl/nemo_rl/algorithms/async_utils.py` already runs multi-turn async rollout (`run_async_multi_turn_rollout`)
+
+Planned work (doc-level):
+- Add one new “async sliding puzzle” config and/or run script that turns on:
+  - async GRPO mode, and
+  - async vLLM engine (if needed for the run).
+- Use it as the NeMo-RL main reference “async + multi-turn” example for SchedRL.
+
+Rough estimate: 2–5 days (add config/script + debug runtime issues).
+
+## 1.3 Phase 2 (Mini-SWE): async agent + tools
+
+Goal: add a **Mini-SWE** training example for NeMo-RL that is:
+- multi-turn,
+- uses real tools (shell / git patch),
+- and runs under NeMo-RL async training.
+
+What we can reuse in this workspace:
+- Mini-SWE agent server code exists in NeMo-Gym:
+  - `nemo-gym/responses_api_agents/mini_swe_agent/`
+- Mini-SWE resource configs exist:
+  - `nemo-gym/resources_servers/mini_swe_agent/`
+
+Planned work (doc-level first, then code):
+- Define a NeMo-RL rollout “task” that uses the Mini-SWE agent server as the environment/tool runner.
+- Start with one-step-off style overlap (generate batch N+1 while training batch N) using existing async GRPO plumbing.
+- Add clear “safe stop” points for shrink/time-share:
+  - stop new starts,
+  - wait for in-flight tool loops to finish,
+  - then sleep/offload a DP subset.
+
+Safety rules (important for tools):
+- Do not allow mid-tool abort as the default for Mini-SWE.
+- If we need mid-flight shrink later, add idempotency keys for tool actions and teach the tool server to dedupe.
+
 ## 1.1 Protocol Fit (Against `multi-pipeline-adaptation-plan_clean.md`)
 
 This section reality-checks NeMo-RL against the shared protocol in `design_doc/multi-pipeline-adaptation-plan_clean.md` and lists concrete gaps.

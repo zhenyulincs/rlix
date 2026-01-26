@@ -13,7 +13,7 @@ source_docs:
 
 # SchedRL: Multi-Pipeline Adaptation Plan (Clean Structure)
 
-This is the canonical shared protocol for multi-pipeline GPU sharing across
+This is the main shared protocol for multi-pipeline GPU sharing across
 **NeMo-RL**, **ROLL**, **Miles**, and **SkyRL-train**.
 
 For concrete per-framework code entrypoints and limitations, see:
@@ -21,6 +21,19 @@ For concrete per-framework code entrypoints and limitations, see:
 - `design_doc/adaptation_roll.md`
 - `design_doc/adaptation_miles.md`
 - `design_doc/adaptation_skyrl.md`
+
+Main reference async + multi-turn examples (one per framework):
+- ROLL: `ROLL/examples/qwen3_agentic_gem/gem_math_dapo.yaml` (MathEnv; already exists)
+- NeMo-RL: sliding puzzle async example (planned; see `design_doc/adaptation_nemo_rl.md`)
+- Miles: Retool async example (planned; see `design_doc/adaptation_miles.md`)
+- SkyRL-train: GSM8K multi-turn + async trainers (supported; see `design_doc/adaptation_skyrl.md`)
+
+Phase 2 (complex agent tasks) examples:
+- ROLL: **WebShop** (planned as the Phase 2 agent task in ROLL; see `design_doc/adaptation_roll.md`)
+- NeMo-RL: **Mini-SWE** (planned; reuse NeMo-Gym Mini-SWE agent server; see `design_doc/adaptation_nemo_rl.md`)
+- Miles: **Mini-SWE** (planned; upgrade `miles/examples/experimental/swe-agent/` to `train_async.py`; see `design_doc/adaptation_miles.md`)
+- SkyRL-train: **Mini-SWE** (planned; add async entrypoints for `SkyRL/skyrl-train/examples/mini_swe_agent/`; see `design_doc/adaptation_skyrl.md`)
+  - Safety note for Phase 2 tool loops: for shrink/time-sharing, default to “stop new starts + wait for drain”. Do not assume mid-tool abort is safe.
 
 Reference (ROLL-specific sequence/design inspiration):
 - `design_doc/multi-pipeline_roll_old_design.md`
@@ -77,11 +90,12 @@ SchedRL unifies cross-framework behavior using two orthogonal knobs:
   - On retry after abort ACK, increment `attempt` so each attempt has a unique backend request id.
   - Error retry limit (safety): cap **engine error retries** per `(trajectory_id, turn_id)` (default: 3, configurable). If exceeded, drop the trajectory and report a metric.
     - Do **not** cap “preemption retries” (abort due to shrink/expand rebalance). Preemption retries are part of time-sharing.
+    - Phase 1 guard: if a turn is preempted “too many” times (high threshold), crash the pipeline (fail fast and loudly). Backlog: replace crash with “wait for drain”.
 - Abort confirmation is required: when a worker is preempted and in-flight work must be retried elsewhere, the adapter must not reissue the same request/turn until the
   original request has returned an explicit abort outcome (or equivalent “request is stopped” confirmation from the backend). HTTP 200 from an abort endpoint alone is not sufficient.
   - Adapters may send abort commands in batch (where supported) and then wait for abort outcomes/ACKs collectively before reissuing retries on the remaining active workers.
   - For vLLM/SGLang, ACK means: the request finishes with `finish_reason/stop_reason == "abort"`.
-  - Timeout rule: if ACK does not arrive in time, fail loudly and do not continue shrink/expand (do not offload/stop a worker that may still be running work).
+  - Timeout rule: if ACK does not arrive in time, **crash the pipeline** (fail fast and loudly) and do not continue shrink/expand (do not offload/stop a worker that may still be running work).
 
 **C) Expand rebalance policy (`expand_rebalance_policy`)**
 - Expand does not require migration for correctness (new workers can just take new work after syncing weights).
@@ -121,7 +135,7 @@ These are the chosen design decisions for the protocol:
 - Decision: ACK means the request finishes with `finish_reason/stop_reason == "abort"`.
 
 3) What if abort ACK does not arrive before timeout?
-- Decision: **fail shrink/expand** and do not offload/stop that worker. Treat it as a worker failure case, not a normal shrink case.
+- Decision: **crash the pipeline** (fail fast and loudly). Do not offload/stop that worker. Treat it as unsafe to proceed.
 
 4) What is `load[dp]` for the 5% rule?
 - Decision: `load[dp] = queued_trajectories_by_worker[dp] + inflight_trajectories_by_worker[dp]` (trajectory counts).
@@ -130,12 +144,27 @@ These are the chosen design decisions for the protocol:
 - Decision: balance across all active dp workers and stop when the gap is within 5%.
 
 6) Retry limit policy
-- Decision: cap **engine error retries** per `(trajectory_id, turn_id)` (default max error retries: 3, configurable). Do not cap preemption retries.
+- Decision: cap **engine error retries** per `(trajectory_id, turn_id)` (default max error retries: 3, configurable).
+- Decision: do not cap preemption retries (abort due to shrink/expand rebalance), but add a high “too many preempts” threshold to fail loudly (Phase 1).
 
-Backlog (safety improvement):
-- Track how many times a turn has been preempted (aborted due to shrink/expand rebalance). If a turn is preempted “too many” times, stop aborting it and wait for it to finish.
-  - Expand rebalance: do not abort that turn again; let it finish.
-  - Shrink: delay `offload/flush`: stop sending new work to the shrinking worker(s), wait for that turn to finish, then offload/flush and release GPUs.
+7) Preempted too many times (Phase 1 vs backlog)
+- Phase 1 decision: if a turn is preempted “too many” times (high threshold, configurable), **crash the pipeline** (fail fast and loudly). This makes the bug visible.
+- Backlog: add a “wait for drain” fallback:
+  - Expand rebalance: stop aborting that turn; let it finish.
+  - Shrink: stop sending new work to the shrinking worker(s), wait for that turn to finish, then offload/flush and release GPUs.
+
+8) `report_progress(...)` units
+- Decision: `report_progress` must use **trajectory counts**. The pipeline coordinator converts internal units (groups/prompt-groups) into trajectories before reporting.
+
+9) “Superseded activation requests” (v2 then v3)
+- Decision: coordinator chooses the version; scheduler only chooses timing.
+- Decision: require an `activation_epoch` in activation/sync requests. Scheduler must skip any older request when a newer epoch exists (“newest wins”).
+
+10) Subset lifecycle changes (Phase 1 style)
+- Decision: use the smallest code change that works: add optional `worker_indices` / `indices` arguments to existing APIs.
+
+11) Placement changes (Phase 1 style)
+- Decision: fixed placement is enough for Phase 1. We do not require “resize Ray placement groups at runtime”.
 
 ## 3) Protocol (Shared)
 
@@ -167,7 +196,7 @@ SchedRL standardizes progress reporting across frameworks so the scheduler can m
 
 **Units**
 - All progress counters are in **trajectory units** (not turn/request units).
-- Many frameworks internally use “groups” (one group contains multiple trajectories). Adapters must convert group counts into trajectory counts before reporting.
+- Many frameworks internally use “groups” (one group contains multiple trajectories). The pipeline coordinator converts group counts into trajectory counts before calling `report_progress(...)` (or the adapter can do it if the coordinator cannot).
 
 **Reported counts**
 - `queued_trajectories`: trajectories that are queued but not started.
@@ -241,7 +270,7 @@ Correctness invariant:
   - Before starting an expensive sync/activate for version `v`, re-check that `v` is still the currently requested active version; if not, skip `v`.
   - If a sync for `v` is already running and a newer activation arrives, best-effort cancel; if cancellation is not supported, allow it to finish but treat its result
     as stale (do not reopen admission / do not mark cutover complete for `v`).
-- Recommendation: include an `activation_epoch`/`request_id` in `request_checkpoint_activation(...)` so the scheduler can ignore stale completions safely.
+- Required: include an `activation_epoch` in `request_checkpoint_activation(...)` so the scheduler can ignore stale completions safely.
 
 Trainer cache retention (minimum):
 - Keep `{active_checkpoint_version, latest_checkpoint_version}` in the trainer CPU checkpoint cache:
@@ -256,7 +285,11 @@ Trainer cache retention (minimum):
 - Use one of:
   - **Pin/lease/refcount**: scheduler pins `active_checkpoint_version` (and any in-flight activation target) until it ACKs completion; trainer cache only GC’s
     unpinned versions.
-  - **Grace policy**: keep `{active, previous}` (and optionally `{latest}`) with `keep_last_N>=2` and/or TTL, so fast active transitions do not break late pulls.
+  - **Strict delete (default)**:
+    - Keep `{active_checkpoint_version, latest_checkpoint_version}`.
+    - Also keep any version that is currently being synced (an in-flight sync task).
+    - Delete older versions immediately once they are not `{active, latest}` and not in-flight.
+    - Special case: “previous” is not kept by TTL. It is kept only if it is still being synced.
 
 ### 3.4 Elastic Rollout Workers (Shrink/Expand + Sync)
 
@@ -323,7 +356,7 @@ and (4) version tagging rules when overlap is allowed.
 | **On-policy (sync)** | Rollout then train; no overlap | `QUIESCE` or `BATCH` | No | Yes (shrink/expand during rollout) | Trivial activation; resize uses `REQUEST_RETRY` (cancel+retry). If there is no in-flight work, the migration path is a no-op. |
 | **Pipelined batch overlap (one/two-step-off)** | Train step N overlaps rollout for step N+1 | `BATCH` | No | Yes | Activation at batch boundary; requires tagging if training consumes mixed versions. |
 | **Buffered async generation (bounded staleness)** | Rollout continues while training consumes from buffer | `QUIESCE` (typical) | No | Yes | Activation requires drain/abort boundary; strict “no admission with stale weights”. |
-| **Fully async queue (unbounded/implicit staleness)** | Rollout tasks decoupled from train loop | `QUIESCE` (default) or framework-specific | No | Yes | Requires explicit admission control + version tagging; retry granularity may be task/trajectory. |
+| **Always-on background rollout worker** | Background worker keeps producing rollouts; training drains | N/A | No | Hard | Not supported for SchedRL adaptation (example: Miles `miles/examples/fully_async`). Hard to time-share GPUs because there is no clean scheduler-controlled “stop point” and shrink timing becomes unpredictable. |
 | **In-flight update (no stop)** | Update active rollout workers in-place | `INFLIGHT` | No | Yes (but merged with activation) | Scheduler may sync existing `S` without resize; merge with shrink decisions to avoid syncing preempted workers. |
 | **Time-sharing resize (weights unchanged)** | Scheduler shrinks/expands `S` mid-rollout | N/A (activation unchanged) | Yes | Yes | Uses `migration_policy` on shrink; expand pulls `active` checkpoint if weights were offloaded. |
 
@@ -333,8 +366,8 @@ and (4) version tagging rules when overlap is allowed.
 |---|---|---|
 | **NeMo-RL** | `QUIESCE` + `INFLIGHT` activation; resize time-sharing | Subset lifecycle + admission gating wiring (see `design_doc/adaptation_nemo_rl.md`); version tagging already exists as `(generation_weight_version, target_weight_version)` and should map to `generation_checkpoint_version` / `active_checkpoint_version`. |
 | **ROLL (Agentic)** | `QUIESCE` activation; abort+retry at turn boundary | Subset start/stop + routing remap (clear sticky mappings) so aborted turns retry on remaining/new DP ranks (see `design_doc/adaptation_roll.md`). |
-| **Miles** | `BATCH` activation | Subset targeting (`indices=...`) for `RolloutManager.onload/offload`; implement `REQUEST_RETRY` by aborting subset engines and re-queueing prompt/groups to the global data source (see `design_doc/adaptation_miles.md`). |
-| **SkyRL-train** | `BATCH` (one-step-off) and fully-async with staleness control | Use existing SkyRL-train async entrypoints first (`SkyRL/skyrl-train/examples/async`, `SkyRL/skyrl-train/examples/fully_async`), then add subset lifecycle if/when SchedRL needs live shrink/expand (see `design_doc/adaptation_skyrl.md`). |
+| **Miles** | `BATCH` activation and step-based async (`train_async.py`) | Support `train.py` (sync) and `train_async.py` (one-step-ahead overlap) plus sync-by-interval (`update_weights_interval`). Do not use `miles/examples/fully_async`. Subset targeting (`indices=...`) for `RolloutManager.onload/offload`; implement `REQUEST_RETRY` by aborting subset engines and re-queueing work to the global data source (see `design_doc/adaptation_miles.md`). |
+| **SkyRL-train** | `BATCH` (one-step-off) and fully-async with staleness control (**GSM8K multi-turn only**) | Use existing SkyRL-train async entrypoints first (`SkyRL/skyrl-train/examples/async`, `SkyRL/skyrl-train/examples/fully_async`), then add subset lifecycle if/when SchedRL needs live shrink/expand (see `design_doc/adaptation_skyrl.md`). |
 
 ### 4.3 Doc vs Code Status (Reality Check)
 
@@ -346,7 +379,7 @@ Legend: `present` / `partial` / `missing`.
 |---|---|---|---|---|---|---|---|---|
 | **ROLL** | `missing` (only cluster `start_server/stop_server`) — `ROLL/roll/pipeline/agentic/agentic_pipeline.py`, `ROLL/roll/distributed/strategy/vllm_strategy.py` | `partial` (abort+retry exists, but not subset-targeted) — abort is global `RequestScheduler.abort_request` (`ROLL/roll/distributed/scheduler/generate_scheduler.py`); retry-on-abort exists in env loop (`ROLL/roll/pipeline/agentic/env_manager/traj_env_manager.py`) | `missing` (no explicit “rebalance queued” mechanism; would require routing/mapping refresh) — sticky mapping is `src_rank2_dp_rank` (`ROLL/roll/distributed/scheduler/generate_scheduler.py`) | `missing` (no `active_dp_ranks` gate in scheduler) — `ROLL/roll/distributed/scheduler/generate_scheduler.py` | `missing` (no `model_update(worker_indices=...)`) — `ROLL/roll/distributed/executor/model_update_group.py` | `missing` (only local progress bar today) — `ROLL/roll/distributed/scheduler/rollout_scheduler.py` | `missing` in code (protocol-only guidance today) — `design_doc/multi-pipeline-adaptation-plan_clean.md` | `missing` (no subset preempt/resume/selective-sync integration tests found) |
 | **NeMo-RL** | `missing` (no subset worker-group helper) — `nemo-rl/nemo_rl/distributed/worker_groups.py` | `missing` (no abort API + no retry queue; failures are logged/dropped) — `_run_prompt_group_worker` catches exceptions (`nemo-rl/nemo_rl/algorithms/async_utils.py`) | `partial` (round-robin DP leader exists; no explicit “queued rebalance” knob) — `nemo-rl/nemo_rl/models/generation/vllm/vllm_generation.py` | `present` for “stop new starts” at refit boundary — `_refit_pause_cleared` (`nemo-rl/nemo_rl/algorithms/async_utils.py`) | `partial` (in-flight weight update mode exists at refit boundary; subset-scoped selective sync is not implemented) — `nemo-rl/nemo_rl/algorithms/async_utils.py` | `missing` (no `report_progress` in code) | `missing` in code (protocol-only guidance today) | `missing` (no subset shrink/expand integration tests found) |
-| **Miles** | `missing` (cluster-wide `onload/offload`) — `miles/miles/ray/rollout.py` | `partial` (abort primitive exists; requeue-on-abort exists in fully-async example, but not a universal policy) — abort all workers in `miles/miles/rollout/sglang_rollout.py`; requeue aborted group example `miles/examples/fully_async/fully_async_rollout.py` | `partial` (global data buffer exists; but no explicit scheduler-driven rebalance API) — `miles/miles/rollout/data_source.py` | `missing` in router API (MilesRouter has no `/remove_worker`; but engine shutdown calls it under `use_miles_router`) — `miles/miles/router/router.py`, `miles/miles/backends/sglang_utils/sglang_engine.py` | `partial` (weight_version supported in engine update calls; no centralized CPU cache ownership/bucket staging defined in code) — `miles/miles/backends/sglang_utils/sglang_engine.py` | `missing` (no `report_progress` in code) | `missing` in code (protocol-only guidance today) | `missing` (no tests for shared-router offload / retry scenarios found) |
+| **Miles** | `missing` (cluster-wide `onload/offload`) — `miles/miles/ray/rollout.py` | `partial` (abort primitive exists; SchedRL needs subset-targeted abort + retry wiring in the main rollout loop, not only in examples) — abort helper in `miles/miles/rollout/sglang_rollout.py` | `partial` (global data buffer exists; but no explicit scheduler-driven rebalance API) — `miles/miles/rollout/data_source.py` | `missing` in router API (MilesRouter has no `/remove_worker`; but engine shutdown calls it under `use_miles_router`) — `miles/miles/router/router.py`, `miles/miles/backends/sglang_utils/sglang_engine.py` | `partial` (weight_version supported in engine update calls; no centralized CPU cache ownership/bucket staging defined in code) — `miles/miles/backends/sglang_utils/sglang_engine.py` | `missing` (no `report_progress` in code) | `missing` in code (protocol-only guidance today) | `missing` (no tests for shared-router offload / retry scenarios found) |
 | **SkyRL-train** | `present` (configured by `generator.num_inference_engines`; no live subset API) — `SkyRL/skyrl-train/skyrl_train/config/ppo_base_config.yaml` | `partial` (abort/pause exists; subset-targeted shrink/expand is not designed yet) — `SkyRL/skyrl-train/skyrl_train/inference_engines/inference_engine_client.py` | `partial` (routing exists; scheduler-driven “rebalance queued” hook not present) — `SkyRL/skyrl-train/skyrl_train/inference_engines/utils.py` | `present` (pause blocks new submissions; used for in-flight sync) — `SkyRL/skyrl-train/skyrl_train/inference_engines/inference_engine_client.py` | `present` (weight sync infra exists; backend supports nccl/cuda_ipc strategies) — `SkyRL/skyrl-train/skyrl_train/weight_sync/` | `missing` (no SchedRL `report_progress` emission) | `missing` (SchedRL activation epoch + trainer cache GC are protocol-level) | `missing` (no SchedRL integration tests) |
 
 ### 4.4 Progress Mapping (Per-framework)

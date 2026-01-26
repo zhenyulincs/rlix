@@ -4,6 +4,47 @@
 Miles is the Phase 4 target. Being a specialized prototype for SWE-Agent workloads, it already enforces explicit `onload`/`offload` patterns, making it the easiest integration candidate structurally, though it serves a narrower use case.
 We keep the core training loop intact and introduce a **proxy layer** to intercept framework-specific operations. The pipeline coordinator calls the central scheduler **directly**; the proxy is unidirectional (wrapper only) and emits release ACKs.
 
+## 1.2 Simple async + multi-turn example (planned): Retool
+
+Miles has:
+- multi-turn agent loops (examples), and
+- an async training loop (`train_async.py`),
+but they are not combined into one simple example today.
+
+We will make one main reference “async + multi-turn” example based on Retool because it is usually the easiest multi-turn example (no extra services).
+
+- Multi-turn Retool example: `miles/examples/retool/generate_with_retool.py`
+- Async training loop to reuse: `miles/train_async.py`
+
+Planned work (doc-level):
+- Add one entrypoint/config that runs Retool multi-turn rollouts under the async loop.
+- Keep it simple (no tool server). Use vLLM or SGLang as the rollout engine.
+
+Rough estimate: 3–7 days (wire multi-turn generator into async loop + debug).
+
+## 1.3 Phase 2 (Mini-SWE): async agent + tools
+
+Goal: make the existing Mini-SWE tool-loop work in Miles run with the Miles async training loop.
+
+What exists today:
+- Tool-loop training example: `miles/examples/experimental/swe-agent/`
+  - It uses a Mini-SWE agent server (via NeMo-Gym) and runs `train.py` today.
+
+Phase 2 plan:
+- Add an async variant of this example:
+  - start from the same configs and custom rollout functions, but switch the driver to `train_async.py`.
+- Keep the scheduler rules simple for safety:
+  - stop new starts,
+  - wait for in-flight tool loops to finish,
+  - then offload/shrink engines.
+
+Why we are conservative:
+- Tool loops have real side effects (shell commands inside a sandbox).
+- If we abort and retry at the wrong time, we can run the same tool action twice.
+
+Backlog (safer later):
+- Add idempotency keys for tool actions and a resume story (so retry does not repeat side effects).
+
 ## 1.1 Protocol Fit (Against `multi-pipeline-adaptation-plan_clean.md`)
 
 This section reality-checks Miles against the shared protocol in `design_doc/multi-pipeline-adaptation-plan_clean.md`.
@@ -33,7 +74,9 @@ This section reality-checks Miles against the shared protocol in `design_doc/mul
   - This is feasible because Miles already has:
     - a global data source buffer (`RolloutDataSourceWithBuffer`),
     - a per-worker abort endpoint (`/abort_request` supports `rid` in SGLang), and
-    - an async generation loop that already handles aborted samples (e.g., `examples/fully_async/fully_async_rollout.py` returns aborted groups to the buffer).
+    - a step-based training loop (`train.py` / `train_async.py`) that can be extended to re-enqueue aborted work back into that global data source.
+  - Not supported (for SchedRL adaptation): the “persistent background worker” rollout mode in `miles/examples/fully_async`.
+    - Reason: it is not driven by the training loop, and it does not provide a clean scheduler-controlled stop point for GPU time-sharing shrink.
   - **Required extension (hard requirement)**: coordinator-generated deterministic request id.
     - The coordinator must set SGLang `rid = f"{trajectory_id}:{turn_id}:{attempt}"` for every turn request.
     - This requires a stable `trajectory_id` (same across retries) and a stable `turn_id` within that trajectory.
@@ -58,6 +101,7 @@ This section reality-checks Miles against the shared protocol in `design_doc/mul
   - The multi-turn reference implementations treat `finish_reason=abort` as terminal and return `Sample.Status.ABORTED` immediately (e.g. `miles/examples/geo3k_vlm_multi_turn/rollout.py`, `miles/examples/retool/generate_with_retool.py`, `miles/examples/search-r1/generate_with_search.py`, `miles/examples/tau-bench/trainable_agents.py`).
   - There is no generic “pause / update / resume the same trajectory” mechanism in these examples. If a model update happens mid-trajectory and triggers abort, the trajectory is dropped (or retried from scratch by higher-level logic).
   - `partial_rollout`-style continuation is not available when using the Miles router today (`miles/miles/router/middleware_hub/radix_tree_middleware.py` asserts `not args.partial_rollout`), so “resume after abort” is not a baseline capability.
+  - For SchedRL time-sharing shrink/expand, we only require turn-level abort+retry. We do not need a full multi-turn “resume from inside a turn” feature.
 
 **Concrete file refs & immediate actions**
 - Files: `miles/miles/ray/rollout.py`, `miles/miles/backends/sglang_utils/sglang_engine.py`, `miles/miles/rollout/sglang_rollout.py`.

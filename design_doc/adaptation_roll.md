@@ -5,6 +5,43 @@ ROLL is the Phase 1 target for SchedRL adaptation. This phase is **explicitly sc
 This adaptation assumes **no Ray-level GPU reclaim** (placement groups are fixed). GPU sharing relies on **offload/load of training and inference states**, while SchedRL gates execution and still needs **subset-level DP worker activation** to improve scheduling efficiency.
 We keep the core training loop intact and introduce a **proxy layer** to intercept framework-specific operations (e.g., `RolloutScheduler`, `RequestScheduler`). The pipeline coordinator calls the central scheduler **directly**; the proxy is unidirectional (wrapper only).
 
+## 1.2 Simple async + multi-turn example (already exists): MathEnv
+
+We will keep one “simple async + multi-turn” example in ROLL as the main reference for SchedRL integration.
+We use **MathEnv** (multi-turn reasoning), not FrozenLake.
+
+- Best starting point: `ROLL/examples/qwen3_agentic_gem/gem_math_dapo.yaml`
+- Where MathEnv is implemented:
+  - `ROLL/roll/pipeline/agentic/env/gem/math_env.py`
+- Why it is a good reference:
+  - It is **multi-turn** (agentic env loop).
+  - It is **async** (uses `async_generation_ratio` in ROLL configs).
+  - It already exercises the key behavior we need: turn-level retry on abort, without restarting the whole trajectory.
+- Work to make it a “main reference” for adaptation:
+  - Add a short doc pointer in this file (done here).
+  - Add a small “how to run” note or wrapper script (future doc task).
+  - Run it once as a sanity check after SchedRL hooks are added (future validation task).
+
+## 1.3 Phase 2 (WebShop): async agent task in ROLL
+
+Goal: for Phase 2, use **WebShop** as the “complex agent task” in ROLL (instead of SWE/Mini-SWE).
+
+Why WebShop:
+- It already exists in ROLL as an agentic environment.
+- It is multi-turn and closer to “real agent behavior” than FrozenLake/MathEnv.
+- We can still run it under ROLL async training (`async_generation_ratio`).
+
+Where to start:
+- Example configs in this repo:
+  - `ROLL/examples/qwen2.5-0.5B-agentic/agentic_val_webshop.yaml`
+  - `ROLL/examples/qwen2.5-7B-agentic_megatron/agentic_val_webshop.yaml`
+
+Async training mode in ROLL:
+- Use `async_generation_ratio > 0` to overlap rollout and training.
+
+SchedRL safety note:
+- WebShop can include stateful actions. For time-sharing shrink, prefer “stop new starts + wait for drain” as the safe fallback.
+
 ## 1.1 Protocol Fit (Against `multi-pipeline-adaptation-plan_clean.md`)
 
 This section reality-checks ROLL (Agentic pipeline) against the shared protocol in `design_doc/multi-pipeline-adaptation-plan_clean.md`.

@@ -12,6 +12,37 @@ This plan focuses on integrating **SkyRL-train** into SchedRL as a supported fra
 SkyAgent integration (agentic multi-turn, e.g., SWE + OpenHands) is **currently on-policy only** in this repo.
 Async SkyAgent (SWE + OpenHands) is noted as **future work**.
 
+## 1.1 What we will support as async multi-turn examples (scoped)
+
+To keep the first SchedRL integration simple, we only target **GSM8K multi-turn** as the “async + multi-turn” reference for SkyRL-train:
+- Multi-turn task: `SkyRL/skyrl-train/examples/turn_level_rewards/` (env: `gsm8k_multi_turn`)
+- Async trainers:
+  - One-step-off (recommended): `SkyRL/skyrl-train/examples/async/async_trainer.py`
+  - Fully-async bounded-staleness (supported): `SkyRL/skyrl-train/skyrl_train/fully_async_trainer.py`
+
+We do **not** target Mini-SWE-Agent / Terminal-Bench as async examples yet, because those are long tool loops and need extra “resume on abort” handling to be reliable.
+
+## 1.2 Phase 2 (Mini-SWE): async agent + tools
+
+Goal: add a **Mini-SWE** example that runs with async training.
+
+Where Mini-SWE already exists in this workspace:
+- SkyRL-train Mini-SWE training example (sync today): `SkyRL/skyrl-train/examples/mini_swe_agent/`
+
+Phase 2 plan (Mini-SWE in SkyRL-train):
+- One-step-off async:
+  - Create a new entrypoint that mirrors `SkyRL/skyrl-train/examples/async/main_async.py`,
+    but uses `MiniSweAgentGenerator` from `SkyRL/skyrl-train/examples/mini_swe_agent/mini_swe_generator.py`.
+- Fully-async bounded-staleness:
+  - Create a new entrypoint that mirrors `SkyRL/skyrl-train/examples/fully_async/main_fully_async.py`.
+  - Keep the “fully-async constraints” in mind:
+    - `generator.batched=false` is required in SkyRL-train fully-async.
+    - vLLM-only for abort/pause in the current SkyRL-train code.
+
+Safety rules (important for tools):
+- For Phase 2, prefer “stop new starts + wait for drain” when shrinking GPUs.
+- Backlog: add idempotency keys for tool actions so retries cannot apply the same tool action twice.
+
 ## 2) What SkyRL-train already provides
 
 ### 2.1 One-step-off async (pipelined)
@@ -107,6 +138,10 @@ For now, treat SkyRL-train as a supported pipeline by using its existing example
 - Fully-async: run `SkyRL/skyrl-train/examples/fully_async/main_fully_async.py`
 
 This provides the async training modes without requiring custom SchedRL adapter code immediately.
+
+For the first **async + multi-turn** reference, use the GSM8K multi-turn task setup:
+- `SkyRL/skyrl-train/examples/turn_level_rewards/` (multi-turn env + turn-level rewards)
+Then wire it to the async trainers above (one-step-off first).
 
 ## 5) Future work: SkyAgent SWE + async training
 
