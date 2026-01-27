@@ -96,8 +96,12 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
     - Make `request_id` coordinator-provided and deterministic per turn (`trajectory_id:turn_id:attempt`) instead of worker-generated UUID.
     - Track `(request_id -> dp_idx)` for in-flight async vLLM requests in the coordinator/generation layer.
     - Implement `abort_requests(worker_indices, request_ids)` in the generation wrapper; require ACK (stop_reason == abort) before retry.
+      - **Timeout Fail-safe**: If ACK does not arrive within timeout, **crash the pipeline** (do not proceed to shrink).
     - On abort, re-enqueue the affected work into a retry queue so it is retried on a non-preempted dp worker.
   - Enable `expand_rebalance_policy = REBALANCE_QUEUED` (default): after `wake(worker_indices=A)` + weight sync, preferentially schedule queued/not-started prompt groups (including retries) onto the expanded subset.
+  - **Selective Sticky Routing**:
+    - On Shrink: Clear mappings for removed workers.
+    - On Expand Rebalance: Clear mappings **only** for the specific prompt-groups chosen for migration (load shedding).
 
 **Baseline validation (required)**
 - Validate the `REQUEST_RETRY` safety invariant: do not execute stateful env/tool side effects unless a non-abort generation result is received (single-writer commit). If not true, mid-flight shrink is unsafe and must be disabled until fixed.
@@ -105,6 +109,8 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
 **Implication**
 - NeMo-RL can implement `update_policy=INFLIGHT` (no allocation change) in a protocol-correct way.
 - The main missing piece for multi-pipeline GPU sharing is **subset shrink/expand with mid-flight `REQUEST_RETRY` migration** (plus shared heartbeats).
+- **Superseded Syncs (Safety)**:
+  - Enforce strict **Serialization & Coalescing** for weight updates. Never abort a running sync.
 
 **Concise actionable items (merged from `design_doc/archive/adaptation_review.md`)**
 - Add DP-subset lifecycle entrypoints (indices/ranks) so the scheduler can wake/sleep only a subset of generation workers (`expand_workers`/`shrink_workers`).

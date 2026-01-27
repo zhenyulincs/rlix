@@ -249,12 +249,13 @@ Goal: support elastic time-sharing with `migration_policy=REQUEST_RETRY` (abort/
   - When aborting requests on `P`, also clear any per-request routing/bookkeeping for the aborted request IDs (e.g., remove entries from `request_id_2_dp_rank`) to avoid stale mappings and make retries land cleanly on `new_S`.
 - Concurrency detail (async safety): when building the abort set per dp-rank, take a snapshot of `inflight_requests[dp_rank].keys()` **before any `await`** (e.g., `list(...)`). This avoids dict-mutation hazards without requiring an `asyncio.Lock`.
 - Abort/drain ordering (safety): do **not** stop/offload `P` immediately after sending abort.
+  - **Strict Ordering**: `Close Admission` -> (`Wait for Drain` OR `Send Abort` + `Wait for ACK`) -> `Sync/Shrink`.
   - Wait until the abort is ACKed and `P` is drained (no running requests on those dp ranks) before calling `stop_server_subset(P)`.
   - Rationale: sending an abort command does not guarantee it has executed yet; stopping/offloading while work is still running risks GPU memory access errors.
   - Phase 1 (A): drain check inside `RequestScheduler`: spin-wait until `inflight_requests[dp_rank]` is empty for all `dp_rank in P`, then sleep an extra `0.5s` as a conservative buffer before stop/offload.
   - Backlog (C): remove the magic sleep by adding worker-side engine drain/flush + “engine idle” confirmation (vLLM/SGLang), and require **A AND C** before stop/offload for maximum safety.
     - Preferred shape: add a unified `wait_for_engine_idle(worker_indices, timeout_s)` RPC at the scheduler/proxy layer, and implement it by wrapping backend-specific calls under vLLM vs SGLang.
-  - Timeout policy: if drain does not complete within a configured timeout, **fail loudly** (raise/emit an error and do not proceed with stop/offload), rather than forcing offload and risking memory errors.
+  - Timeout policy: if drain does not complete within a configured timeout, **fail loudly** (crash pipeline) and do not proceed with stop/offload.
 - Retry trigger (already exists): aborted request yields `None` from `PolicyProxy.generate`, which becomes `GenerateStopReason.ABORT`, and the env loop retries the same turn without stepping env state (`third_party/ROLL/roll/pipeline/agentic/env_manager/traj_env_manager.py`).
 
 ## 4.X Mid-Flight Shrink (DP workers) — Implementation sketch
@@ -273,6 +274,7 @@ Adapter / framework hooks (ROLL-level):
 1. Admission-close for `P`: mark `P` inactive so the scheduler stops dispatching new requests to those dp ranks.
 2. Abort in-flight on `P`: snapshot `inflight_requests[dp_rank]` for `dp_rank in P`, send abort in batch.
 3. Wait abort ACK (required): wait until those request ids complete with `finish_reason == abort` (or `inflight_requests[dp_rank]` is empty for all `dp_rank in P`).
+   - **Timeout Fail-safe**: If ACK does not arrive within timeout, **crash the pipeline** (do not proceed to shrink).
 4. Stop/offload `P`: only after ACK, call `stop_server_subset(P)` + offload states to release GPUs.
 
 Failure policy:
@@ -285,7 +287,10 @@ After `start_server_subset(A)`, rebalance is enabled by default (stronger expand
 - If still unbalanced, abort selected in-flight turns on overloaded ranks and retry them on underloaded ranks (turn-level retry; does not step env on `ABORT`).
   - Require abort ACK before retry and before stopping/offloading any rank.
   - Stop condition (5% rule): the pipeline coordinator computes `load[dp] = queued_by_worker[dp] + inflight_by_worker[dp]` (trajectory counts) and stops when:
-    `(max(load) - min(load)) / max(queued_trajectories + inflight_trajectories, 1) <= 0.05`.
+    `((max(load) - min(load)) / max(queued_trajectories + inflight_trajectories, 1) <= 0.05) OR ((max(load) - min(load)) <= 2)`.
+- **Selective Sticky Routing**:
+  - On Shrink: Clear `src_rank2_dp_rank` mappings for removed workers.
+  - On Expand Rebalance: Clear `src_rank2_dp_rank` **only** for the specific trajectories chosen for migration (load shedding).
 
 ## 5. Post-Adaptation Integration Overview
 This section describes how the reused ROLL components (Section 3) and required extensions (Section 4) implement the distributed protocol in `design_doc/multi-pipeline_roll_old_design.md`.

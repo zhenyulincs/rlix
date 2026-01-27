@@ -78,6 +78,7 @@ SchedRL unifies cross-framework behavior using two orthogonal knobs:
 
 **QUIESCE variants (rules)**
 - Pick exactly one of `QUIESCE-by-drain` or `QUIESCE-by-abort` for a given boundary (do not mix drain and abort).
+- **Enforce strict ordering**: `Close Admission` -> (`Wait for Drain` OR `Send Abort` + `Wait for ACK`) -> `Sync/Shrink`. Clarify that Drain and Abort are mutually exclusive alternatives for the "empty the pipe" step.
 - `QUIESCE-by-abort` requires `REQUEST_RETRY` safety (two-phase commit) because aborted work must be retried elsewhere/later.
 - Make the drain unit explicit in adapters:
   - **Turn/request drain**: close admission for new turns/requests and wait until no in-flight requests remain. This guarantees no mid-request mixing, but a multi-turn trajectory can still span versions across turns.
@@ -113,14 +114,18 @@ SchedRL unifies cross-framework behavior using two orthogonal knobs:
   2. Reassign queued/not-started work so it can run on the expanded workers.
   3. If load is still uneven, abort selected in-flight turns on overloaded workers and retry them on underloaded workers until the load is within tolerance.
      - This uses the same `REQUEST_RETRY` safety rules as shrink: deterministic per-turn request id + abort ACK required + two-phase commit for any stateful tool/env effects.
-	     - Stop condition: stop abort+retry when the load gap across active workers is within **5%**.
+	     - Stop condition: stop abort+retry when the load gap across active workers is within **5%** or the absolute gap is small.
 	       - Definition: let `load[dp] = queued_trajectories_by_worker[dp] + inflight_trajectories_by_worker[dp]` (computed locally by the pipeline coordinator). Stop when:
-	         `(max(load) - min(load)) / step_target_trajectories <= 0.05`.
+	         `((max(load) - min(load)) / step_target_trajectories <= 0.05) OR ((max(load) - min(load)) <= 2)`.
 	       - Note: `queued_trajectories_by_worker` and `inflight_trajectories_by_worker` are local-only numbers used for rebalance decisions. `report_progress(...)` stays pipeline-level (sum across all workers).
 
 Important distinction:
 - **Shrink** must migrate/cancel in-flight work on `P` (mandatory), because `P` may be offloaded/stopped and lose state.
 - **Expand** can choose how aggressive it is. We default to the stronger behavior above, but it should be configurable (e.g., limit how many in-flight turns can be aborted per rebalance cycle).
+
+**Sticky Routing Cleanup (Selective)**
+- **On Shrink**: Clear mappings for removed workers (mandatory).
+- **On Expand Rebalance**: Do NOT clear the entire table. Only clear mappings for the *specific trajectories* chosen for migration (load shedding). Preserves stability for running sessions.
 
 Note:
 - `SUSPEND_RESUME`-style mechanisms are **not valid for shrink**, because shrink implies the worker may be offloaded/deactivated and lose its local state (e.g., KV cache).
@@ -167,7 +172,10 @@ These are the chosen design decisions for the protocol:
 
 9) “Superseded activation requests” (v2 then v3)
 - Decision: coordinator chooses the version; scheduler only chooses timing.
-- Decision: require an `activation_epoch` in activation/sync requests. Scheduler must skip any older request when a newer epoch exists (“newest wins”).
+- Decision: require an `activation_epoch` in activation/sync requests.
+- **Serialization & Coalescing**:
+  - **Serialization**: Never abort a running sync (unsafe for NCCL). If v2 is syncing, wait for it to finish.
+  - **Coalescing**: If v3 and v4 arrive while v2 is syncing, v3 is dropped/skipped, and v4 is queued as the next target ("Highest Version Wins").
 
 10) Subset lifecycle changes (Phase 1 style)
 - Decision: use the smallest code change that works: add optional `worker_indices` / `indices` arguments to existing APIs.
@@ -285,9 +293,11 @@ Correctness invariant:
   - For `BATCH`: required version is the batch-pinned version chosen by the coordinator at the boundary.
   - For `INFLIGHT`: in-flight work may finish on older versions, so the coordinator must track which versions are still in use (`in_use_checkpoint_versions`) for safe cache retention/GC.
 
-**Race: superseded sync requests (coalescing)**
+**Race: superseded sync requests (Serialization & Coalescing)**
 - The coordinator may request sync of `v2` and then quickly request sync of `v3` before syncing `v2` completes.
-- Scheduler/proxy behavior must be “last-writer-wins”: it must not reopen admission or mark cutover complete for an older sync that is already superseded by a newer sync request.
+- **Rule**:
+  - **Serialization**: Never abort a running sync (unsafe for NCCL). If v2 is syncing, wait for it to finish.
+  - **Coalescing**: If v3 and v4 arrive while v2 is syncing, v3 is dropped/skipped, and v4 is queued as the next target ("Highest Version Wins").
 
 Trainer-side CPU cache retention (minimum):
 - After each train step, the trainer-side cache service materializes the trained weights into CPU bucket-list form and updates `latest_checkpoint_version`.
@@ -318,6 +328,7 @@ This section covers:
 **Shrink (`old_S -> new_S`, `P = old_S − new_S`)**
 1. Coordinator closes admission for `P`.
 2. Migrate/cancel in-flight work on `P` according to `migration_policy` (mandatory for shrink), and wait until `inflight(P) == 0` (abort ACK or drain completion).
+   - **Strict Ordering**: `Close` -> (`Wait for Drain` OR `Send Abort` + `Wait for ACK`) -> `Sync/Shrink`.
 3. Offload/remove model weights from GPU for `P` (sleep/offload/stop) to free memory.
 4. Return from `shrink_workers(...)` so the scheduler can reassign GPUs.
 
@@ -580,7 +591,10 @@ The protocol must handle these distributed system realisms:
 
 ### 6.2 Race: Superseded Activations
 - **Scenario**: Coordinator requests `v2`, then quickly requests `v3` (before `v2` finishes syncing).
-- **Rule**: Eventual Consistency. The Scheduler MAY skip `v2` if it hasn't started, or abort `v2` sync, and proceed directly to `v3`.
+- **Rule**: Strict **Serialization & Coalescing** (Safety first).
+- **Behavior**:
+  - **Serialization**: Never abort a running sync (unsafe for NCCL). If `v2` is syncing, wait for it to finish.
+  - **Coalescing**: If `v3` and `v4` arrive while `v2` is syncing, `v3` is dropped/skipped, and `v4` is queued as the next target ("Highest Version Wins").
 - **Invariant**: Workers never serve a version *newer* than what the Coordinator has requested, but skipping intermediate versions is allowed.
 
 ### 6.3 Race: Cache Garbage Collection
@@ -593,8 +607,23 @@ The protocol must handle these distributed system realisms:
 - **Rule**: Adapter must report `notify_allocation_failed(indices=[2], reason=...)`.
 - **Handling**: Scheduler marks index 2 as bad/cooldown and tries expanding a different index (e.g., 3), or releases 1 and retries later. It does NOT treat the bundle as ready until full success.
 
-### 6.5 SGLang/Miles `retract` Scope
-- **Scenario**: Using `mode='retract'` during Shrink.
-- **Risk**: If `retract` only re-queues to the *local engine memory*, and the engine is killed, requests are lost.
-- **Rule**: Local-only retract is valid only for **pause without shrink** (no deallocation/offload).
-- **Fix**: For Shrink, do not rely on `retract`. Use `REQUEST_RETRY` (cancel + re-issue) via a global dispatcher/queue (restart current request/turn is acceptable).
+### 6.6 Accepted Risks & Non-Goals
+
+The following risks are explicitly accepted for Phase 1:
+
+1.  **CPU Memory Pressure**:
+    - **Risk**: Trainer CPU cache may hold too many versions if consumers lag significantly, causing OOM.
+    - **Mitigation**: Aggressive GC of non-active/non-in-use versions.
+    - **Acceptance**: We assume sufficient CPU RAM is provisioned for the trainer bucket list.
+
+2.  **Global Dispatcher SPOF**:
+    - **Risk**: The central Scheduler/Dispatcher is a Single Point of Failure.
+    - **Acceptance**: Accepted for Phase 1 simplicity.
+
+3.  **Request ID Collisions**:
+    - **Risk**: If multiple pipelines share a rollout engine without isolation, IDs might collide.
+    - **Acceptance**: We rely on the **Isolation Assumption** (Section 1). Pipelines run on isolated engine groups, so `pipeline_id` prefix is not strictly needed in the backend request ID.
+
+4.  **Oldest Unfinished Timestamp**:
+    - **Risk**: "Oldest creation timestamp" might not be perfectly fair if clocks drift.
+    - **Acceptance**: We stick to "oldest creation timestamp" prioritization as the best-effort fairness metric. No change to logic. This means we accept small priority inversions caused by clock skew across different pipeline coordinator machines, rather than implementing a complex logical clock or strict NTP enforcement.

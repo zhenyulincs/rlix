@@ -68,8 +68,10 @@ This section reality-checks Miles against the shared protocol in `design_doc/mul
 - **Shrink-time migration semantics**:
   - Shrink implies the engine may be stopped/offloaded; any “retract” that only re-queues locally would lose work.
   - For SchedRL mid-flight shrink, we must implement `migration_policy=REQUEST_RETRY` using existing Miles primitives:
+    - **Close Admission (Strict Ordering)**: `Close Admission` -> (`Wait for Drain` OR `Send Abort` + `Wait for ACK`) -> `Sync/Shrink`.
     - **Cancel in-flight (targeted)** on the shrinking subset using SGLang `/abort_request` by `rid` (per-engine, not global).
     - **Abort ACK (required)**: the coordinator must wait until the aborted requests return with stop_reason/finish_reason == `abort` before offloading those engines.
+      - **Timeout Fail-safe**: If ACK does not arrive within timeout, **crash the pipeline** (do not proceed to shrink).
     - **Retry the current turn** on remaining engines by re-issuing the same turn with preserved token/history state (token-in/token-out), not “restart the whole trajectory”.
   - This is feasible because Miles already has:
     - a global data source buffer (`RolloutDataSourceWithBuffer`),
