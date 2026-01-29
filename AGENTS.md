@@ -1,7 +1,7 @@
 # Rules for the Agent
 
-- DO NOT generate ".MD" files. Don't generate tests files. unless explicitly told. 
-- DO NOT make use of any new libraries or packages unless explicitly told.
+- DO NOT add new files, like ".md" ".txt" or test, unless explicitly told or approved by user. 
+- DO NOT make use of any new libraries or packages, unless explicitly told or approved by user.
 
 ## 1. Safety (Critical)
 - **No Secrets**: Never print, store, or commit tokens or keys.
