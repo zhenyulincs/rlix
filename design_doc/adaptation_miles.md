@@ -100,6 +100,10 @@ This section reality-checks Miles against the shared protocol in `design_doc/mul
 - **Miles assumes weight sync happens at safe boundaries** (between rollout batches / when the rollout engines are quiesced), not as a “hot swap” in the middle of multi-turn interactions.
   - `third_party/miles/train.py` does `generate → (optional offload) → train → onload_weights → actor_model.update_weights → onload_kv` (update happens after generation finishes).
   - `third_party/miles/train_async.py` explicitly syncs generation before updating weights: “sync generate before update weights to prevent update weight in the middle of generation”.
+- **Weight activation cadence is interval-driven in `train_async.py`**:
+  - `--update-weights-interval` controls how often rollout engines observe new weights (sync/broadcast happens only when `(rollout_id + 1) % update_weights_interval == 0`).
+  - Because `train_async.py` prefetches the “next rollout” early, it will (by design) *finish* that prefetched rollout under the *previous* weights, then update weights (it drains `rollout_data_next_future` before calling `actor_model.update_weights()`).
+  - **SchedRL implication**: Miles `active_checkpoint_version` / “weight activation” must advance only on these interval boundaries. With `update_weights_interval=3`, the rollout engines intentionally run up to ~3 train-steps behind the trainer weights between broadcasts (still only one rollout future in flight; this is not a “3-step-ahead” pipelining contract).
 - **What this means for multi-turn rollouts**:
   - The multi-turn reference implementations treat `finish_reason=abort` as terminal and return `Sample.Status.ABORTED` immediately (e.g. `third_party/miles/examples/geo3k_vlm_multi_turn/rollout.py`, `third_party/miles/examples/retool/generate_with_retool.py`, `third_party/miles/examples/search-r1/generate_with_search.py`, `third_party/miles/examples/tau-bench/trainable_agents.py`).
   - There is no generic “pause / update / resume the same trajectory” mechanism in these examples. If a model update happens mid-trajectory and triggers abort, the trajectory is dropped (or retried from scratch by higher-level logic).

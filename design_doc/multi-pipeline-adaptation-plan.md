@@ -442,6 +442,8 @@ and (4) a clear rule for how training consumes mixed-version data when overlap i
 | **Miles** | `BATCH` activation and step-based async (`train_async.py`) | Support `train.py` (sync) and `train_async.py` (one-step-ahead overlap) plus sync-by-interval (`update_weights_interval`). Do not use `third_party/miles/examples/fully_async`. Subset targeting (`indices=...`) for `RolloutManager.onload/offload`; implement `REQUEST_RETRY` by aborting subset engines and re-queueing work to the global data source (see `design_doc/adaptation_miles.md`). |
 | **SkyRL-train** | `BATCH` (one-step-off) and `QUIESCE-by-abort` (fully-async) | Use existing SkyRL-train async entrypoints first (`third_party/SkyRL/skyrl-train/examples/async`, `third_party/SkyRL/skyrl-train/examples/fully_async`), then add subset lifecycle if/when SchedRL needs live shrink/expand (see `design_doc/adaptation_skyrl.md`). |
 
+Miles note (important): `update_weights_interval` is the **weight activation cadence** in `train_async.py`. With `--update-weights-interval=K`, rollout engines intentionally run up to ~K trainer-steps behind between broadcasts; this remains a one-step-ahead pipeline (only one rollout future in flight), not a “K-step-ahead” pipelining contract.
+
 ### 4.3 Doc vs Code Status (Reality Check)
 
 This table is a **code reality check** (not an aspiration list). Each row is backed by concrete file pointers.

@@ -13,6 +13,11 @@ support Miles’ “persistent background worker” fully-async rollout mode (`t
 
 This plan assumes the centralized scheduler exists (or will exist) and focuses on **Miles-side** changes: MilesRouter + RolloutManager + SGLang rollout loop + minimal coordinator hooks.
 
+**Important: weight activation cadence (Miles async).**
+- `third_party/miles/train_async.py` updates rollout weights only every `--update-weights-interval` rollouts (the broadcast happens when `(rollout_id + 1) % update_weights_interval == 0`).
+- Because `train_async.py` prefetches one “next rollout” early, it drains that prefetched rollout *before* calling `actor_model.update_weights()`; the prefetched rollout completes under the *previous* weights by design.
+- **SchedRL requirement**: treat Miles’ `active_checkpoint_version` (rollout-side “which weights are active”) as advancing only on these interval boundaries. Do not assume “one-step-off” implies “weights change every step”.
+
 ## Current State Analysis
 
 ### What already exists (reusable)
@@ -353,6 +358,7 @@ Validate **all** Stage 1 SchedRL features end-to-end on Retool:
 - [ ] Expand/resume performs subset-scoped staged resume + weight sync and generation succeeds.
 - [ ] Scheduler receives `report_progress(...)` events at batch start + 2% bands (trajectory units).
 - [ ] Stage 1 run uses the one-step-off driver (`third_party/miles/train_async.py`), not the fully-async background worker example.
+- [ ] Stage 1 run explicitly documents/sets `--update-weights-interval` and treats it as the rollout-weight activation cadence (the proxy/scheduler must not assume per-step activation).
 
 ---
 
