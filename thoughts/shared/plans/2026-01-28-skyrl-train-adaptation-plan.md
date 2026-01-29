@@ -245,7 +245,8 @@ Goal: add async Mini-SWE examples once side-effect safety is specified.
    edits to `third_party/SkyRL/skyrl-train/`.
 2) For “shrink”, we MUST fully release GPU memory (Final Plan invariant). If a “sleep/offload” path does not actually
    free weights+KV on GPU, we must terminate the relevant actors or add a real full-offload primitive before calling
-   `shrink_workers(...)` complete.
+   `shrink_workers(...)` complete. For vLLM engines, `shrink_workers(...)` MUST use deep sleep (`sleep(level=2)`) so both
+   model weights and KV cache are released; it is acceptable to keep CUDA runtime / CUDA graph allocations for now.
 3) Resolved constraint: SchedRL shrink/expand support is scoped to **non-batched** generation only.
    - SchedRL runs MUST set `generator.batched=false`.
    - Batched generation (`generator.batched=true`) is out of scope for shrink/expand in this phase.

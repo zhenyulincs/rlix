@@ -38,7 +38,7 @@ What we can reuse in this workspace:
 
 Planned work (doc-level first, then code):
 - Define a NeMo-RL rollout “task” that uses the Mini-SWE agent server as the environment/tool runner.
-- Start with one-step-off style overlap (generate batch N+1 while training batch N) using existing async GRPO plumbing.
+- Start with async GRPO concurrency (rollout generation overlaps with training), and use `max_trajectory_age_steps=1` (“1off”) as the initial bounded-staleness setting. This is not a strict “one-step-off pipeline contract”; it only bounds how stale sampled trajectories may be.
 - Add clear “safe stop” points for shrink/time-share:
   - stop new starts,
   - wait for in-flight tool loops to finish,

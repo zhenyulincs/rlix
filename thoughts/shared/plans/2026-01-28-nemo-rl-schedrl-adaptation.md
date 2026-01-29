@@ -5,7 +5,9 @@
 Adapt **NeMo-RL’s GRPO pipeline** to the shared SchedRL protocol (`design_doc/multi-pipeline-adaptation-plan.md`) by adding: (1) DP-subset lifecycle control (shrink/expand), (2) deterministic per-turn vLLM request IDs + safe abort/retry migration (**targeted abort + backend-confirmed ACK from day one**), (3) **selective/cheap sync + faster wake/sleep behaviors from day one**, and (4) standardized `report_progress(...)` heartbeats.
 
 Default protocol settings for NeMo-RL Phase 2:
-- `update_policy = INFLIGHT` when `vllm_cfg.async_engine && grpo.async_grpo.in_flight_weight_updates`, else `QUIESCE-by-drain`
+- `update_policy = INFLIGHT` when async training is enabled (`vllm_cfg.async_engine && grpo.async_grpo.enabled`), else `QUIESCE-by-drain`
+- Runtime requirement (fail fast): when async training is enabled, assert `grpo.async_grpo.in_flight_weight_updates == true` at startup (do not allow async training with `in_flight_weight_updates=false`).
+- Note on naming: NeMo-RL “async-1off” configs mean `max_trajectory_age_steps=1` (bounded staleness), not a strict “one-step-off pipelining” guarantee.
 - `migration_policy = REQUEST_RETRY` (abort the current turn/request, retry elsewhere; two-phase commit invariant required)
 - `expand_rebalance_policy = REBALANCE_QUEUED` (queued-only day one; in-flight rebalance requires cooperative cancellation, Phase 2+)
 

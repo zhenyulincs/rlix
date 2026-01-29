@@ -157,6 +157,7 @@ Approach: use `sitecustomize.py` patch shims and rely on NeMo-RL’s existing pa
 Operational requirement:
 - Ensure the driver `PYTHONPATH` includes the patch directory before NeMo-RL initializes Ray.
 - Ensure Ray workers inherit that `PYTHONPATH` (NeMo-RL commonly uses `runtime_env={"env_vars": dict(os.environ)}` in its Ray init paths).
+- If NeMo-RL async GRPO is enabled, enforce at startup: `grpo.async_grpo.in_flight_weight_updates=true` (fail fast otherwise).
 
 #### 4.1.3) SkyRL-train (third-party; no direct edits assumed)
 
@@ -198,6 +199,7 @@ Required semantics (time-sharing compatible):
 - `shrink_workers`: complete the shrink sequence for the subset and ACK only when done.
   - shrink ordering is strict: close admission → abort/drain → wait for ACK that inflight==0 → offload/stop → return success.
   - MUST fully release GPU memory for the subset.
+    - For vLLM-based rollout engines, this means using vLLM Sleep Mode deep sleep (`sleep(level=2)`) so both model weights and KV cache are released. It is acceptable to keep CUDA runtime / CUDA graph allocations for now.
 - `expand_workers`: bring workers online for the subset and ACK only when ready.
   - onload/restore → sync checkpoint (if required by policy) → open admission → return success.
 
