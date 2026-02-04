@@ -1,5 +1,7 @@
 # Miles SchedRL Adaptation Implementation Plan
 
+**Status (2026-02-04)**: Deferred/archived. Current integration focus is **ROLL + SkyRL-train**. Kept for reference only.
+
 ## Overview
 
 Adapt **Miles** (Phase 4 target) to the shared SchedRL protocol (`design_doc/multi-pipeline-adaptation-plan.md`) by adding: (1) DP-subset lifecycle control for rollout workers, (2) safe shrink/expand with **admission-close + abort + backend-confirmed ACK + retry**, (3) selective sync-on-resume (subset-scoped weight sync + staged SGLang memory resume), and (4) standardized `report_progress(...)` heartbeats (trajectory units, 2% bands).
@@ -69,12 +71,12 @@ Expose an Adapter surface that matches the Final Plan:
 - `close_admission(worker_indices, action_id, activation_epoch) -> ActionResponse`
 - `open_admission(worker_indices, action_id, activation_epoch) -> ActionResponse`
 - `shrink_workers(worker_indices, action_id, activation_epoch) -> ActionResponse`
-- `expand_workers(worker_indices, checkpoint_version, action_id, activation_epoch) -> ActionResponse`
+- `expand_workers(worker_indices, base_version, action_id, activation_epoch) -> ActionResponse`
 
 Mapping notes:
 - `close_admission/open_admission` are implemented as router admission control for the subset (disable/enable routing).
 - `shrink_workers` performs: close admission → abort → wait ACK → offload subset, and MUST fully release GPU memory.
-- `expand_workers` performs: onload subset → sync to `checkpoint_version` (if needed) → return; scheduler calls `open_admission(...)` separately.
+ - `expand_workers` performs: onload subset → sync to `base_version` (if needed) → return; scheduler calls `open_admission(...)` separately.
 
 Registration invariant (State Reset on Registration):
 - On (re)registration, assume `S_actual={}` and release/kill any leftover engines from a prior session.
@@ -409,7 +411,7 @@ After Stage 1 is stable on Retool, integrate the SWE-agent tool-loop example and
 - SchedRL-enabled runs should require `use_miles_router=true` to guarantee admission control and ACK semantics.
 
 ## References
-- Design: `design_doc/adaptation_miles.md`
+- Design: `design_doc/archive/adaptation_miles.md`
 - Protocol: `design_doc/multi-pipeline-adaptation-plan.md`
 - Research: `thoughts/shared/research/2026-01-28-schedrl-framework-mechanisms.md`
 - Research: `thoughts/shared/research/2026-01-28-schedrl-adaptation-research.md`

@@ -233,7 +233,7 @@ For the `swe-agent` example, integration involves modifying the `train.py` loop:
 ### 5.2 Scheduler Progress Hooks
 *   **Integration Point**: `rollout_manager.py`.
 *   **Trigger**: When `results` are pushed to the training queue / buffer and at batch start (hook at the top of the `for rollout_id in range(...)` loop in `third_party/miles/train.py`, before `rollout_manager.generate(...)`).
-*   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts)`.
+*   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, active_base_version)`.
 *   **Required TODO (Miles async semantics)**: implement **arrival vs consumption** accounting so the denominator/remaining logic is correct even when generation and training overlap.
     - Track at least these monotonic counters for the current backlog window:
         - `groups_released_for_generation` (submitted/queued into the global data source)

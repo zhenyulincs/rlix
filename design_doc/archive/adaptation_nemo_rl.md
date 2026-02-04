@@ -78,7 +78,7 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
 - **Terminology mapping**:
   - Shared protocol uses `active_checkpoint_version` / `generation_checkpoint_version`. NeMo-RL uses `current_weight_version`, `generation_weight_version`, `target_weight_version`. We should map these 1:1 (active = target for new work).
 - **Progress reporting for scheduling**:
-  - The central scheduler needs heartbeats based on **trajectory counts**: `queued_trajectories`, `inflight_trajectories`, `percent_completed`, and `oldest_unfinished_creation_ts`.
+  - The central scheduler needs heartbeats based on **trajectory counts**: `queued_trajectories`, `inflight_trajectories`, `percent_completed`, `oldest_unfinished_creation_ts`, and `active_base_version`.
   - NeMo-RL often reasons in “prompt-groups” (one prompt-group contains multiple trajectories: `num_generations_per_prompt`). The adapter must convert prompt-group counts into trajectory counts.
 
 **Concrete file refs & immediate actions**
@@ -88,7 +88,8 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
   - Instrument `AsyncTrajectoryCollector` to emit `scheduler.report_progress(...)` at batch start and on 2% progress bands:
     - `queued_trajectories`, `inflight_trajectories` (trajectory units),
     - `percent_completed = collected_trajectories / train_global_batch_size` (where `train_global_batch_size = num_prompt_groups_needed * num_generations_per_prompt`; `percent_completed >= 1.0` means next train step batch is ready),
-    - `oldest_unfinished_creation_ts`.
+    - `oldest_unfinished_creation_ts`,
+    - `active_base_version`.
   - Add simple version tagging for debugging:
     - record `generation_checkpoint_version` when the first turn of a trajectory is submitted, and
     - record it again when the last turn finishes (final output pushed into the replay buffer).
@@ -227,7 +228,7 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
 ### 4.2 Scheduler Progress Hooks
 *   **Integration Point**: `AsyncTrajectoryCollector._run_prompt_group_worker` in `third_party/nemo-rl/nemo_rl/algorithms/async_utils.py` (buffer enqueue via `replay_buffer.push_with_wait_signal(...)`), plus the `grpo_train` loop in `third_party/nemo-rl/nemo_rl/algorithms/grpo.py`.
 *   **Trigger**: On buffer enqueue (inside `_run_prompt_group_worker`) and at the start of the batch loop (`for batch in dataloader:` around line 1118).
-*   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts)`.
+*   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, active_base_version)`.
 *   **Frequency**: Report at **batch start** and whenever `percent_completed` crosses a **2% progress band** (event-driven). Denominator is the per-step rollout target in trajectories: `train_global_batch_size` (i.e., `num_prompt_groups_needed * num_generations_per_prompt`). Use `oldest_unfinished` timestamp for scheduler tie-breaking.
 
 ### 4.3 Step-Level Retry (If Applicable)

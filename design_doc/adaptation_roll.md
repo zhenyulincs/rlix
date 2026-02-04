@@ -89,7 +89,7 @@ This section reality-checks ROLL (Agentic pipeline) against the shared protocol 
     - record it again when the last turn finishes.
 
 **Recommended baseline mapping**
-- `update_policy = QUIESCE-by-abort` (keep the existing “suspend + stop + model_update + start” boundary).
+- `update_policy = QUIESCE-by-abort` (strict boundary; reuse ROLL’s `suspend()` + abort primitive).
 - `migration_policy = REQUEST_RETRY` (ROLL-native “abort + retry”) for shrink preemption (turn-level retry; does not step env on abort).
 - `expand_rebalance_policy = REBALANCE_QUEUED` (enabled by default): on expand, clear sticky routing so new turns can land on newly activated DP ranks.
 
@@ -99,7 +99,7 @@ This section reality-checks ROLL (Agentic pipeline) against the shared protocol 
 **Concise actionable items (merged from `design_doc/archive/adaptation_review.md`)**
 - Implement `start_server_subset(worker_indices)` / `stop_server_subset(worker_indices)` (or equivalent adapter-level subset control).
 - Add `ModelUpdateGroup.model_update(worker_indices=...)` / comm-plan filtering so selective sync-on-resume is possible.
-- Wire `report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts)` from the rollout buffer enqueue point (e.g., `GroupQueue.put`/`GroupQueueManager`).
+- Wire `report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, active_base_version)` from the rollout buffer enqueue point (e.g., `GroupQueue.put`/`GroupQueueManager`).
 
 **Critical Implementation Gaps (Must Fix Before Phase 0)**
 
@@ -172,6 +172,7 @@ This section reality-checks ROLL (Agentic pipeline) against the shared protocol 
 | **inflight_trajectories** | `inflight_groups * group_size` (or per-trajectory inflight if available) |
 | **percent_completed** | `collected_trajectories / rollout_batch_size` (`percent_completed >= 1.0` means next train step batch is ready) |
 | **oldest_unfinished** | New timestamp captured at **group creation** for the oldest unfinished group (aligns with `oldest_unfinished_creation_ts` in `design_doc/multi-pipeline_roll_old_design.md`; do not reuse `create_step`, which is a step id) |
+| **active_base_version** | Coordinator's current active base checkpoint version (matches `ActiveModelSpec.base_version`; use -1 for MULTI_LORA frozen base). |
 
 ### 3.4 Preemption & Release Protocol (Post-Adaptation)
 **Important**: ROLL has two distinct “stop/resume” reasons that must be handled differently:
@@ -206,7 +207,7 @@ This section reality-checks ROLL (Agentic pipeline) against the shared protocol 
 ### 4.2 Scheduler Progress Hooks
 *   **Integration Point**: `GroupQueue.put` (within `GroupQueueManager`).
 *   **Trigger**: Report at **batch start** and whenever `percent_completed` crosses a 2% progress band (event-driven).
-*   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts)` where `percent_completed = collected_trajectories / rollout_batch_size` and `collected_trajectories` counts how many trajectories are complete and ready for training for the next step (e.g., buffered/qualified and not yet consumed).
+*   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, active_base_version)` where `percent_completed = collected_trajectories / rollout_batch_size` and `collected_trajectories` counts how many trajectories are complete and ready for training for the next step (e.g., buffered/qualified and not yet consumed).
 *   **Note**: If completed trajectories are dropped/unqualified after being counted as collected, `percent_completed` may decrease accordingly.
 
 ### 4.3 Native Request Migration During Stop (Framework-Specific)

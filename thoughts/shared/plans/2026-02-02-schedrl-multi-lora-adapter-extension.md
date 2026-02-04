@@ -1,4 +1,4 @@
-# SchedRL Multi‑LoRA Adapter Extension (vLLM-first, ROLL + SkyRL-train + NeMo-RL) Implementation Plan
+# SchedRL Multi‑LoRA Adapter Extension (vLLM-first, ROLL + SkyRL-train) Implementation Plan
 
 **Date**: 2026-02-02
 
@@ -21,7 +21,7 @@ Core requirement: LoRA weights are **trained + synchronized at adapter granulari
 This plan focuses on a **vLLM-first** shape because:
 - ROLL already plumbs `lora_request` into vLLM generation (`third_party/ROLL/roll/distributed/strategy/vllm_strategy.py:172`).
 - SkyRL-train already has LoRA disk-load hooks using vLLM `add_lora` (`third_party/SkyRL/skyrl-train/skyrl_train/inference_engines/vllm/vllm_engine.py:313`).
-- NeMo-RL documents LoRA as “base model frozen” (expected semantics for adapter mode) (`third_party/nemo-rl/docs/guides/sft.md:168`).
+NeMo-RL wiring is deferred/archived for now; this plan focuses on ROLL + SkyRL-train.
 
 ---
 
@@ -122,6 +122,7 @@ Because rollouts may be mixed-adapter batched, cutovers must be **scoped to the 
 **Implementation fallback rule (embedded API, recommended)**:
 - Default to **C1** at the coordinator level (stop scheduling adapter X; abort X in-flight; wait abort ACK).
 - The actual “activate X@v_new” step may still require a **brief global control critical section** on each engine (because `add_lora(...)` mutates shared engine state). If the framework’s embedded API is not proven safe to call concurrently with generation, fall back to a short global `QUIESCE-by-abort` of the whole engine group for the duration of the `add_lora(...)` call, then resume mixed-adapter generation immediately.
+  - Any requests aborted solely due to this brief global quiesce (including “bystander” adapters not being updated) MUST be treated as **Preemption Retries**, not **Engine Errors** (i.e., they must not count against any “max engine errors” cap).
 - This keeps correctness while allowing us to later optimize toward “pure adapter-scoped update” if/when validated.
 
 ### Decision D — Retry semantics after shrink-triggered abort
@@ -139,10 +140,16 @@ Because rollouts may be mixed-adapter batched, cutovers must be **scoped to the 
 Add the following protocol-level objects (names illustrative; final naming should match `schedrl/protocol/types.py` once implemented):
 
 - `ModelMode = {FULL_FT, MULTI_LORA}`
-- `BaseSpec = {base_version, base_uri?}` (for FULL_FT, `base_version` is the usual checkpoint version; for MULTI_LORA it is constant for the run)
 - `AdapterId` (stable identifier; recommended string)
-- `AdapterSpec = {adapter_id, adapter_version, adapter_uri?}`
-- `ActiveModelSpec = {mode, base: BaseSpec, adapters: dict[AdapterId, AdapterSpec]}`
+- `ActiveModelSpec = {base_version: int, adapters: dict[AdapterId, int]}`
+  - `base_version`:
+    - in `FULL_FT`: the usual checkpoint version (same meaning as `active_checkpoint_version` / `active_base_version`),
+    - in `MULTI_LORA`: `-1` (sentinel) meaning “frozen base for the run” (constant; the base is not updated during adapter training, and its artifact is resolved from static config / cache, not by version lookup).
+    - Ordering note: in `MULTI_LORA`, `base_version` is an identifier/sentinel; it must not be used in “newer wins” comparisons (only equality + validation is meaningful).
+  - `adapters`: map `adapter_id -> adapter_version` (multi-dimensional “active state”).
+  - URIs are resolved by the trainer-side artifact cache / static config, not passed through the scheduler protocol.
+  - `ModelMode` is a **registration-time constant per pipeline** (scheduler stores it from `register()`); it is not carried in the active model state/messages.
+  - **Validation rule**: `base_version == -1` is only permitted when `model_mode == MULTI_LORA`; in `FULL_FT`, `base_version MUST be >= 0`.
 
 **Compatibility rule**:
 - In `FULL_FT`, `ActiveModelSpec.adapters = {}` and the existing single-axis `checkpoint_version` semantics remain.
@@ -161,23 +168,16 @@ GC rules (Phase 1, recommended):
 - Keep: newest `K` versions per adapter (configurable; default small like 2–4).
 - Do **not** guarantee strict snapshot retries (per Decision D1), so old versions can GC aggressively.
 
-### 3) Extend scheduler↔adapter interface to express “what to warm on expand”
-The scheduler does not need to micromanage adapters, but expand-from-zero needs a way to avoid opening admission before adapters needed for queued work are available.
+### 3) Coordinator-driven warmup on expand/resume (scheduler remains workload-agnostic)
+Expand-from-zero must avoid opening admission before adapters needed for queued work are available, but the scheduler should not compute adapter-level warmup lists.
 
-**Option 1 (recommended)**: extend `expand_workers(...)` with an optional warmup payload:
-- `expand_workers(worker_indices, base_version, warmup_adapters=[AdapterId], action_id, activation_epoch)`
-- Coordinator loads base (per `base_version`) and then ensures `warmup_adapters` are loaded/ready on those workers before ACK.
+Protocol requirement:
+- `expand_workers(worker_indices, base_version, action_id, activation_epoch)`
+  - Coordinator loads base (per `base_version`) and then warms adapters based on its own local per-adapter queues (e.g., any `adapter_id` with `queued_trajectories[adapter_id] > 0`) before it allows mixed-batch dispatch to those workers.
 
-Warmup policy (recommended):
-- Warm **only** adapters that have queued work “now” (or an explicit `warmup_adapters` set). Do not preload all adapters by default.
-- In `MULTI_LORA`, avoid any “base resync” beyond the one-time base load required after expand/resume.
-- Warmup failure semantics (Phase 1, recommended):
-  - `expand_workers(...)` is **atomic** with respect to warmup: return `success=true` only if **all** requested `warmup_adapters` are successfully loaded/ready on **all** requested `worker_indices`.
-  - If any adapter warmup fails on any worker, return `success=false` with an error listing the failed `(worker_index, adapter_id)` pairs. Do not open admission on those workers for workloads that may require those adapters.
-
-**Option 2**: add a separate call:
-- `prepare_adapters(worker_indices, adapters=[AdapterSpec], action_id, activation_epoch)`
-- This splits “resource expand” from “adapter warmup” but adds an extra RPC/action ordering surface.
+Coordinator state requirement (MULTI_LORA):
+- Track `resident_adapters_by_worker[worker_index] -> dict[adapter_id, adapter_version]` (or equivalent).
+- Dispatch MUST only target workers where the requested `adapter_id` is resident at the desired version (or the coordinator must load it first under admission gating).
 
 ### 4) Request identity must include adapter identity (for abort + attribution)
 Deterministic request IDs should incorporate adapter identity so we can:
@@ -247,7 +247,7 @@ Expand must guarantee:
 
 Recommended operational approach:
 - Coordinator maintains per-adapter queues and builds mixed batches by drawing from multiple queues.
-- Scheduler can optionally pass `warmup_adapters` to reduce “first batch penalty” after resume (see `expand_workers(..., warmup_adapters=...)` in Protocol Extensions).
+- On expand/resume, the coordinator warms only adapters with queued work (based on its local queues and `resident_adapters_by_worker`) before dispatching mixed batches to newly activated workers.
 - Mixed-batch fairness (Phase 1, recommended):
   - Use a simple no-starvation rule in the mixed-batch builder: each `adapter_id` with non-empty queue gets at least 1 prompt admitted per scheduling tick (up to batch capacity), then fill remaining slots proportional to backlog (or round-robin).
   - If an adapter has consistently low volume, this guarantees eventual service without requiring the central scheduler to be adapter-aware.
@@ -258,7 +258,7 @@ Adapter updates do not require scheduler involvement unless you want scheduling 
 Recommended coordinator behavior (Decision C1):
 1) Stop starting new trajectories for adapter X (adapter-scoped admission close).
 2) Abort in-flight requests/trajectories for adapter X and wait abort ACK.
-3) Load/activate adapter X@v_new on any active workers that may serve adapter X (default: all currently active rollout workers, unless the coordinator tracks a smaller “workers with X resident” set).
+3) Load/activate adapter X@v_new on any active workers that may serve adapter X (default: all currently active rollout workers; coordinator may use `resident_adapters_by_worker` to target a smaller set).
 4) Reopen adapter X admission **only after** all targeted active workers report “adapter X is ready at v_new” (avoid mixed X@old and X@new serving simultaneously).
 
 If a shrink arrives in the middle of steps 2–3, the same fail-fast rules apply:
@@ -317,9 +317,9 @@ Plan deltas for multi-LoRA:
 Define the protocol additions so frameworks can implement the same adapter surface for both full FT and multi-LoRA.
 
 ### Changes Required
-1) Extend protocol schema to add `ModelMode` + `ActiveModelSpec` and adapter artifact definitions (see “Protocol Extensions”).
+1) Extend protocol schema to add `ModelMode` (pipeline registration) + `ActiveModelSpec` (active base + adapters) and adapter artifact definitions (see “Protocol Extensions”).
 2) Extend cache contract from “checkpoint-only” to “base + adapter artifacts” with clear GC rules.
-3) Decide and document the `expand_workers` warmup mechanism (Option 1 recommended).
+3) Document `expand_workers` warmup mechanism: coordinator-driven warmup based on local per-adapter queues (no scheduler-provided warmup payload).
 
 ### Success Criteria
 #### Automated Verification
@@ -341,6 +341,14 @@ Implement multi-LoRA semantics in the ROLL reference path first, because it alre
 2) Ensure vLLM calls use a per-prompt `lora_request` list (one `LoRARequest` per prompt) matching each prompt’s adapter_id.
 3) Implement adapter activation (`adapter_id -> adapter_version`) and ensure it happens only at safe boundaries (Decision C1 recommended).
 4) Ensure deterministic request IDs include adapter_id, and aborted work retries with incremented attempt (Decision D1).
+5) Surface an adapter removal API for GC:
+   - Required capability: unload/remove an adapter version from the engine so repeated adapter updates do not accumulate VRAM/LoRA slots indefinitely.
+   - Define the engine-facing hook as `remove_lora(adapter_id, adapter_version)` (or equivalent backend API like vLLM “unload LoRA adapter”).
+   - If removal is not available in the embedded surface, Phase 2 must fall back to a safe-but-heavier strategy for adapter GC (e.g., brief deep-sleep/restart of the engine group, then warm only the currently-needed adapters before reopening admission).
+   - Default eviction policy (Phase 1, recommended):
+     - Enforce a per-worker `max_resident_adapters` limit.
+     - If a load would exceed the limit, evict the least-recently-used adapter with no in-flight work (LRU by “last used” timestamp updated on dispatch).
+     - If no evictable adapter exists (all resident adapters have in-flight work), fail fast: do not attempt the load and return a clear error (avoid OOM by uncontrolled growth).
 
 ### Success Criteria
 #### Automated Verification
@@ -423,9 +431,12 @@ Adopt the same adapter artifact + activation semantics for NeMo-RL, reusing its 
 
 **Mitigation (Phase 1, recommended)**:
 - Do not attempt a full “one cache to rule them all” refactor initially.
-- Define two minimal, concrete surfaces:
-  - `BaseBucketCache.get_base(base_version) -> bucket_iterable` (existing bucketized base copy; base frozen in `MULTI_LORA`)
-  - `AdapterArtifactCache.get_adapter(adapter_id, adapter_version) -> artifact_ref` (file path or in-memory handle)
+- Prefer a **wire-format extension** over introducing new “cache managers”:
+  - Extend the existing “bucket list” / checkpoint cache RPC payload to carry a list of **artifact entries**, where each entry is either:
+    - a base artifact (bucketized weights, same as today), or
+    - an adapter artifact (e.g., file path / URI / handle for `(adapter_id, adapter_version)`).
+  - Keep the existing trainer-owned cache actor/service as the single source of truth; do not add a second cache service for adapters in Phase 1.
+  - If we want code cleanliness, implement thin helpers/wrappers (`get_base(...)`, `get_adapter(...)`) over the same underlying payload, but avoid introducing a new “checkpoint manager” layer.
 - Add a small pin/unpin (or refcount) contract to avoid GC races during expand/resume (scheduler dispatch must not observe 404s for the target base/adapters).
 
 ### Risk 2: vLLM `add_lora` concurrency (embedded API)
@@ -433,18 +444,29 @@ Adopt the same adapter artifact + activation semantics for NeMo-RL, reusing its 
 
 **Mitigation (Phase 2, recommended)**:
 - Treat adapter updates as “adapter-scoped gating + brief global critical section”:
-  1) stop scheduling adapter X into new mixed batches,
-  2) abort in-flight X requests and wait abort ACK (or fall back to abort-all if mapping is unavailable),
-  3) perform `add_lora(...)` under a short global `QUIESCE-by-abort` for the engine group if concurrency safety is not validated,
-  4) resume mixed-adapter generation immediately.
+  1) **Coordinator**: stop scheduling adapter X into new mixed batches (adapter-scoped admission close).
+  2) **Coordinator**: abort in-flight X requests and wait abort ACK (targeted by request_id; see Risk 3 mapping).
+  3) **Coordinator**: enter a short global control critical section for the engine group (fallback is global `QUIESCE-by-abort`).
+  4) **Worker/Engine**: run `add_lora(adapter_id, artifact)` on each active worker that may serve X; return a per-worker “ready” ACK (or fail fast).
+  5) **Coordinator**: update `resident_adapters_by_worker` to reflect X@v_new, then exit the critical section and resume mixed-adapter generation.
+  6) **Coordinator**: reopen adapter X admission only after all targeted workers report ready at v_new.
 - Before optimizing to “pure adapter-scoped update while other adapters continue”, validate behavior on the project’s vLLM build with a minimal reproduction (no new test files required).
+- In the same validation pass, confirm whether “overwrite in place” is safe (re-`add_lora` same adapter_id) or whether updates must be “remove then add” (requires a surfaced `remove_lora`/unload API).
 
 ### Risk 3: Abort granularity in mixed-adapter batches
 **Issue**: “abort adapter X” requires mapping to concrete in-flight request IDs when batches contain multiple adapters. If this mapping is missing, the safest fallback is abort-all on the targeted workers.
 
 **Mitigation (v1-safe default)**:
 - For **shrink**: abort is worker-subset scoped; abort all in-flight work on workers in `P` and retry elsewhere (SchedRL core path).
-- For **adapter update**: keep “adapter X admission gating” in the coordinator. If request-id mapping is not available, use the same short global quiesce around `add_lora(...)` rather than trying to surgically abort X.
+- For **adapter update** (preferred): implement adapter→request mapping so we don’t need “abort-all”:
+  - Maintain reverse indexes at the routing boundary (e.g., in ROLL `RequestScheduler`):
+    - `request_id -> adapter_id`
+    - `adapter_id -> set[request_id]` (active only)
+    - (optional) `worker_index/dp_rank -> set[request_id]` for fast subset aborts
+  - On submit: insert into the indexes.
+  - On completion/abort ACK: remove from the indexes.
+  - Adapter update “abort X” enumerates `adapter_id -> request_ids` and aborts exactly those ids (then waits for ACK), while other adapters continue.
+  - If the mapping is not yet implemented, fall back to the same short global quiesce around `add_lora(...)` rather than attempting a partial abort that could miss X requests.
 
 ---
 
@@ -454,4 +476,4 @@ Adopt the same adapter artifact + activation semantics for NeMo-RL, reusing its 
 - Dual-mode scheduler plan: `thoughts/shared/plans/2026-01-28-schedrl-dual-mode-final-plan.md`
 - ROLL adaptation plan: `thoughts/shared/plans/2026-01-28-roll-schedrl-adaptation.md`
 - SkyRL-train adaptation plan: `thoughts/shared/plans/2026-01-28-skyrl-train-adaptation-plan.md`
-- NeMo-RL adaptation plan: `thoughts/shared/plans/2026-01-28-nemo-rl-schedrl-adaptation.md`
+- NeMo-RL adaptation plan: `thoughts/shared/plans/2026-01-28-nemo-rl-schedrl-adaptation.md` (deferred; archived)

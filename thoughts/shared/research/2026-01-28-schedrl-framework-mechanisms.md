@@ -748,8 +748,8 @@ else:
 
 - `design_doc/multi-pipeline-adaptation-plan.md` - Main protocol specification
 - `design_doc/adaptation_roll.md` - ROLL-specific implementation gaps
-- `design_doc/adaptation_nemo_rl.md` - NeMo-RL-specific gaps
-- `design_doc/adaptation_miles.md` - Miles-specific gaps
+- `design_doc/archive/adaptation_nemo_rl.md` - NeMo-RL-specific gaps (deferred; archived)
+- `design_doc/archive/adaptation_miles.md` - Miles-specific gaps (deferred; archived)
 - `design_doc/adaptation_skyrl.md` - SkyRL-specific gaps
 
 ---

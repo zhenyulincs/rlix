@@ -51,7 +51,7 @@ From `design_doc/multi-pipeline-adaptation-plan.md` + `design_doc/adaptation_sky
      - `/chat/completions` retry: `third_party/SkyRL/skyrl-train/skyrl_train/inference_engines/inference_engine_client.py:330`
 
 4) **SchedRL progress heartbeats are missing**
-   - No `report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, ...)`.
+   - No `report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, active_base_version, ...)`.
 
 ## Desired End State (Definition of Done)
 
@@ -69,14 +69,24 @@ SkyRL-train is schedulable by SchedRL with:
 3) Deterministic per-turn request IDs (coordinator-provided) used by the backend:
    - vLLM `request_id` and (future) SGLang `rid`
 
-4) `report_progress(...)` emitted at batch start + 2% bands (trajectory units):
-   - `queued_trajectories`, `inflight_trajectories`, `percent_completed`, `oldest_unfinished_creation_ts`
+4) `report_progress(...)` emitted at batch start + 2% bands (trajectory units), plus a low-frequency wall-clock backup:
+   - `queued_trajectories`, `inflight_trajectories`, `percent_completed`, `oldest_unfinished_creation_ts`, `active_base_version`
+     - `active_base_version` is the coordinator’s current active base checkpoint/model version (naming rule: this is the pipeline’s `base_version`, i.e. it matches `ActiveModelSpec.base_version`; convention: in `MULTI_LORA`, use `-1` as the frozen-base sentinel).
+   - Cadence:
+     - event-driven: batch start + 2% band crossings
+     - backup: at most once per 60s (configurable; keep infrequent to avoid overhead)
+   - Always include per-adapter progress metrics (see `thoughts/shared/plans/2026-02-02-schedrl-multi-lora-adapter-extension.md`):
+     - `metrics["percent_completed_by_adapter"]` (required)
+       - In `FULL_FT`, use a single entry: `{"default": percent_completed}`.
+     - `metrics["queued_by_adapter"]` (optional; primarily useful in `MULTI_LORA`)
+     - `metrics["inflight_by_adapter"]` (optional; primarily useful in `MULTI_LORA`)
 
 5) Adapter RPC surface matches the Final Plan:
    - `close_admission(worker_indices, action_id, activation_epoch) -> ActionResponse`
    - `open_admission(worker_indices, action_id, activation_epoch) -> ActionResponse`
    - `shrink_workers(worker_indices, action_id, activation_epoch) -> ActionResponse`
-   - `expand_workers(worker_indices, checkpoint_version, action_id, activation_epoch) -> ActionResponse`
+   - `expand_workers(worker_indices, base_version, action_id, activation_epoch) -> ActionResponse`
+   - `ModelMode` (`FULL_FT` vs `MULTI_LORA`) is a **registration-time constant per pipeline**; provide it in `register()` and store it in the scheduler (do not carry it in every “active model” message).
 
 Registration invariant (State Reset on Registration):
 - On (re)registration, assume `S_actual={}` and release/kill any leftover engines from a prior scheduler session.
@@ -163,7 +173,7 @@ One-step-off:
 
 - Identify the “rollout-ready boundary” (where the next train step batch is ready) and compute the same fields.
 
-Deliverable: pipeline heartbeats at batch start + 2% bands, consistent with `design_doc/multi-pipeline-adaptation-plan.md`.
+Deliverable: pipeline heartbeats at batch start + 2% bands, with a low-frequency wall-clock backup (default 60s), consistent with `design_doc/multi-pipeline-adaptation-plan.md`.
 
 ### Phase 2 — Subset lifecycle for inference engines (admission + shrink/expand)
 
@@ -237,6 +247,7 @@ Goal: add async Mini-SWE examples once side-effect safety is specified.
   - continued rollout on `new_S` with retries completing
 - `report_progress(...)`:
   - emits at batch start and when 2% bands are crossed
+  - also emits a low-frequency wall-clock backup (default 60s) to prevent “silent stalls” when percent/batch events are sparse
   - uses trajectory units; `percent_completed >= 1.0` implies “next train step batch ready”
 
 ## Open Questions (Need your call)

@@ -61,7 +61,7 @@ Expose a coordinator-owned Adapter surface that matches the Final Plan:
 - `close_admission(worker_indices, action_id, activation_epoch) -> ActionResponse`
 - `open_admission(worker_indices, action_id, activation_epoch) -> ActionResponse`
 - `shrink_workers(worker_indices, action_id, activation_epoch) -> ActionResponse`
-- `expand_workers(worker_indices, checkpoint_version, action_id, activation_epoch) -> ActionResponse`
+- `expand_workers(worker_indices, base_version, action_id, activation_epoch) -> ActionResponse`
 
 ### Multi-LoRA extension hook (ROLL tag/domain → `adapter_id`)
 This plan is the baseline for **FULL_FT**. For **MULTI_LORA** (multiple LoRA adapters on a frozen base) see:
@@ -77,9 +77,12 @@ Notes:
 - `ActionResponse` is `{success: bool, error: Optional[str]}`; use `error="Superseded"` for supersession ACKs.
 - Scheduler-owned timeouts are enforced at the scheduler→adapter RPC boundary; the Adapter MUST NOT require `timeout_s` parameters in the public RPC signature.
 - On (re)registration, assume `S_actual={}` and release/kill any leftover inference servers from a prior scheduler session.
+- If weight broadcast (`model_update`) can be slow and is synchronous, the scheduler’s shrink/expand RPC timeout MUST be configured to exceed the worst-case broadcast time (recommended: a large safety margin), or the adapter implementation MUST make the sync path async so control-plane RPCs can still respond.
+- `ModelMode` (`FULL_FT` vs `MULTI_LORA`) is a **registration-time constant per pipeline**; it should be provided in `register()` and stored by the scheduler (not carried in every “active model” message).
 
 Additional (non-Adapter) surfaces used by the scheduler client (unchanged from shared protocol):
-- `report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, metrics=...)`
+- `report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, active_base_version, metrics=...)`
+  - Naming rule: `active_base_version` is the pipeline’s `base_version` (same meaning as `ActiveModelSpec.base_version`; convention: in `MULTI_LORA`, use `-1` as the frozen-base sentinel).
 
 ### Deterministic request IDs (SchedRL requirement)
 The coordinator must provide a deterministic per-turn `request_id` and pass it into the backend (vLLM `request_id`) so shrink can do **targeted abort + backend-confirmed ACK + retry** safely.
@@ -98,8 +101,18 @@ Implement selective sync so that:
 Implement a deterministic mapping from ROLL group/episode bookkeeping to:
 - `queued_trajectories` (queued not started)
 - `inflight_trajectories` (running / pending)
-- `percent_completed` (collected ready-for-train / step_target_trajectories)
+- `percent_completed` (pipeline-level progress scalar)
 - `oldest_unfinished_creation_ts` (enqueue time of oldest unfinished trajectory)
+- `active_base_version` (the coordinator’s current active base checkpoint/model version; scheduler uses this to avoid stale `base_version` on expand)
+
+Compatibility requirement (FULL_FT + MULTI_LORA):
+- Internally track progress as if it were per-`adapter_id` (treat `FULL_FT` as a single adapter, e.g. `adapter_id="default"`), so the same code path can later report multi-LoRA progress without forking.
+- Compute the scalar `percent_completed` as:
+  - `percent_completed = min(1.0, sum_a collected_trajectories[a] / sum_a target_trajectories[a])`
+  - In `FULL_FT`, this reduces to `collected_trajectories / rollout_batch_size` because `target_trajectories["default"] = rollout_batch_size`.
+- Always report:
+  - `metrics["percent_completed_by_adapter"] = {adapter_id: min(1.0, collected_trajectories[a] / target_trajectories[a])}`
+  - In `FULL_FT`, this is a single entry: `{"default": percent_completed}`.
 
 ---
 
@@ -168,6 +181,7 @@ Make shrink/expand correct and safe for agentic multi-turn rollouts by:
 **Changes**
 - Modify `RequestScheduler.report_response(...)` to treat an output as “abort” when `data.meta_info["finish_reasons"]` contains `"abort"` (and resolve the future to `None` in this case).
 - Implement `RequestScheduler.abort_request(worker_indices: list[int] | None = None, timeout_s: float = ...)`:
+  - Maintain an efficient inverse index (e.g., `dp_rank_to_request_ids`) so `abort_request(worker_indices=P)` can find targeted request ids without scanning all active requests.
   - Snapshot targeted request ids and their futures *before any await*.
   - For each targeted dp rank, send one vLLM abort command with `meta_info["request_id"] = [rid1, rid2, ...]`.
   - Wait for ACK by awaiting the snapped futures, and require that each resolves to `None` (abort) or to a completed response (already finished before abort).
@@ -182,9 +196,9 @@ Make shrink/expand correct and safe for agentic multi-turn rollouts by:
   - Set `active_dp_ranks := S \\ P` (so no new work routes to `P`).
 - Add `open_admission(worker_indices: list[int], action_id: str, activation_epoch: int) -> ActionResponse`:
   - Set `active_dp_ranks := S ∪ A` (only after expand is complete and any required sync is done).
-- Add `expand_workers(worker_indices: list[int], checkpoint_version: int, action_id: str, activation_epoch: int) -> ActionResponse`:
+- Add `expand_workers(worker_indices: list[int], base_version: int, action_id: str, activation_epoch: int) -> ActionResponse`:
   - Call `infer_cluster.workers[i].start_server.remote(DataProto(meta_info={...}))` for each `i`.
-  - Perform subset-scoped sync-on-resume if `checkpoint_version` changed while workers were inactive (Phase 3).
+  - Perform subset-scoped sync-on-resume if `base_version` changed while workers were inactive (Phase 3).
   - Do NOT reopen admission here; the scheduler calls `open_admission(...)` as a separate action.
   - Optionally clear sticky routing for queued rebalance (Phase 1 uses “rebalance queued” only).
 - Add `shrink_workers(worker_indices: list[int], action_id: str, activation_epoch: int) -> ActionResponse`:
@@ -226,7 +240,7 @@ Implementation note: pause after this phase for a human confirmation that the ma
 ## Phase 2: `report_progress(...)` Heartbeats (2% Bands, Trajectory Units)
 
 ### Overview
-Emit SchedRL-standard progress heartbeats so the central scheduler can make fair shrink/expand decisions and avoid thrashing.
+Emit SchedRL-standard progress heartbeats so the central scheduler can make fair shrink/expand decisions and avoid thrashing. Heartbeats MUST include `active_base_version` so the scheduler does not issue `expand_workers(..., base_version=...)` using stale base state.
 
 ### Changes Required
 
@@ -254,7 +268,8 @@ Emit SchedRL-standard progress heartbeats so the central scheduler can make fair
   - `queued_trajectories = queued_groups * group_size`
   - `inflight_trajectories = inflight_groups * group_size`
   - `collected_trajectories = ready_groups * group_size`
-  - `percent_completed = collected_trajectories / rollout_batch_size` (ROLL mapping from shared doc)
+  - `target_trajectories = rollout_batch_size` (FULL_FT baseline)
+  - `percent_completed = min(1.0, collected_trajectories / target_trajectories)`
 - Emit heartbeats:
   - at batch start, and
   - whenever `percent_completed` crosses a 2% band boundary.

@@ -5,33 +5,33 @@ canonical_path: design_doc/multi-pipeline-adaptation-plan_clean.md
 source_docs:
   - design_doc/multi-pipeline_roll_old_design.md
   - design_doc/archive/adaptation_review.md
-  - design_doc/adaptation_nemo_rl.md
+  - design_doc/archive/adaptation_nemo_rl.md
   - design_doc/adaptation_roll.md
-  - design_doc/adaptation_miles.md
+  - design_doc/archive/adaptation_miles.md
   - design_doc/adaptation_skyrl.md
 ---
 
 # SchedRL: Multi-Pipeline Adaptation Plan (Clean Structure)
 
 This is the main shared protocol for multi-pipeline GPU sharing across
-**NeMo-RL**, **ROLL**, **Miles**, and **SkyRL-train**.
+**ROLL** and **SkyRL-train** (current integration focus). NeMo-RL and Miles are deferred/archived for now.
 
 For concrete per-framework code entrypoints and limitations, see:
-- `design_doc/adaptation_nemo_rl.md`
+- `design_doc/archive/adaptation_nemo_rl.md` (deferred; archived)
 - `design_doc/adaptation_roll.md`
-- `design_doc/adaptation_miles.md`
+- `design_doc/archive/adaptation_miles.md` (deferred; archived)
 - `design_doc/adaptation_skyrl.md`
 
 Main reference async + multi-turn examples (one per framework):
 - ROLL: `third_party/ROLL/examples/qwen3_agentic_gem/gem_math_dapo.yaml` (MathEnv; already exists)
-- NeMo-RL: sliding puzzle async example (planned; see `design_doc/adaptation_nemo_rl.md`)
-- Miles: Retool async example (planned; see `design_doc/adaptation_miles.md`)
+- NeMo-RL: sliding puzzle async example (deferred; see `design_doc/archive/adaptation_nemo_rl.md`)
+- Miles: Retool async example (deferred; see `design_doc/archive/adaptation_miles.md`)
 - SkyRL-train: GSM8K multi-turn + async trainers (supported; see `design_doc/adaptation_skyrl.md`)
 
 Phase 2 (complex agent tasks) examples:
 - ROLL: **WebShop** (planned as the Phase 2 agent task in ROLL; see `design_doc/adaptation_roll.md`)
-- NeMo-RL: **Mini-SWE** (planned; reuse NeMo-Gym Mini-SWE agent server; see `design_doc/adaptation_nemo_rl.md`)
-- Miles: **Mini-SWE** (planned; upgrade `third_party/miles/examples/experimental/swe-agent/` to `train_async.py`; see `design_doc/adaptation_miles.md`)
+- NeMo-RL: **Mini-SWE** (deferred; reuse NeMo-Gym Mini-SWE agent server; see `design_doc/archive/adaptation_nemo_rl.md`)
+- Miles: **Mini-SWE** (deferred; upgrade `third_party/miles/examples/experimental/swe-agent/` to `train_async.py`; see `design_doc/archive/adaptation_miles.md`)
 - SkyRL-train: **Mini-SWE** (planned; add async entrypoints for `third_party/SkyRL/skyrl-train/examples/mini_swe_agent/`; see `design_doc/adaptation_skyrl.md`)
   - Safety note for Phase 2 tool loops: for shrink/time-sharing, default to “stop new starts + wait for drain”. Do not assume mid-tool abort is safe.
 
@@ -211,7 +211,7 @@ Execution note:
 - The actual in-place weight update and “sync-on-expand” are performed inside the pipeline coordinator (e.g., a `ParameterSyncService` / model update group). The scheduler only decides *when* and *which workers* should be updated and may run a global shrink barrier first.
 
 Progress input:
-- `report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, metrics=...)`
+- `report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, active_base_version, metrics=...)`
 
 #### `report_progress(...)` semantics (SchedRL-standard)
 
@@ -237,6 +237,7 @@ SchedRL standardizes progress reporting across frameworks so the scheduler can m
   - For queued items, this is their enqueue time.
   - For in-flight items, use the same trajectory enqueue time (do not replace with worker start time).
 - For retries of the current turn/request (`REQUEST_RETRY`), enqueue time is attached to the trajectory identity and is not reset per retry.
+- `active_base_version`: the coordinator’s current active base checkpoint/model version (a.k.a. `active_checkpoint_version` in FULL_FT). Naming rule: this value is the pipeline’s `base_version` (i.e., it should match `ActiveModelSpec.base_version` wherever that state is represented). Convention: in `MULTI_LORA`, use `active_base_version = -1` as the “frozen base” sentinel. **Validation rule**: `-1` is only permitted when the pipeline’s registered `model_mode == MULTI_LORA`; in `FULL_FT`, `active_base_version` MUST be `>= 0`. The scheduler uses this to avoid issuing `expand_workers(..., base_version=...)` using stale base state after coordinator-side cutovers.
 
  
 
@@ -437,9 +438,9 @@ and (4) a clear rule for how training consumes mixed-version data when overlap i
 
 | Framework | Covered by protocol | What is required in the codebase to fully realize it |
 |---|---|---|
-| **NeMo-RL** | `QUIESCE-by-drain` + `INFLIGHT` activation; resize time-sharing | Subset lifecycle + admission gating wiring (see `design_doc/adaptation_nemo_rl.md`); version tagging already exists as `(generation_weight_version, target_weight_version)` and should map to `generation_checkpoint_version` / `active_checkpoint_version`. |
+| **NeMo-RL** | `QUIESCE-by-drain` + `INFLIGHT` activation; resize time-sharing | Subset lifecycle + admission gating wiring (deferred; see `design_doc/archive/adaptation_nemo_rl.md`); version tagging already exists as `(generation_weight_version, target_weight_version)` and should map to `generation_checkpoint_version` / `active_checkpoint_version`. |
 | **ROLL (Agentic)** | `QUIESCE-by-abort` activation; abort+retry at turn boundary | Subset start/stop + routing remap (clear sticky mappings) so aborted turns retry on remaining/new DP ranks (see `design_doc/adaptation_roll.md`). |
-| **Miles** | `BATCH` activation and step-based async (`train_async.py`) | Support `train.py` (sync) and `train_async.py` (one-step-ahead overlap) plus sync-by-interval (`update_weights_interval`). Do not use `third_party/miles/examples/fully_async`. Subset targeting (`indices=...`) for `RolloutManager.onload/offload`; implement `REQUEST_RETRY` by aborting subset engines and re-queueing work to the global data source (see `design_doc/adaptation_miles.md`). |
+| **Miles** | `BATCH` activation and step-based async (`train_async.py`) | Support `train.py` (sync) and `train_async.py` (one-step-ahead overlap) plus sync-by-interval (`update_weights_interval`). Do not use `third_party/miles/examples/fully_async`. Subset targeting (`indices=...`) for `RolloutManager.onload/offload`; implement `REQUEST_RETRY` by aborting subset engines and re-queueing work to the global data source (deferred; see `design_doc/archive/adaptation_miles.md`). |
 | **SkyRL-train** | `BATCH` (one-step-off) and `QUIESCE-by-abort` (fully-async) | Use existing SkyRL-train async entrypoints first (`third_party/SkyRL/skyrl-train/examples/async`, `third_party/SkyRL/skyrl-train/examples/fully_async`), then add subset lifecycle if/when SchedRL needs live shrink/expand (see `design_doc/adaptation_skyrl.md`). |
 
 Miles note (important): `update_weights_interval` is the **weight activation cadence** in `train_async.py`. With `--update-weights-interval=K`, rollout engines intentionally run up to ~K trainer-steps behind between broadcasts; this remains a one-step-ahead pipeline (only one rollout future in flight), not a “K-step-ahead” pipelining contract.
@@ -521,8 +522,8 @@ Adapters must update the denominator window correctly:
 
 Framework-specific gaps are documented in each per-framework adaptation file:
 - ROLL: `design_doc/adaptation_roll.md` (sticky routing, static comm plan, abort ACK, creation_ts)
-- Miles: `design_doc/adaptation_miles.md` (missing `/remove_worker`, creation_ts)
-- NeMo-RL: `design_doc/adaptation_nemo_rl.md` (two-phase admission, creation_ts)
+- Miles: `design_doc/archive/adaptation_miles.md` (deferred; missing `/remove_worker`, creation_ts)
+- NeMo-RL: `design_doc/archive/adaptation_nemo_rl.md` (deferred; two-phase admission, creation_ts)
 
 **Cross-cutting gaps (apply to all frameworks)**:
 

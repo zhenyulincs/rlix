@@ -1,5 +1,7 @@
 # NeMo-RL (GRPO + vLLM) SchedRL Adaptation Implementation Plan
 
+**Status (2026-02-04)**: Deferred/archived. Current integration focus is **ROLL + SkyRL-train**. Kept for reference only.
+
 ## Overview
 
 Adapt **NeMo-RL’s GRPO pipeline** to the shared SchedRL protocol (`design_doc/multi-pipeline-adaptation-plan.md`) by adding: (1) DP-subset lifecycle control (shrink/expand), (2) deterministic per-turn vLLM request IDs + safe abort/retry migration (**targeted abort + backend-confirmed ACK from day one**), (3) **selective/cheap sync + faster wake/sleep behaviors from day one**, and (4) standardized `report_progress(...)` heartbeats.
@@ -12,7 +14,7 @@ Default protocol settings for NeMo-RL Phase 2:
 - `expand_rebalance_policy = REBALANCE_QUEUED` (queued-only day one; in-flight rebalance requires cooperative cancellation, Phase 2+)
 
 Primary design references:
-- `design_doc/adaptation_nemo_rl.md`
+- `design_doc/archive/adaptation_nemo_rl.md`
 - `design_doc/multi-pipeline-adaptation-plan.md`
 - `thoughts/shared/research/2026-01-28-schedrl-framework-mechanisms.md`
 - `thoughts/shared/research/2026-01-28-schedrl-adaptation-research.md`
@@ -45,7 +47,7 @@ Primary design references:
 
 - NeMo-RL does not report SchedRL-standard `report_progress(...)`. `AsyncTrajectoryCollector` has enough internal state to compute it but lacks:
   - explicit queued-vs-inflight bookkeeping and
-  - enqueue timestamps for `oldest_unfinished_creation_ts`. (`design_doc/adaptation_nemo_rl.md:122`, `design_doc/multi-pipeline-adaptation-plan.md:214`)
+  - enqueue timestamps for `oldest_unfinished_creation_ts`. (`design_doc/archive/adaptation_nemo_rl.md:122`, `design_doc/multi-pipeline-adaptation-plan.md:214`)
 
 ---
 
@@ -66,13 +68,13 @@ Expose an Adapter surface that matches the Final Plan:
 - `close_admission(worker_indices, action_id, activation_epoch) -> ActionResponse`
 - `open_admission(worker_indices, action_id, activation_epoch) -> ActionResponse`
 - `shrink_workers(worker_indices, action_id, activation_epoch) -> ActionResponse`
-- `expand_workers(worker_indices, checkpoint_version, action_id, activation_epoch) -> ActionResponse`
+- `expand_workers(worker_indices, base_version, action_id, activation_epoch) -> ActionResponse`
 
 Mapping notes:
 - `close_admission`: block new prompt-group starts for `worker_indices` (do not enqueue new work onto those shards).
 - `open_admission`: resume prompt-group starts for `worker_indices`.
 - `shrink_workers`: abort in-flight for `worker_indices`, wait for abort ACK, then sleep/offload at **Level 2 (weights+KV)** so GPU memory is fully released.
-- `expand_workers`: wake subset, sync to `checkpoint_version` if needed, then let the scheduler call `open_admission(...)`.
+ - `expand_workers`: wake subset, sync to `base_version` if needed, then let the scheduler call `open_admission(...)`.
 
 Registration invariant (State Reset on Registration):
 - On (re)registration, assume `S_actual={}` and release/kill any leftover servers from a prior session.
@@ -333,7 +335,7 @@ Manual (must do on a real run):
 
 ## References
 
-- NeMo-RL adaptation notes: `design_doc/adaptation_nemo_rl.md`
+- NeMo-RL adaptation notes: `design_doc/archive/adaptation_nemo_rl.md`
 - Shared protocol: `design_doc/multi-pipeline-adaptation-plan.md`
 - Mechanisms research: `thoughts/shared/research/2026-01-28-schedrl-framework-mechanisms.md`
 - Cross-framework research: `thoughts/shared/research/2026-01-28-schedrl-adaptation-research.md`

@@ -85,9 +85,14 @@ schedrl/
   __init__.py
   protocol/                  # pure data + invariants
     __init__.py
-    types.py                 # IDs, enums, dataclasses (incl. ResourceRequest/ResourceRelease)
+    types.py                 # IDs, enums, dataclasses (ResourceRequest/ResourceRelease + ModelMode/AdapterId/ActiveModelSpec)
     actions.py               # Shrink/Expand/CheckpointSync schemas
     validation.py            # invariant checks (fail fast)
+  cache/                     # trainer-side artifact caches (used by both modes)
+    __init__.py
+    base_cache.py            # BaseBucketCache ABC (FULL_FT + MULTI_LORA; thin wrapper over existing bucket-list cache)
+    adapter_cache.py         # AdapterArtifactCache ABC (MULTI_LORA; thin wrapper; avoid new cache manager layers)
+    gc.py                    # retention/GC policy helpers (optional)
   client/                    # framework-facing SDK
     __init__.py
     adapter.py               # Adapter ABC: ONLY thing frameworks implement
@@ -119,11 +124,14 @@ Framework-side integration is limited to:
    - The Adapter is owned by the framework coordinator and maps SchedRL actions to existing internal APIs.
 2. Register with the scheduler and continuously report progress.
    - Registration: `pipeline_id`, framework name, policies, `dp_max`, `tp_size`, and any role metadata needed by scheduling policy.
-   - Progress heartbeats: queued/inflight/percent_completed in SchedRL-standard units (trajectory units).
+   - Progress heartbeats: `report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, active_base_version, metrics: dict[str, Any] | None)` (trajectory units).
      - `percent_completed` is allowed to exceed `1.0` for reporting, but scheduling triggers that depend on “2% bands” MUST clamp it to `[0.0, 1.0]` (to avoid unbounded band increases).
+     - Heartbeats MUST include the coordinator-owned `active_base_version` (the current base checkpoint/model version the pipeline considers active; this is `ActiveModelSpec.base_version`). Convention: in `MULTI_LORA`, use `active_base_version = -1` as the “frozen base” sentinel. Validation rule: `-1` is only permitted when the pipeline’s registered `model_mode == MULTI_LORA`; in `FULL_FT`, `active_base_version MUST be >= 0`. The scheduler updates its internal Desired Spec from this value before issuing any follow-on actions (e.g., `expand_workers(..., base_version=...)`).
+     - Frameworks SHOULD include `metrics["percent_completed_by_adapter"]: dict[AdapterId, float]` so the scheduler can make per-adapter fairness decisions.
+       - In `FULL_FT`, use a single entry: `{"default": percent_completed}`.
    - Re-registration idempotency:
      - Duplicate `register()` calls for the same `pipeline_id` while the Adapter actor is still live SHOULD be rejected or treated as a no-op.
-     - A re-register that points to a different Adapter actor handle MUST replace the prior handle (and trigger State Reset on Registration semantics).
+     - A re-register that points to a different Adapter actor handle MUST replace the prior handle (and trigger State Reset on Registration semantics, including an `activation_epoch` session reset; see below).
 3. Respect action semantics (idempotency + supersession).
    - Every scheduler→adapter call includes `action_id` and `activation_epoch`.
    - Adapter must be idempotent by `action_id` and ignore superseded intents via `activation_epoch`.
@@ -131,6 +139,10 @@ Framework-side integration is limited to:
    - If the scheduler restarts (re-registration), it has no record of prior allocations.
    - Therefore, upon (re)registration, the Adapter MUST assume it has 0 allocations (S_actual={}).
    - If it holds resources from a previous session, it MUST release/kill them immediately to prevent zombie resource conflict with the fresh scheduler state.
+   - If the Adapter restarts (new actor handle) and re-registers, the scheduler MUST treat it as a fresh session:
+     - discard any outstanding actions for that pipeline, and
+     - reset `activation_epoch` for that pipeline to a new baseline (recommended: `0`).
+     - The Adapter MUST accept the first `activation_epoch` it receives after (re)registration as the new baseline, regardless of its numeric value.
 
 ### 4.1) Minimal Patching Strategy (Per Framework)
 
@@ -140,7 +152,8 @@ Constraint: third-party framework code is not always in our control. Prefer the 
 - **Fallback**: import-time patching via `sitecustomize.py` shipped to Ray workers via `runtime_env` (driver + all workers).
 
 Order of attack for adaptation work:
-1) ROLL → 2) NeMo-RL → 3) SkyRL-train → 4) Miles
+1) ROLL → 2) SkyRL-train
+(NeMo-RL and Miles are deferred/archived for now.)
 
 #### 4.1.1) ROLL (we control source code)
 
@@ -150,7 +163,7 @@ Approach: implement required hooks directly in ROLL, and make runtime environmen
   - Current runtime_env is platform env only: `third_party/ROLL/roll/distributed/scheduler/initialize.py`.
 - Implement the ROLL-specific requirements from `thoughts/shared/plans/2026-01-28-roll-schedrl-adaptation.md` as direct code changes (deterministic request ids, targeted abort+ACK, subset expand/shrink, subset-scoped sync/progress).
 
-#### 4.1.2) NeMo-RL (third-party; no direct edits assumed)
+#### 4.1.2) NeMo-RL (deferred; archived)
 
 Approach: use `sitecustomize.py` patch shims and rely on NeMo-RL’s existing pattern of passing through environment variables into Ray `runtime_env`.
 
@@ -166,7 +179,7 @@ Approach: use `sitecustomize.py` patch shims and rely on SkyRL’s built-in capa
 Operational requirement:
 - Set `SKYRL_PYTHONPATH_EXPORT=true` so the driver `PYTHONPATH` is propagated to Ray workers.
 
-#### 4.1.4) Miles (third-party; no direct edits assumed)
+#### 4.1.4) Miles (deferred; archived)
 
 Approach: use `sitecustomize.py` patch shims and validate runtime env propagation because Miles frequently sets per-actor `runtime_env={"env_vars": ...}`.
 
@@ -188,7 +201,7 @@ Scheduler → Adapter (required, minimal):
 - `close_admission(worker_indices, action_id, activation_epoch) -> ActionResponse`
 - `open_admission(worker_indices, action_id, activation_epoch) -> ActionResponse`
 - `shrink_workers(worker_indices, action_id, activation_epoch) -> ActionResponse`
-- `expand_workers(worker_indices, checkpoint_version, action_id, activation_epoch) -> ActionResponse`
+- `expand_workers(worker_indices, base_version, action_id, activation_epoch) -> ActionResponse`
 
 `ActionResponse` schema (minimum, Phase 1):
 - `success: bool`
@@ -198,10 +211,14 @@ Required semantics (time-sharing compatible):
 - `close_admission`: stop admitting NEW work for the specified subset.
 - `shrink_workers`: complete the shrink sequence for the subset and ACK only when done.
   - shrink ordering is strict: close admission → abort/drain → wait for ACK that inflight==0 → offload/stop → return success.
+  - Abort ACK (protocol definition): the Adapter confirms all targeted in-flight requests have terminated.
+    - The Adapter MUST NOT return `success=true` from `shrink_workers(...)` until all requests on the targeted workers have completed (finished, errored, or aborted).
+    - Framework-specific completion signals (e.g., vLLM `finish_reason`) are implementation details.
   - MUST fully release GPU memory for the subset.
     - For vLLM-based rollout engines, this means using vLLM Sleep Mode deep sleep (`sleep(level=2)`) so both model weights and KV cache are released. It is acceptable to keep CUDA runtime / CUDA graph allocations for now.
 - `expand_workers`: bring workers online for the subset and ACK only when ready.
-  - onload/restore → sync checkpoint (if required by policy) → open admission → return success.
+  - onload/restore → sync/load `base_version` (if required by policy) → open admission → return success.
+  - In `MULTI_LORA`, any “warmup” (pre-loading adapters on newly expanded workers) is coordinator-driven using the coordinator’s local per-adapter queues; the scheduler remains workload-agnostic.
 
 Supersession / “ignore” semantics (avoid deadlocks):
 - Adapters MUST NOT silently drop a call with a superseded `activation_epoch`.
@@ -229,7 +246,8 @@ Invariant (double-free prevention):
 - When processing `release_gpus(worker_indices)`, the scheduler MUST ignore any indices that are not in state ACTIVE.
 
 Ownership / monotonicity:
-- `activation_epoch` is scheduler-owned, monotonic per pipeline.
+- `activation_epoch` is scheduler-owned, monotonic per pipeline *session*.
+  - A pipeline session is defined by the current registered Adapter actor handle; a re-register to a new handle starts a new session (see §4 “State Reset on Registration”).
   - Clients/Adapters NEVER GENERATE epochs. Client requests (like `request_checkpoint_sync`) must NOT include an epoch; the scheduler assigns it upon ingestion.
   - Used for supersession (“ignore older epochs”).
 
@@ -282,7 +300,10 @@ Deployment selects the mode:
 
 Phase 1: Protocol + Adapter surface (unblocks all frameworks)
 - Implement `schedrl/protocol/{types,actions,validation}.py`
-- Protocol MUST support both `FULL_FT` and `MULTI_LORA` via an `ActiveModelSpec`-style model descriptor (base + optional adapters). Reference: `thoughts/shared/plans/2026-02-02-schedrl-multi-lora-adapter-extension.md`.
+- Protocol MUST support both `FULL_FT` and `MULTI_LORA` via:
+  - a per-pipeline registration constant `model_mode: ModelMode`, and
+  - an active model state `ActiveModelSpec` with `base_version: int` and `adapters: dict[AdapterId, int]`.
+  Reference: `thoughts/shared/plans/2026-02-02-schedrl-multi-lora-adapter-extension.md`.
 - Implement `schedrl/client/adapter.py` (ABC) + minimal `ActionResponse` schema
 - Implement `schedrl/client/client.py` (`connect`/`get_or_create` + register + report helpers)
 
@@ -305,8 +326,8 @@ Phase 5: Framework wiring (minimal patching strategy; in this order)
 - Miles: add `sitecustomize.py` shims + verify `PYTHONPATH` survives per-actor runtime_env, then wire Adapter + progress reporting
 - References:
   - `thoughts/shared/plans/2026-01-28-roll-schedrl-adaptation.md`
-  - `thoughts/shared/plans/2026-01-28-nemo-rl-schedrl-adaptation.md`
-  - `thoughts/shared/plans/2026-01-28-miles-schedrl-adaptation.md`
+  - `thoughts/shared/plans/2026-01-28-nemo-rl-schedrl-adaptation.md` (deferred; archived)
+  - `thoughts/shared/plans/2026-01-28-miles-schedrl-adaptation.md` (deferred; archived)
   - `thoughts/shared/plans/2026-01-28-skyrl-train-adaptation-plan.md`
 
 ---
