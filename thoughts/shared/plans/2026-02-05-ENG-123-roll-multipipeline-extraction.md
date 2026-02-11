@@ -4,9 +4,13 @@
 
 We will re-plan and implement SchedRL as the shared **Ray-based** time-sharing library (**Library Mode only for ENG-123**) and migrate the working multi-pipeline time-sharing logic from `third_party/ROLL_multi_pipeline/` into `schedrl/`, while keeping **framework-specific mechanics** in `third_party/ROLL` behind a small Adapter/shim.
 
-Option A boundary (chosen):
-- `schedrl/` owns: protocol/types + client + central scheduler actor (Library Mode) + planner/executor + state.
-- `third_party/ROLL` owns: ROLL Adapter actor implementation, and ROLL-specific mechanics (DP subset lifecycle, targeted abort+ACK semantics, progress mapping) used to satisfy the shared Adapter RPC surface.
+Option A boundary + framework patching policy (ENG-123):
+- Ownership split:
+  - `schedrl/` owns: protocol/types + client + central scheduler actor (Library Mode) + planner/executor + state.
+  - `third_party/ROLL` owns: ROLL Adapter actor implementation, and ROLL-specific mechanics (DP subset lifecycle, targeted abort+ACK semantics, progress mapping) used to satisfy the shared Adapter RPC surface.
+- Adapter-first integration is the default: prefer implementing framework-specific behavior in the ROLL Adapter/shim.
+- Minimal, upstreamable patches to RL frameworks (e.g., ROLL internals) are allowed only when adapter-only alternatives are clearly worse (e.g., Ray actor limitations or missing required framework hook points).
+- Any framework patch must be narrowly scoped, must not move scheduler policy into framework core, and must include a short rationale in the PR.
 
 Primary goal for ENG-123:
 - **ROLL-only integration**, but the extracted scheduler core must be designed so SkyRL-train can be added next with a new Adapter (no scheduler redesign).
@@ -125,7 +129,7 @@ Several items in the older intended design are not requirements for ENG-123 (or 
 
 - **Priority queue internals**: keep the existing fork implementation (per-priority FIFO lists + wakeup loop). Do not refactor to heapq in ENG-123.
 - **Priority taxonomy**: keep the existing 7-tier `Priority` enum; do not compress to 4 tiers in ENG-123.
-- **API naming/return values**: keep `register_pipeline` / `admit_pipeline` / `request_gpus` returning GPU IDs for ENG-123.
+- **API naming/return values**: keep fork API naming for ENG-123 (`register_pipeline` / `admit_pipeline` / `request_gpus`). `request_gpus` is a blocking activation grant over registered GPU IDs (ROLL YAML is source-of-truth).
 - **Min-DP constraints**: do not add `min_dp_workers_per_pipeline` enforcement in ENG-123; track as future work.
 
 These are documented here so implementers do not “close a gap” by changing behavior beyond ENG-123 scope.
@@ -134,7 +138,7 @@ Decision notes (from `multi_pipeline_gaps.md`) that are binding for ENG-123:
 
 - Keep fork queue implementation; do not pursue heapq/lock-free refactor in ENG-123.
 - Keep fork FIFO semantics; do not add priority boosting in ENG-123.
-- Keep fork API naming/return values (`register_pipeline`/`admit_pipeline`/`request_gpus` returning GPU ids) for ENG-123.
+- Keep fork API naming (`register_pipeline`/`admit_pipeline`/`request_gpus`) for ENG-123; interpret `request_gpus` as a blocking activation grant (no GPU selection by SchedRL).
 - Treat locking vs atomicity as an implementation detail; rely on the coordinator contract + fork’s existing lock discipline.
 
 Post-ENG-123 follow-ups (explicitly reflecting the gaps doc decisions):
@@ -142,8 +146,13 @@ Post-ENG-123 follow-ups (explicitly reflecting the gaps doc decisions):
 - Min-DP constraints: keep fork shrink planning behavior for ENG-123; add `min_dp_workers_per_pipeline` enforcement after ENG-123.
 - Priority taxonomy: keep fork 7-tier taxonomy for ENG-123; revisit after ENG-123 if needed.
 - Queue refactors: heapq/lock-free refactor is deferred until after ENG-123; the “What is needed to close gap” item proposing heapq in `multi_pipeline_gaps.md` is superseded by the ENG-123 Decision.
+- **SharedStorage cleanup (G4)**:
+  - ENG-123: implement explicit `SharedStorage.delete_prefix(pipeline_id)` cleanup on pipeline teardown so ports/metadata can be reused within the same job.
+  - Post-ENG-123: add TTL / detached-actor lifecycle hardening for Service Mode.
 
 ## Concrete contracts (must match exactly)
+
+See `## Workflow + Contracts (SPEC; ENG-123)` for the admission-gated startup flow, GPU source-of-truth (ROLL YAML decides concrete GPU IDs), and TP>1 weight transfer requirements.
 
 ### Standardized actor names (ENG-123)
 
@@ -155,7 +164,7 @@ All actors are in Ray namespace `schedrl`.
 - `schedrl:adapter:{pipeline_id}`
 
 Explicit non-goal / boundary:
-- `model_update_service` is framework-specific and lives in `third_party/ROLL` (Option A boundary). Do not add `schedrl:model_update_service:{pipeline_id}`.
+- `model_update_service` is framework-specific and lives in `third_party/ROLL` (see **Option A boundary + framework patching policy (ENG-123)**). Do not add `schedrl:model_update_service:{pipeline_id}`.
 
 ### Canonical `request_id`
 
@@ -221,8 +230,15 @@ Cadence:
 
 **Serialization (by design; no retry tolerance)**:
 - Adapter actions are **not** required to be idempotent.
-- Actions must be **serialized** (no interleaving/concurrency) using the same lock discipline as the working reference in `third_party/ROLL_multi_pipeline/` (e.g., `swapping_lock` and `request_lock`).
+- Actions must be **serialized** (no interleaving/concurrency) with `swapping_lock` for full shrink/expand operations and `routing_lock` for brief routing-metadata edits.
 - Assumption (ENG-123 scope): callers do **not** issue duplicate/retry RPCs after timeouts; the system assumes the action went through.
+
+**Two-lock usage (source of truth)**:
+- `routing_lock` protects routing metadata changes (`active_dp_ranks`, `src_rank2_dp_rank`, and any per-src sticky mappings); keep hold time brief.
+- `swapping_lock` serializes full lifecycle operations (shrink/expand onload/offload/abort-drain windows) to prevent concurrent physical worker-state races.
+- `generate_one_request()` must not acquire `swapping_lock`; request routing should only touch `routing_lock`.
+- Any add/remove of active DP ranks and any clearing of sticky mappings during shrink/expand happens under `routing_lock`.
+- For required ordering during shrink/expand (suspend-before-clear, brief `routing_lock` hold, no `routing_lock` held across awaits, lifecycle serialization), see **“Routing lock atomicity and suspend-before-clear ordering (required)”** in the verification clarifications.
 
 **Documented limitation (explicit)**:
 - ENG-123 intentionally does **not** implement `activation_epoch` / `action_id` / idempotency tokens or “Superseded” ACK semantics.
@@ -239,6 +255,13 @@ Cadence:
 - Adopt canonical request id format for ROLL when used with SchedRL:
   - **All modes**: `{pipeline_id}:{traj_id}:{turn_id}:{attempt}`
 - Provide a `schedrl` helper (in protocol) to build/parse/validate these IDs; ROLL adapter uses it to validate and to target aborts.
+
+**Upstream overwrite note (required; request_id dual-write)**:
+- Upstream ROLL `RequestScheduler.generate_one_request()` overwrites `data.meta_info["request_id"]` with an internal `uuid_counter`-style id.
+- For ENG-123 we keep the internal `request_id` as the primary abort-tracking key, and we carry the canonical SchedRL id in a separate field:
+  - Set `data.meta_info["schedrl_request_id"] = build_request_id(...)` in `traj_env_manager.py`.
+  - Preserve `data.meta_info["request_id"]` as the scheduler-generated internal id.
+- Any targeted abort / running_requests tracking uses the internal `request_id`; scheduler/protocol-facing logs and cross-pipeline correlation use `schedrl_request_id`.
 
 **Validation**:
 - Verify parser/validator works correctly.
@@ -265,16 +288,17 @@ Cadence:
 - Requests block at `_check_suspend` while `need_suspend=True`.
 - Requests raise `RuntimeError` if `active_dp_ranks` is empty while `need_suspend=False` (state inconsistency).
 
-**Required implementation in ROLL Adapter**:
+**Required implementation in upstream ROLL `RequestScheduler` (per-pipeline RequestScheduler actor instance)**:
 - Implement a blocking gate in `generate_one_request` using `asyncio.Event` (e.g., `suspend_notifier`) and a `need_suspend` flag.
-- **Behavior during transition**:
-  - `close_admission(worker_indices)`: 
-    - If it results in zero active workers (shrink-to-zero): set `need_suspend=True`, clear `suspend_notifier`. 
-    - Otherwise: remove `worker_indices` from `active_dp_ranks` under `request_lock`.
-  - `open_admission(worker_indices)`: 
-    - Add `worker_indices` to `active_dp_ranks` under `request_lock`.
+  - **Behavior during transition**:
+  - `close_admission(dp_ranks)`: 
+    - Locking note (avoid confusion): `routing_lock` lives on `RequestScheduler` (not on the outer `schedrl:adapter:{pipeline_id}` Ray actor). Implement `RequestScheduler.close_admission(...)` as `async with self.routing_lock:` (or assert caller holds it). This path mutates `active_dp_ranks` / sticky routing metadata and must be atomic w.r.t. `generate_one_request()`.
+    - If it results in zero active workers (shrink-to-zero): set `need_suspend=True`, clear `suspend_notifier`.
+      - Under `routing_lock`, perform the required mapping updates/clears (mark ranks inactive; clear `src_rank2_dp_rank` / sticky mappings) using the ordering in **Routing lock atomicity and suspend-before-clear ordering (required)**.
+    - Otherwise: remove `dp_ranks` from `active_dp_ranks` under `routing_lock` (see **Two-lock usage (source of truth)**).
+  - `open_admission(dp_ranks)`: 
+    - Add `dp_ranks` to `active_dp_ranks` under `routing_lock` (see **Two-lock usage (source of truth)**).
     - If `need_suspend` was True: set `need_suspend=False`, set `suspend_notifier` to unblock queued requests.
-
 **Error conditions**:
 - Raise `RuntimeError("No active workers and not suspended")` if `generate_one_request` is reached with an empty `active_dp_ranks` set while `need_suspend` is False.
 - This ensures that if expansion fails or state diverges, the pipeline fails loudly rather than hanging forever.
@@ -287,10 +311,10 @@ Cadence:
 
 **Verified**.
 
-**Evidence**: `third_party/ROLL/roll/distributed/executor/model_update_group.py` calls `start_model_update` on all `src_cluster.workers` and does not accept `worker_indices`.
+**Evidence**: `third_party/ROLL/roll/distributed/executor/model_update_group.py` calls `start_model_update` on all `src_cluster.workers` and does not accept `dp_ranks`.
 
 **Required fix**:
-- Add subset-aware sync-on-resume (either via porting `ModelUpdateService` from the fork or by extending `ModelUpdateGroup` with a `worker_indices` argument).
+- Add subset-aware sync-on-resume (either via porting `ModelUpdateService` from the fork or by extending `ModelUpdateGroup` with a `dp_ranks` argument).
 
 **Validation**:
 - Verify subset update only touches specified ranks.
@@ -313,15 +337,15 @@ Cadence:
 - Verify selective updates target correct workers.
 - Verify bucket caching provides performance benefit (or at least works).
 
-### High: SchedRL Client/Scheduler API Missing (`swap_gpus` & `notify_ready_to_release`)
+### High: SchedRL Client/Scheduler API Missing (`release_and_request` & `notify_ready_to_release`)
 
 **Verified missing in upstream**.
 
 **Evidence**:
-- `swap_gpus` (implemented as `release_and_request_gpus` in fork) and `notify_ready_to_release` are core time-sharing primitives but missing in upstream ROLL and SchedRL.
+`release_and_request` (implemented as `release_and_request_gpus` in fork) and `notify_ready_to_release` are core time-sharing primitives but missing in upstream ROLL and SchedRL.
 
 **Required fix**:
-- Implement `swap_gpus` (Atomic Release+Request) in **SchedRL Scheduler**.
+- Implement `release_and_request` (Atomic Release+Request) in **SchedRL Scheduler**.
 - Implement `notify_ready_to_release` (Blocking Planned Release) in **SchedRL Scheduler**.
 - Expose these via **`schedrl.client`** for Coordinator to call.
 - These are **Coordinator → Scheduler** calls (not Adapter RPCs).
@@ -476,6 +500,7 @@ This section consolidates all issues discovered during the deep verification of 
       cache[cluster_name] = request_scheduler
       return request_scheduler
   ```
+- **Naming requirement (E2)**: actor lookup must use a pipeline-scoped name (include `pipeline_id` prefix) to avoid collisions across multiple pipelines in the same Ray namespace.
 - **Reviewed**: Yes
 
 **P0: Issue 107: State Inconsistency on Execution Phase Failure**
@@ -551,9 +576,9 @@ This section consolidates all issues discovered during the deep verification of 
 
 **P1: Issue 30 & 41: Adapter RPC API Alignment**
 - **Finding**: Mismatches in `expand_workers` (needs selective sync logic) and Indexing (Physical vs Logical args).
-- **Fix**: Update Adapter RPC surface. All translation between SchedRL protocol (logical indices) and ROLL primitives (physical GPUs) happens in the Adapter:
-  - **Issue 30 (`expand_workers`)**: Adapter derives `global_step` from coordinator's `active_checkpoint_version` and always enables selective update (hardcoded). Calls existing ROLL `expand_workers(target_gpus, skip_load=True)` after translating logical `worker_indices` to physical GPU IDs.
-  - **Issue 41 (Indexing)**: Adapter maintains topology mapping and converts logical `worker_indices` (DP ranks) to physical `target_gpus` internally. No changes to upstream ROLL API.
+- **Fix**: Update Adapter RPC surface to use `dp_ranks` directly as the lifecycle target identifier:
+  - **Issue 30 (`expand_workers`)**: Adapter selects rollout `dp_ranks` only, then calls `ModelUpdateService` for selective sync. Active rollout checkpoint version is promoted by coordinator signaling and stored on sender strategy cache state.
+  - **Issue 41 (Indexing)**: For ENG-123, `dp_ranks` are the canonical identity in adapter lifecycle APIs. Do not introduce separate logical-vs-physical index translation in the adapter contract.
 - **Reviewed**: Yes
 
 
@@ -613,7 +638,7 @@ This section consolidates all issues discovered during the deep verification of 
 **P0: Issue 49: Port Collision & Shared Storage Coordination**
 - **Finding**: Namespace collisions between SchedRL and ROLL.
 - **Fix**: Ensure shared services are reachable or share the `schedrl` namespace.
-- **Review Decision**: Invalid - By Design. The plan already specifies standardized actor names under the `schedrl` namespace (`schedrl:orchestrator`, `schedrl:scheduler`, `schedrl:adapter:{pipeline_id}`), and Library Mode uses independent Ray clusters per job, eliminating collision risk.
+- **Review Decision**: Invalid - By Design. The plan already specifies standardized SchedRL actor names under the `schedrl` namespace (`schedrl:orchestrator`, `schedrl:scheduler`, `schedrl:adapter:{pipeline_id}`), and Library Mode uses independent Ray clusters per job (no cross-job collisions). Note: within a single job (multi-pipeline), upstream ROLL scheduler helper actor names must be pipeline-scoped (see E2: `RolloutScheduler(pipeline_id=...)` prefixes `RequestScheduler`/`GroupQueueManager` names).
 - **Reviewed**: Yes - invalid
 
 **P0: Issue 51: Pipeline ID Delimiter Collision**
@@ -787,7 +812,7 @@ This section consolidates all issues discovered during the deep verification of 
 - **Reviewed**: Yes (Verified as superseded by `start_multi_pipeline_test.py`)
 
 **P2: Issue 235: Dead Code in `CentralizedGPUSchedulerImpl`**
-- **Finding**: Unused methods (`_plan_generation_fifo`, `notify_completion` stub).
+- **Finding**: Unused methods (`_plan_generation_fifo`) and legacy stubs in `CentralizedGPUSchedulerImpl` (not the fork's production `CentralizedGPUScheduler`).
 - **Fix**: Do not port.
 - **Reviewed**: Yes (Verified as unused stubs/legacy methods)
 
@@ -811,6 +836,10 @@ This section consolidates all issues discovered during the deep verification of 
   2. `examples/multi_pipeline/pipeline2_sokoban_grpo.yaml` (Companion pipeline)
   3. `examples/multi_pipeline/start_multi_pipeline_test.py` (Main entry point for multi-pipeline testing)
 - **Reviewed**: Yes (Verified as the canonical multi-pipeline example set)
+
+**Note (policy update)**:
+- This plan merged the boundary statement and patch policy into a single top-level section: **Option A boundary + framework patching policy (ENG-123)**.
+- When interpreting “port examples” in ENG-123, apply that merged policy: keep scheduler logic in `schedrl/`, keep ROLL-specific mechanics behind the Adapter/shim, and only apply minimal upstreamable ROLL patches when adapter-only alternatives are clearly worse.
 
 **P0: Issue 236 & 217: [CLOSED - Invalid] Robust Suspend/Resume (Shrink-to-Zero)**
 - **Finding**: Multi-pipeline time-sharing requires pipelines to "shrink to 0" workers, but this logic is fragile/disabled.
@@ -849,6 +878,19 @@ This section consolidates all issues discovered during the deep verification of 
 **P1: Issue 202 & 216: Proportional Rebalancing & Session Migration**
 - **Finding**: `RequestScheduler.rebalance_on_expand` implements a specific "proportional abort" strategy: when expanding, it calculates how many sticky sessions (src_ranks) to keep on old workers and aborts the rest, forcing them to re-route to new workers.
 - **Fix**: SchedRL's `RequestScheduler` must implement this specific "Aborts-for-Rebalancing" logic to ensure new workers actually get traffic after expansion.
+  - Termination safety: guard `_rebalance_on_expand` against "zombie inflation" where `src_rank2_dp_rank` contains mappings to inactive ranks (inflates `src_ranks_to_abort` beyond the selectable pool). Filter abortable mappings to `old_active_dp_ranks` before doing proportional math (or clamp planned abort to available) and `logger.warning(...)` if clamping occurs; proceed best-effort (rebalancing accuracy is not correctness-critical for ENG-123).
+  - Selection policy (balance): each iteration, abort one `src_rank` from the most-loaded old worker (max remaining `src_ranks`), not `cycle(...)` round-robin. If `max_load == 0` (no `src_ranks` left to steal), stop and warn.
+  - Implementation note (why this matters; avoid hangs):
+    - Current upstream-style selection uses `cycle(dp_rank_to_src_ranks.keys())` and has no `await` inside the selection loop. If the abort target is inflated (due to zombie entries) and all per-worker lists drain, the loop can spin forever and block the event loop, so `asyncio.wait_for(..., timeout=30s)` may not fire.
+    - Recommended best-effort algorithm (deterministic, terminates):
+      1. Snapshot `old_active_dp_ranks = active_dp_ranks.copy()` before `active_dp_ranks.update(expand_dp_ranks)`.
+      2. Build `dp_rank_to_src_ranks` by filtering `src_rank2_dp_rank.items()` to `dp_rank in old_active_dp_ranks`.
+      3. Let `available = sum(len(v) for v in dp_rank_to_src_ranks.values())`.
+      4. Compute `planned_to_abort` from `available` (or compute from `len(src_rank2_dp_rank)` then clamp: `planned_to_abort = min(planned_to_abort, available)` and `logger.warning(...)` if clamped).
+      5. While `remaining_to_abort > 0`:
+         - pick `dp_rank = argmax len(dp_rank_to_src_ranks[dp_rank])` over old active ranks
+         - if `max_load == 0`: `logger.warning(...)` and break (no src env left to steal)
+         - pop one `src_rank` from that dp rank, decrement `remaining_to_abort`
 - **Reviewed**: Yes
 
 **P2: Issue 203 & 209: Offload Verification & Gap Closure**
@@ -917,10 +959,10 @@ This section consolidates all issues discovered during the deep verification of 
   - **Old**: `start_server()` / `stop_server()`
   - **New**: `load_states()` / `offload_states()`
 - **Correct Pattern** (use upstream ROLL's `suspend()` logic, not fork's `rebalance_on_shrink`):
-  1. `abort_requests(worker_indices)` - send abort signals to workers
+  1. `abort_requests(dp_ranks)` - send abort signals to workers
   2. `while not empty(): await empty_notifier.wait()` - wait for `running_requests` to be empty (actual completion)
   3. `clear_src_rank_mappings()` - remove sticky routing
-  4. THEN `offload_states_partial(worker_indices)` - safe to move weights to CPU
+  4. THEN `offload_states_partial(dp_ranks)` - safe to move weights to CPU
 - **Why Not Fork's Pattern**: Fork's `await asyncio.gather(*abort_futures)` only waits for RPC return, not actual request completion. This creates race condition where requests still run during offload.
 - **Fix for ENG-123**:
   1. Remove `start_server/stop_server` from upstream ROLL
@@ -947,7 +989,11 @@ This section consolidates all issues discovered during the deep verification of 
   3. **Update Adapter RPC handlers**:
      - `shrink_workers()` → call `offload_states_partial()` (replaces stop_server)
      - `expand_workers()` → call `load_states_partial()` (replaces start_server)
-  4. **Server lifecycle change**:
+  4. **Precondition behavior (B1)**:
+     - Keep upstream fail-fast assertions in partial lifecycle APIs.
+     - `load_states_partial(dp_ranks)`: keep `assert is_loaded is False`.
+     - `offload_states_partial(dp_ranks)`: keep `assert is_loaded is True`.
+  5. **Server lifecycle change**:
      - Old: Explicit `start_server()` → `stop_server()` calls
      - New: Implicit via `load_states()` → `offload_states()` (server tied to model state)
 - **Implementation Note**: This is a breaking API change. Ensure all fork code using `stop_server`/`start_server` is updated during porting.
@@ -1020,15 +1066,47 @@ We will **port concepts** from `third_party/ROLL_multi_pipeline` into `schedrl/`
 
 Key design choice: keep the Adapter surface identical regardless of lifetime model. (Service Mode is deferred.)
 
+## Workflow + Contracts (SPEC; ENG-123)
+
+### Workflow (ENG-123, Library Mode; admission-gated spawn; source-of-truth GPUs in ROLL)
+
+Reference workflow: `third_party/ROLL_multi_pipeline/examples/multi_pipeline/start_multi_pipeline_test.py`.
+
+1. **ROLL runner loads YAML** and determines **concrete GPU IDs** / device mapping for each cluster (e.g. `actor_train`, `actor_infer`, `critic`) including DP/TP structure (TP>1 supported/required).
+2. **ROLL runner connects to Ray** (job-scoped Ray cluster for ENG-123).
+3. **ROLL → SchedRL Orchestrator**: `register_pipeline(pipeline_id, registration_payload)` where `registration_payload` includes:
+   - concrete GPU IDs / device mapping (ROLL is the source-of-truth),
+   - any topology metadata needed by the adapter (dp ranks, tp groups, rank2devices, etc.),
+   - required config validations (e.g. `sleep_level=2`, `partial_gpu_mode=False`).
+4. **ROLL → SchedRL Orchestrator**: `admit_pipeline(pipeline_id) -> AdmitResponse` (**blocking**).
+   This is the admission gate: ROLL must not start GPU-heavy initialization until this returns. `AdmitResponse` includes a scheduler handle/locator for subsequent coordinator→scheduler RPCs.
+5. **After admit ACK**, ROLL spawns and initializes the pipeline’s GPU-heavy Ray actors/workers and enters the training loop.
+6. During runtime:
+   - **Pipeline/adapter → SchedRL**: `report_progress(pipeline_id, ...)` (batch start + 2% band crossings + completion).
+   - **SchedRL Scheduler → Adapter (`schedrl:adapter:{pipeline_id}`)**: lifecycle RPCs (`close/open_admission`, `shrink/expand`, `abort`/drain, offload/stop).
+   - **Coordinator (pipeline) → SchedRL Scheduler**: coordinator primitives (e.g. `notify_ready_to_release`, `release_and_request`) as required by the SchedRL protocol.
+
+### Contracts / Invariants (must hold)
+
+Single source of truth for contracts (avoid duplication):
+- Resource model + admission gate + GPU source-of-truth: see **## Concrete contracts (must match exactly)**.
+- Shrink-to-zero and shrink ordering: see **Verified issues to address** → **Critical 1**.
+- Abort ACK semantics + timeout policy: see **Verified issues to address** → **Critical 2**.
+- Routing metadata/lifecycle locking + ordering: see **Two-lock usage (source of truth)** and **Routing lock atomicity and suspend-before-clear ordering (required)**.
+
 ### Adapter RPC Surface (minimum)
 
 Scheduler → Adapter:
-- `close_admission(worker_indices) -> ActionResponse`
-- `open_admission(worker_indices) -> ActionResponse`
-- `shrink_workers(worker_indices, shrink_to_zero: bool = False) -> ActionResponse`
-- `expand_workers(worker_indices) -> ActionResponse`
-  - Derives `global_step` internally from coordinator's `active_checkpoint_version`
+- `close_admission(dp_ranks) -> ActionResponse`
+- `open_admission(dp_ranks) -> ActionResponse`
+- `shrink_workers(dp_ranks) -> ActionResponse`
+- `expand_workers(dp_ranks) -> ActionResponse`
+  - Adapter decides `tgt_dp_ranks`; sender strategy cache state holds active rollout checkpoint version
   - Always performs selective sync-on-resume (hardcoded behavior)
+
+Coordinator/Pipeline loop → ModelUpdateService:
+- `promote_active_checkpoint(checkpoint_version: int, global_step: int) -> None`
+  - Explicit coordinator signal for activation target. `ModelUpdateService` forwards to sender strategy, which stores version metadata and cache state. shrink/expand APIs do not carry version args
 
 #### Assumptions (validate now) + Backlog (enforce later): prerequisites for Adapter RPCs without `activation_epoch` / `base_version`
 
@@ -1037,7 +1115,7 @@ This plan assumes a stronger decoupling where the scheduler only provisions GPUs
 Because we remove `activation_epoch` / `base_version` now, implementors MUST validate these system-level requirements hold end-to-end. Enforcement mechanisms are backlog items and will be implemented later.
 
 - **Single lifecycle caller**: only the central scheduler is allowed to issue Adapter lifecycle actions (`expand_workers`, `shrink_workers`, `open_admission`, `close_admission`).
-  - Today `RequestScheduler` is a named Ray actor in `RAY_NAMESPACE` (e.g., `{pipeline_id}_request_scheduler_{mode}`) and is therefore globally discoverable.
+  - Control flow note: upstream ROLL currently uses fixed Ray actor names for scheduler helpers (no `pipeline_id`), which can collide across multiple pipelines. ENG-123 patches upstream `RolloutScheduler(pipeline_id=...)` to prefix both `RequestScheduler` and `GroupQueueManager` `.options(name=...)` names so each pipeline instance is uniquely discoverable (e.g., `{pipeline_id}_RequestScheduler-...-{mode}`).
   - Enforcement options (pick one):
     - Do not register lifecycle actors under globally discoverable names; pass handles only to the scheduler.
     - Or require a capability token / scheduler secret on lifecycle RPCs (fail closed).
@@ -1058,8 +1136,8 @@ Coordinator (Pipeline Actor) → Scheduler:
   - **Blocking Allocation**: Blocks until the requested GPUs are allocated by the scheduler.
 - `release_gpus(cluster_id, ..., global_step: Optional[int] = None)`
   - **Immediate Release**: Frees GPUs immediately. Used by stateful clusters (Training, Critic) that do not require "shrink" logic.
-- `swap_gpus(release_cluster_id, request_cluster_id, ..., global_step: Optional[int] = None)`
-  - **Atomic Release+Request**: Prevents race conditions where a released GPU is stolen by another pipeline before the requester can grab it. Critical for performant Train->Infer transitions.
+- `release_and_request(release_cluster_id, request_cluster_id, ..., global_step: Optional[int] = None)`
+  - **Atomic Release+Request**: Atomically submits a release intent for one registered cluster and a follow-on activation request for another cluster as a single scheduler transaction. Under ENG-123 static GPU mapping, this is a logical activation-transition *request* over pre-registered GPU IDs (not physical GPU re-assignment); the actual activation grant occurs when the scheduler executes the plan.
 - `notify_ready_to_release(..., global_step: Optional[int] = None)`
   - **Planned Release (Blocking)**: Signals that a generation batch is complete. Unlike `release_gpus` (immediate), this blocks until the scheduler's Phase 0-6 planning loop safely reclaims the resources. Essential for "Gap-Ratio" fairness and partial-GPU synchronization.
 - `report_progress(..., fifo_timestamp: Optional[float] = None)`
@@ -1068,9 +1146,10 @@ Coordinator (Pipeline Actor) → Scheduler:
 
 ### Critical protocol clarifications for ENG-123 (ROLL-only, Library Mode)
 
-- **Shrink-to-zero must be supported** in upstream ROLL adapter paths.
-- **Abort ACK definition (ROLL)**: ACK = “targeted request ids are no longer in-flight” (tracked in `RequestScheduler.running_requests`), not strict `finish_reason == "abort"`.
-- request_id format must include `pipeline_id` prefix.
+Single source of truth (avoid duplication):
+- Shrink-to-zero support + ordering: see **Verified issues to address** → **Critical 1**.
+- Abort ACK definition (ROLL): see **Verified issues to address** → **Critical 2**.
+- request_id format: see **Concrete contracts (must match exactly)** → **Canonical `request_id`**.
 
 ## Phase 1: Create `schedrl` core package skeleton (Library Mode only)
 
@@ -1127,7 +1206,7 @@ Note: these are fields on SchedRL typed config objects (dataclasses) passed to t
 
 #### 2) `schedrl/client/*`
 **Files** (new):
-- `schedrl/client/adapter.py` (Adapter ABC)
+- `schedrl/protocol/adapter.py` (Adapter ABC; methods raise `NotImplementedError`)
 - `schedrl/client/client.py` (connect/get-or-create; register/report helpers)
 
 **Key behavior**
@@ -1177,7 +1256,7 @@ Library Mode placement requirement (ENG-123): pin **ALL** SchedRL system actors 
 
 Client connection flow (ENG-123, Library Mode only):
 - `connect(create_if_missing=True)` returns the **orchestrator** handle.
-- `admit_pipeline(...)` returns an `AdmitResponse` that includes a **scheduler handle (or actor locator)**. After admission, the client may call the scheduler directly for high-frequency RPCs (e.g., progress reporting) while orchestration/admission remains orchestrator-owned.
+- `admit_pipeline(...)` is **blocking** and returns an `AdmitResponse` that includes a **scheduler handle (or actor locator)**. After admission, the coordinator may call the scheduler directly for high-frequency RPCs (e.g., progress reporting) while orchestration/admission remains orchestrator-owned.
 - The orchestrator is responsible for validating that scheduler calls are only used after admission (fail-fast on misuse).
 
 `connect(create_if_missing=True)` implements get-then-create and handles create races.
@@ -1327,11 +1406,16 @@ FIFO policy (plan-only clarification):
   - plan non-generation
   - plan generation (initially simple; can start FIFO)
   - validate execution plan
+    - **TASK**: Port logic from `third_party/ROLL_multi_pipeline/roll/distributed/scheduler/gpu_scheduler_validation.py` to `schedrl/scheduler/validation.py`.
+    - Must include all 11 critical conditions: operation uniqueness, DP rank boundaries, device mapping validation, and double-free detection.
   - execute shrinks/allocations/expansions
   - commit state
 
 **Implementation Reminders (Verified Issues)**:
 - **Issue 81 (Orphaned Signaling)**: `_execute_expansions` must ensure all successful expansions are signaled even if some fail (use `return_exceptions=True` in `asyncio.gather`).
+- **H1 (Dead assertions)**: when porting expand-from-zero allocation construction, do not copy fork's no-op tuple “assertions” (`len(...) > 0, "msg"`). Use real `assert` / raise in SchedRL scheduler.
+- **H2 (pipeline_id parsing)**: never parse `pipeline_id` from `cluster_id` using `rsplit("_", 1)`. Use a suffix-aware cluster-id parser (equivalent to fork `CentralizedGPUScheduler._parse_cluster_id`).
+- **H3 (notify_completion race)**: `notify_completion` must perform the idempotency check and insertion into `pending_completion_requests` under the scheduler lock (one critical section).
 
 #### 3) Progress ingestion
 **Source reference**: `third_party/ROLL_multi_pipeline/roll/distributed/scheduler/rollout_scheduler.py` progress buckets
@@ -1357,55 +1441,65 @@ Add a small shim in upstream ROLL to integrate with `schedrl`.
 
 ### Changes Required
 
-#### 1) ROLL Adapter actor
-**Target location**: inside `third_party/ROLL/roll/` (exact path chosen to match ROLL conventions).
+#### 1) Utility Porting
+**Target location**: `third_party/ROLL/roll/schedrl_adapter/`
+- **TASK (minimal; reuse upstream)**: Do not port fork vLLM `worker_helper.py` or fork TP-shard-aware receiver assembly logic for ENG-123.
+- **TASK (required)**: Reuse upstream `roll/utils/send_recv_utils.py` (`serialize_named_weights(...)`, `named_tensors_from_bucket(...)`) and upstream vLLM worker RPC contract for model-update payloads.
+
+Reference SHAs (verified):
+- Fork spec: `ROLL_multi_pipeline@262dd2c0527695a26f389a6c44a3a85701f48cc6` (`(feat): multi-pipeline.`)
+- Fork base: `ROLL_multi_pipeline@3077befc` (`(feat): publish roll v0.2.0.`)
+- Upstream baseline: `ROLL@777dad6180a32e278802f4775eeb9d821511f648`
+
+#### 2) ROLL Adapter actor
+**Target location**: `third_party/ROLL/roll/schedrl_adapter/adapter.py`
+- **TASK**: Implement `third_party/ROLL/roll/schedrl_adapter/concurrent_pipeline.py`. Port the logic from the fork's `ConcurrentAgenticPipeline` to wire up upstream worker types and the upstream `RequestScheduler` (patched in-place for ENG-123).
+
+**Scope (thin wiring; do not re-port fork orchestration)**:
+- `concurrent_pipeline.py` is wiring/glue only. Keep multi-pipeline orchestration and planning in `schedrl/` + the ROLL runner.
+- Must wire (framework mechanics):
+  - creation/ownership of the per-pipeline upstream `RequestScheduler` handle (owns `routing_lock`-protected routing metadata, `swapping_lock` serialization for shrink/expand, suspend gate, and targeted abort/drain helpers)
+  - adapter RPC backing hooks used by `adapter.py` (`close/open_admission`, `shrink/expand` helpers, stop/offload/onload primitives)
+  - progress reporting hooks (emit `report_progress(...)` at batch start + 2% bands + completion)
+  - request_id plumbing integration (canonical request_id + attempt increment)
+- Must not own (policy/orchestration):
+  - no global scheduling policy, no fairness logic, no multi-pipeline monitoring loops, no Ray cluster lifecycle management
 
 **Implements** the Adapter RPC surface by mapping to ROLL primitives:
 - **Admission gating** via a per-pipeline `active_dp_ranks` set and `need_suspend` flag (see "Admission Error Handling" section above).
 - `shrink_workers(P)` performs strict ordering:
+  0) acquire `swapping_lock` (serialize against concurrent expand/shrink)
   1) `close_admission(P)`
-  1.a) *Implementation ordering requirement*: when implementing `shrink_to_zero`, the adapter MUST set the scheduler suspend gate (call `suspend()` / set `need_suspend=True`) before clearing `active_dp_ranks` or calling `_clear_src_rank_mappings`. This ensures `generate_one_request()` (which awaits `_check_suspend()` before selecting a dp rank) blocks rather than calling `_get_least_active_dp_rank()` and raising `RuntimeError`.
+  1.a) *Implementation ordering requirement*: when `shrink_workers(P)` infers shrink-to-zero (`active_dp_ranks - P == ∅`), the adapter MUST set the scheduler suspend gate (call `suspend()` / set `need_suspend=True`) before clearing `active_dp_ranks` or calling `_clear_src_rank_mappings`. This ensures `generate_one_request()` (which awaits `_check_suspend()` before selecting a dp rank) blocks rather than calling `_get_least_active_dp_rank()` and raising `RuntimeError`.
   1.b) *Routing-lock atomicity*: Acquire `routing_lock` only for a short mapping update window (mark ranks inactive and clear relevant `src_rank2_dp_rank` mappings), then release it. **Do not** hold `routing_lock` while issuing abort RPCs or awaiting their completion — wait for drains using `empty_notifier`/`empty()` after releasing the lock. The drain/wait should specifically target `shrink_dp_ranks` (sum of running_requests for those ranks) so other active ranks may continue processing.
 
-  2) targeted abort of in-flight requests on P
-  3) wait for abort ACK with timeout; fail-fast on timeout
-  4) stop/offload P (full GPU memory release)
+  2) targeted abort of in-flight requests on P (no `routing_lock`)
+  3) wait for abort ACK with timeout; fail-fast on timeout (no `routing_lock`)
+  4) stop/offload P (full GPU memory release; still under `swapping_lock`)
   5) return release ACK payload (`release_reports`); ENG-123 uses `-1` sentinel values for post-release GPU memory fields; TODO add real measurement after ENG-123
+
 - `expand_workers(A)`:
-  1) Derive `global_step` from coordinator's `active_checkpoint_version`
-  2) onload/start servers for A
-  3) Perform selective sync-on-resume for subset A to `global_step` (always enabled)
-  4) `open_admission(A)`
+  0) acquire `swapping_lock` (serialize against concurrent shrink/expand)
+  1) onload/start servers for A (under `swapping_lock`)
+  2) Adapter computes `tgt_dp_ranks=A` and calls `ModelUpdateService.sync_selected_workers(tgt_dp_ranks)` (service reads active rollout checkpoint version from sender strategy cache state)
+  3) `open_admission(A)` with brief `routing_lock` metadata update, then release `swapping_lock`
 
-Expand failure policy (Phase 1):
-- If any dp_rank in `expand_workers(A)` fails to start/load/sync, treat as fatal and terminate (fail loudly). Do not proceed with partial expansion.
+**Expand failure policy (fatal; Phase 3+4)**:
+- If any step in `expand_workers(A)` fails (onload/start, sync-on-resume, or `open_admission`), treat it as a controlled-fatal error: log context and immediately call `orchestrator.shutdown(force=True, reason="expansion_failed", source="phase3+4.expand_workers")`.
+- Rationale/reference: see **Verified Issues** → **Issue 81 & 124: Orphaned Expansion Signaling (Partial & Total Failure)** (this plan already mandates `shutdown(force=True)` on expansion failure).
 
-Abort timeout config + metrics (Phase 1):
-- Use fork env-var timeout configuration (ENG-123: env vars are the source of truth for action timeouts; `schedrl.*timeout*` typed fields are disabled).
-- Emit metric `schedrl/abort_wait_elapsed_ms` for shrink operations.
-
-**Source references**:
-- Deterministic request IDs + abort semantics plan: `thoughts/shared/plans/2026-01-28-roll-schedrl-adaptation.md`
-- Shared protocol rules: `design_doc/multi-pipeline-adaptation-plan.md`
-
-#### 2) ROLL-side request_id plumbing + abort ACK
-**Target files (upstream ROLL)** (from the adaptation plan):
+#### 3) ROLL-side request_id plumbing + abort ACK
+**Target files (upstream ROLL)**:
 - `third_party/ROLL/roll/pipeline/agentic/env_manager/traj_env_manager.py` (set deterministic request_id)
 - `third_party/ROLL/roll/distributed/scheduler/generate_scheduler.py` (respect request_id; targeted abort; active-rank routing)
 
-**Validation note (metadata feasibility)**:
-- ROLL already attaches `traj_id` in `rollout.non_tensor_batch["traj_id"]` and provides a turn index as `self.rollout_cache.step` (see `traj_env_manager.py`). Use these to construct canonical request IDs.
-
-**Precise injection point (required)**:
-- In `third_party/ROLL/roll/pipeline/agentic/env_manager/traj_env_manager.py` (`make_decision`, before calling `self.llm_proxy.generate(...)`):
+**Implementation Details**:
+- In `traj_env_manager.py` (`make_decision`):
   - `lm_input.meta_info["traj_id"] = traj_id`
   - `lm_input.meta_info["turn_id"] = self.rollout_cache.step`
-- `lm_input.meta_info["attempt"] = 0`  # NOTE: see RolloutCache requirement below
-  - `lm_input.meta_info["request_id"] = schedrl.protocol.request_id.build_request_id(pipeline_id, traj_id, turn_id, attempt)`
-  - attempt increments on each retry of the same turn.
-
-Attempt increment location (required clarification):
-- Increment `rollout_cache.attempt` in `TrajEnvManager.make_decision()` retry/exception handling path for the same turn (immediately before rebuilding `request_id` for the retry).
+  - `lm_input.meta_info["attempt"] = self.rollout_cache.attempt`
+  - `lm_input.meta_info["schedrl_request_id"] = build_request_id(...)` (canonical; pipeline-scoped; stable across the system)
+- Increment `rollout_cache.attempt` in `make_decision()` retry path.
 +
 +**RolloutCache `attempt` persistence (required)**
 +- Implementation note: `RolloutCache` must include an `attempt: int` field to persist the current attempt counter for the active turn. This ensures `attempt` is stable across retries and is used in the canonical `request_id`:
@@ -1418,14 +1512,22 @@ Attempt increment location (required clarification):
 #### 4) Explicit tasks to address upstream ROLL gaps (must-do in this phase)
 
 - Implement shrink-to-zero (remove `Cannot shrink to zero active ranks` guard) and define behavior for `active_dp_ranks == set()`.
+- Add `pipeline_id: Optional[str] = None` to upstream `RolloutScheduler.__init__()` and prefix both `GroupQueueManager` + `RequestScheduler` Ray actor names via `.options(name=...)` to avoid multi-pipeline actor-name collisions (E2). Keep this as a naming-only change (no child-actor signature changes required).
+- Fix `RequestScheduler._validate_calculated_ranks(ranks, mode)` expand-mode validation bug in upstream ROLL: shrink must validate ranks are active; expand must validate ranks are inactive (mode-aware check).
 - Enforce canonical request id format using `schedrl.protocol.request_id`.
 - Ensure sticky routing never targets inactive dp ranks after shrink.
 
 **Implementation Reminders (Verified Issues)**:
 - **Issue 85 (Port)**: Framework strategies (SGLang) must not hardcode ports. Use `get_free_port()` or a unique offset that accounts for multiple pipelines on the same node.
 - **Issue 86 (Offload)**: `VllmStrategy` weight offloading must be triggered whenever the scheduler issues a shrink/stop, regardless of whether internal colocation is detected, to ensure GPUs are freed for other pipelines.
+  - Apply the same rule to SGLang: `SGLangStrategy.offload_states` must release memory on scheduler shrink/stop even if `is_actor_infer_colocated` is false.
+  - Rollout offload validation (required; shrink/offload path): after `offload_states_partial(dp_ranks)` completes, verify device-level occupied percent via `torch.cuda.mem_get_info()` is `<= 10%` (fail-fast if higher).
+    - Use the same `10%` threshold as the `state_offload_manager` memory validation section (device-level `occupied_pct` check).
+    - We need both checks because they cover different mechanisms:
+      - `state_offload_manager` validates offload/reload done via the context-manager path (training/critic steps).
+      - rollout shrink/offload uses `offload_states_partial(dp_ranks)` and does not go through `state_offload_manager`.
 
-#### 3) Progress mapping
+#### 4) Progress mapping
 Emit SchedRL `report_progress(...)` from ROLL rollout bookkeeping (trajectory units; 2% bands), mapping from groups as described in:
 - `design_doc/multi-pipeline-adaptation-plan.md`
 - `design_doc/adaptation_roll.md`
@@ -1441,26 +1543,130 @@ Emit SchedRL `report_progress(...)` from ROLL rollout bookkeeping (trajectory un
   - shrink waits for abort ACK before stop/offload
   - shrink-to-zero works (generation cluster can fully release GPUs), then expand back and continue.
 
-## Phase 4: Migrate selective model update (resume/expand weight sync) behind the Adapter (minimal viable)
+## Phase 4: Migrate selective model update (resume/expand weight sync) behind the Adapter
 
 ### Overview
-Adopt the proven `ModelUpdateService` approach from `ROLL_multi_pipeline` so that expand/resume can selectively sync newly activated DP ranks.
+Port `ModelUpdateService` from `ROLL_multi_pipeline` to enable selective weight synchronization for expanding DP workers.
+
+**Upstream parity note (critical)**:
+- The fork `ModelUpdateService.selective_update()` depends on fork selective-update components, including dynamic NCCL group creation + teardown (`SelectiveModelUpdateGroup` + `teardown_collective_groups(...)` on all participants).
+- For ENG-123 we allow minimal upstreamable ROLL patches when adapter-only alternatives are clearly worse (see framework patching policy above).
+- This phase explicitly enumerates the upstream additions required; do not claim “upstream-only worker RPCs” unless verified.
+
+**Bucket caching policy (Option A boundary exception; required for TP>1)**:
+- Selective sync performance for TP>1 requires bucket caching/staging; adapter-only solutions are typically too slow (rebuilding/staging per update) and risk timeouts.
+- ENG-123 explicitly allows a **minimal, upstreamable framework hook** to wire sender-strategy-owned bucket caching (and only that).
+- Keep the patch narrowly scoped (no scheduler policy, no pipeline orchestration logic in core ROLL): the hook should only expose the minimal strategy/worker surface needed to build/cache CPU buckets for selective updates.
 
 ### Changes Required
 
-#### 1) Port/implement a trainer-side cache service concept
-**Source reference**: `third_party/ROLL_multi_pipeline/roll/distributed/executor/model_update_service.py`
+#### 1) Port `ModelUpdateService` to Adapter
+**Source**: `third_party/ROLL_multi_pipeline/roll/distributed/executor/model_update_service.py`  
+**Target**: `third_party/ROLL/roll/schedrl_adapter/model_update_service.py`
 
-Define a minimal SchedRL-facing contract:
-- “sender” (trainer side) caches latest weights by `global_step`
-- “receiver” (inference side) can request selective update for specific dp ranks and a requested step
+**What to keep**:
+- Sender-side cache logic (`refresh_sender_cache`, `register_sender_cache`).
+- Subset-DP targeting semantics:
+  - Primary: Adapter passes `tgt_dp_ranks` into `ModelUpdateService.sync_selected_workers(tgt_dp_ranks=...)`, selecting which DP-rank engines to sync (vLLM `collective_rpc(_async)` scope is TP/PP workers inside that engine, not all DP ranks).
+  - Guardrail: keep the fork's receiver-side allowlist (`set_model_update_allowed_dp_ranks(tgt_dp_ranks)` + cleanup reset) so even if a future strategy path fans out wider at the cluster level, non-target DP ranks can fail fast / early return. This mirrors the fork behavior and makes the subset contract explicit.
+- **Bucket caching (required; TP>1; Megatron-only in ENG-123)**: implement bucket building + caching via an adapter-owned thin wrapper around the upstream strategy.
+  - Hook point (agentic pipelines): wrap the strategy once right after `self.strategy = create_strategy(worker=self)` in `third_party/ROLL/roll/pipeline/base_worker.py:ActorWorker.initialize`.
+  - Backend dispatch: the wrapper checks `self.strategy.strategy_name` (fallback: `worker_config.strategy_args.strategy_name`).
+  - ENG-123 scope: only `megatron_train` is supported for bucket caching initially; other backends must fail fast with `NotImplementedError`.
+  - Reference implementation: follow fork behavior (`third_party/ROLL_multi_pipeline/roll/distributed/executor/worker.py: build_model_update_bucket_cache` and fork selective update path) when implementing the Megatron caching logic.
+  - Control flow note (avoid confusion; source of truth):
+    - Cache build cadence: sender-side bucket cache is built after each train step (or whenever a new weight version is produced) and keyed by checkpoint version / `global_step`.
+    - Promotion/activation: coordinator controls when a cached version becomes `active_rollout_checkpoint_version` via explicit promote signaling (strategy holds version metadata + cache).
+    - Sync trigger: the global scheduler triggers selective sync (e.g., on expand/resume). Adapter calls `ModelUpdateService.sync_selected_workers(tgt_dp_ranks=...)`, and the service syncs the already-promoted active version from sender strategy cache state (service does not choose versions).
+    - `ActorWorker.initialize` remains wiring-only: it enables the sender strategy to maintain cache state; it does not drive build cadence or promotion timing.
 
-Keep implementation in ROLL adapter layer initially (Option A boundary). The scheduler protocol does not carry model versions in this plan.
+  - **Boundary note (intentional minimal framework hook)**: this `ActorWorker.initialize` hook is an intentionally small, upstreamable ROLL patch to enable sender-strategy-owned bucket caching needed for ENG-123 selective sync. Keep the hook narrowly scoped to bucket-cache wiring only (no scheduler policy in core ROLL), and prefer adapter-only integration patterns elsewhere.
+- Timeout handling and validation.
+- **Strict Versioning**: sender strategy owns `active_rollout_checkpoint_version` and cache metadata; coordinator controls promotion timing via explicit signal. `ModelUpdateService` orchestrates sync using sender strategy state only. Strategy-side checks enforce sender-cache freshness (`cached_global_step <= active_global_step`) so expanding workers never receive "future" weights if activated mid-step.
+- **Serialization & Coalescing**: Never abort an active sync. If multiple sync requests arrive, skip intermediate versions and only sync the latest requested one (Highest Version Wins).
+- Colocated vs. separated worker classification.
+
+**What to change**:
+- Port fork's `SelectiveModelUpdateGroup` teardown semantics into upstream and ensure dynamic group lifecycle is safe:
+  - Teardown must run on every participant worker (sender + all receiver ranks that joined the group).
+  - Prefer `try: ... finally: group.teardown()` in the selective update orchestration so exceptions/timeouts do not leak groups.
+- **Worker RPC surface (ENG-123)**: port only the Worker RPCs that are actually required by the selective-update design; do not assume they exist upstream.
+  - If the implementation needs fork-only RPCs (as the fork does), add them as minimal upstreamable Worker methods and list them explicitly in the PR.
+- **Efficient Broadcast**: Ensure the service uses the cached buckets. For colocated targets, pass the cached serialized buffer directly in the `update_parameter_in_bucket.remote()` call.
+  - **CRITICAL (upstream signature compatibility)**: upstream vLLM `RollWorker.update_parameter_in_bucket(serialized_named_tensors, ...)` indexes `serialized_named_tensors[self.rank]`. Therefore, pass a **list** (not a dict) where the element at index `worker.rank` contains that worker's bucket payload.
+    - For selective updates to a subset of workers, use a full-length list sized to the rank-space (typically `len(infer_cluster.workers)` / `max(worker.rank)+1`), filling non-target indices with a sentinel (e.g., `None`) and ensuring each target worker receives its payload at `serialized_named_tensors[worker.rank]`.
+    - If we need a more memory-efficient sparse transport, that requires either (a) a small upstreamable worker change to accept a dict, or (b) an adapter-defined rank remapping layer; do not assume dict indexing works with upstream vLLM.
+
+#### 2) Implementation: Selective Update Flow (high-level)
+
+The service (Ray Actor) orchestrates the sync using only upstream Worker RPCs (`setup_collective_group`, `broadcast_parameter`, `update_parameter_in_bucket`) and strategy-level bucket caching.
+
+High-level steps:
+1. Identify newly expanded DP ranks (`tgt_dp_ranks`) and read `active_rollout_checkpoint_version` from sender strategy cache state.
+2. Trigger sender-side strategy bucket caching for the sender-strategy active rollout checkpoint/global step (required for TP>1). The cached CPU buckets are reused across future expansions.
+3. Split targets into:
+   - **colocated targets** (same node as sender): use `update_parameter_in_bucket` (CUDA IPC path) with cached buckets.
+   - **separated targets** (different node):
+     - create a collective group for sender + selected receivers
+     - broadcast cached buckets via `broadcast_parameter`
+     - **required upstream fix**: group teardown must call `dist.destroy_process_group` to avoid leaks; do not rely on dict-only cleanup. Teardown must be executed on all participant workers.
+4. Receiver apply path (ENG-123): rely on `ROLL_SELECTIVE_MODEL_UPDATE_RECEIVER_DISABLE_CPU_STAGING=1` so receivers apply directly (no fork CPU staging / TP shard-aware unpack). The bucket payload uses upstream `send_recv_utils.py` format and upstream vLLM `update_parameter_in_bucket` contract.
+5. Fail-fast on any timeout or partial failure.
+
+#### 3) Worker Requirements
+
+Reuse upstream APIs where possible:
+- `worker.setup_collective_group.remote(...)` — init NCCL group participant
+- `worker.broadcast_parameter.remote(group_name, ...)` — receive via NCCL
+- `worker.update_parameter_in_bucket.remote(...)` — receive via CUDA IPC
+
+**Upstream additions (required if used by the chosen implementation)**:
+- Port only the fork-only Worker RPCs that the implementation actually calls (determine from the final selective-update implementation; keep this list minimal).
+  - Candidate fork-only RPCs used by the reference implementation (TBD minimal set; verify against the final design):
+    - **Required (fork-like, worker-driven selective update)**:
+      - `start_selective_model_update(...)` — core selective update execution (sender-side orchestration calling strategy `selective_model_update_from_cache`).
+      - `build_model_update_bucket_cache(...)` — required if using cached-bucket staging (default in fork); can be skipped only if we accept rebuilding/staging buckets each update (likely too slow for TP>1).
+
+All three methods already exist in upstream `Worker` and are used by upstream `WeightUpdater` classes.
+
+#### 4) Key Differences from Upstream
+
+| Aspect | Upstream (Full-Cluster) | Selective (Adapter) |
+|--------|------------------------|---------------------|
+| **NCCL Group** | Static, created at init (`setup_model_update`) | Dynamic per update (requires real teardown via `dist.destroy_process_group`) |
+| **Target Workers** | All workers in `infer_cluster.workers` | Subset specified by `tgt_dp_ranks` |
+| **Group Lifecycle** | Created once, reused for all updates | Created before update, destroyed after |
+| **When Used** | Standard training step model sync | Expand/resume operations only |
+
+#### 5) Integration with Adapter RPC Surface
+
+The `expand_workers` RPC in the ROLL Adapter calls the service:
+
+```python
+class ROLLAdapter:
+    async def expand_workers(self, dp_ranks: List[int]):
+        # ... validate, onload, start servers ...
+        
+        # Selective model update for newly expanded workers
+        if self.model_update_service:
+            await self.model_update_service.sync_selected_workers(
+                tgt_dp_ranks=dp_ranks
+            )
+        
+        # ... open_admission ...
+```
 
 ### Success Criteria
 
 #### Manual Verification
 - [ ] Expand after a weight update results in new dp ranks serving the correct weights (no stale admission).
+- [ ] Dynamic NCCL group creation/teardown does not leak resources (verify via `nvidia-smi` and process inspection).
+
+**Required upstream change (ENG-123)**:
+- Upstream `GroupManager.destroy_collective_group()` must call `dist.destroy_process_group(...)` (not just delete Python dict entries) and must have correct bookkeeping so dynamic group lifecycle does not leak NCCL resources.
+- Add upstream `teardown_collective_groups(model_update_name, group_names)` surface (Strategy/Worker) and ensure selective update orchestration calls it for all participant ranks (typically from `SelectiveModelUpdateGroup.teardown()` in a `finally:`).
+- [ ] Colocated path uses CUDA IPC (verify no NCCL traffic for same-node updates).
+- [ ] Separated path uses NCCL broadcast (verify efficient cross-node transfer).
 
 ## Migration Notes
 
@@ -1504,14 +1710,15 @@ These clarifications remove ambiguity around identifiers, retry semantics, FIFO 
 - TODO (deferred): we are not reporting `oldest_unfinished_creation_ts` in ENG-123.
   - If/when we add it, record `creation_ts` when the episode/trajectory is first created (in `reset()`) and propagate it in `RolloutCache` for the life of that trajectory, including across retries of the same turn/request.
 
-3) Routing lock atomicity and suspend-before-clear ordering (required)
+3) Two-lock ordering + suspend-before-clear sequence (required)
 - Finding: Clearing `src_rank2_dp_rank` mappings during shrink/expand can race with in-flight `generate_one_request()` calls which choose a dp rank using `_get_least_active_dp_rank()`; `_get_least_active_dp_rank()` raises if `active_dp_ranks` is empty.
 - Required change (ordering + plan): adopt and document this safe sequence for rank teardown (shrink-to-zero and normal shrink):
-  1. Set the suspend gate (call `suspend()` / set `need_suspend=True`) so `generate_one_request()` blocks at `_check_suspend()` and does not proceed to `_get_least_active_dp_rank()`.
-  2. Acquire `routing_lock` and perform a *brief* mapping update: mark ranks as inactive and clear `src_rank2_dp_rank` entries for removed ranks. Release `routing_lock` immediately after updating mappings.
-  3. Issue targeted aborts to affected workers and wait for `running_requests` to drain to zero. **Do not** hold `routing_lock` while awaiting abort ACKs (this avoids deadlock with other async callbacks). Use `empty_notifier`/`empty()` to await completion.
-  4. Offload/stop the workers and collect post-release memory; return release ACK.
-  5. If resuming, perform expand actions and call `resume()` (clear suspend gate).
-- Rationale: setting `need_suspend` first prevents TOCTOU assignment races; holding `routing_lock` only for the short mapping-edit window prevents a stale mapping from being used while avoiding long lock holds that can deadlock RPC callbacks.
+  1. Acquire `swapping_lock` to serialize lifecycle operations.
+  2. Set the suspend gate (call `suspend()` / set `need_suspend=True`) so `generate_one_request()` blocks at `_check_suspend()` and does not proceed to `_get_least_active_dp_rank()`.
+  3. Acquire `routing_lock` and perform a *brief* mapping update: mark ranks as inactive and clear `src_rank2_dp_rank` entries for removed ranks. Release `routing_lock` immediately after updating mappings.
+  4. Issue targeted aborts to affected workers and wait for `running_requests` to drain to zero. **Do not** hold `routing_lock` while awaiting abort ACKs (this avoids deadlock with other async callbacks). Use `empty_notifier`/`empty()` to await completion.
+  5. Offload/stop the workers and collect post-release memory; return release ACK.
+  6. If resuming, perform expand actions and call `resume()` (clear suspend gate), then release `swapping_lock`.
+- Rationale: `swapping_lock` prevents concurrent offload/load races on the same workers; setting `need_suspend` first prevents TOCTOU assignment races; holding `routing_lock` only for the short mapping-edit window prevents stale mapping use while avoiding long lock holds that can deadlock callbacks.
 
 These clarifications are mandatory: add them to the plan file and require implementers to reference them in PR descriptions. They are doc-only changes; no functional code is changed by this edit.
