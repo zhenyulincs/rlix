@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -57,6 +58,7 @@ def _ensure_scheduler_singleton():
     import ray
 
     from schedrl.scheduler.scheduler import scheduler_actor_class
+    from schedrl.scheduler.resource_manager import get_or_create_resource_manager
 
     try:
         return ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
@@ -80,7 +82,11 @@ def _ensure_scheduler_singleton():
         scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
 
     try:
-        ray.get(scheduler.initialize.remote())
+        resource_manager = get_or_create_resource_manager()
+        # Admission control / topology gating happens here (orchestrator-owned).
+        # Scheduler only seeds its idle_gpus from the resource manager after this is ready.
+        ray.get(resource_manager.snapshot.remote(wait_timeout_s=10.0, poll_interval_s=0.2))
+        ray.get(scheduler.initialize.remote(resource_manager=resource_manager))
     except Exception as e:
         raise RuntimeError("Failed to initialize SchedRL scheduler actor") from e
     return scheduler
@@ -137,12 +143,42 @@ class Orchestrator:
         self._pipelines: Dict[str, PipelineState] = {}
         self._shutdown_started = False
 
-    def register_pipeline(self, *, pipeline_id: str, total_gpus: int, gpu_ids: list[int]) -> RegisterResponse:
+    def allocate_pipeline_id(self) -> str:
+        """Allocate a new pipeline_id.
+
+        Contract: driver scripts call this first, then create the pipeline adapter actor using the returned id.
+        """
+        while True:
+            pipeline_id = f"p_{uuid.uuid4().hex}"
+            validate_pipeline_id(pipeline_id)
+            if pipeline_id not in self._pipelines:
+                return pipeline_id
+
+    def register_pipeline(
+        self,
+        *,
+        pipeline_id: str,
+        ray_namespace: str,
+        cluster_tp_configs: Dict[str, int],
+        cluster_device_mappings: Dict[str, list[int]],
+    ) -> RegisterResponse:
         validate_register_pipeline(
-            RegisterValidationInput(pipeline_id=pipeline_id, total_gpus=total_gpus, gpu_ids=gpu_ids)
+            RegisterValidationInput(
+                pipeline_id=pipeline_id,
+                ray_namespace=ray_namespace,
+                cluster_tp_configs=cluster_tp_configs,
+                cluster_device_mappings=cluster_device_mappings,
+            )
         )
         import ray
-        ray.get(self._scheduler.register_pipeline.remote(pipeline_id=pipeline_id))
+        ray.get(
+            self._scheduler.register_pipeline.remote(
+                pipeline_id=pipeline_id,
+                ray_namespace=ray_namespace,
+                cluster_tp_configs=cluster_tp_configs,
+                cluster_device_mappings=cluster_device_mappings,
+            )
+        )
 
         state = self._pipelines.get(pipeline_id)
         if state is None:
@@ -223,6 +259,8 @@ class Orchestrator:
             return alive
 
         # Kill all named actors in this pipeline namespace.
+        kill_lookup_failures = 0
+        kill_failures = 0
         for s in _list_alive_actors():
             name = _attr(s, "name")
             if not isinstance(name, str) or name == "":
@@ -230,11 +268,18 @@ class Orchestrator:
             try:
                 handle = ray.get_actor(name, namespace=ray_namespace)
             except Exception:
+                kill_lookup_failures += 1
                 continue
             try:
                 ray.kill(handle, no_restart=True)
             except Exception:
+                kill_failures += 1
                 continue
+        if kill_lookup_failures or kill_failures:
+            sys.stderr.write(
+                f"[schedrl][WARN] kill_pipeline(namespace={ray_namespace!r}) had {kill_lookup_failures} actor lookup failures "
+                f"and {kill_failures} ray.kill failures for pipeline_id={pipeline_id!r}\n"
+            )
 
         # Unnamed actors: assume temporary and wait briefly for natural teardown.
         deadline = time.time() + 10.0
@@ -270,6 +315,41 @@ class Orchestrator:
                 except Exception as e:
                     sys.stderr.write(f"[schedrl][ERROR] Failed to force-kill unnamed actor_id={actor_id_hex!r}: {e}\n")
 
+        # Best-effort placement group cleanup. ROLL ResourceManager names placement groups with prefix
+        # `schedrl_pg:{pipeline_id}:...` when PIPELINE_ID is set.
+        try:
+            from ray.util.state import list_placement_groups
+        except Exception:
+            list_placement_groups = None
+        if list_placement_groups is not None:
+            prefix = f"schedrl_pg:{pipeline_id}:"
+            try:
+                pgs = list_placement_groups()
+            except Exception as e:
+                sys.stderr.write(f"[schedrl][ERROR] list_placement_groups() failed: {e}\n")
+                pgs = []
+            removed = 0
+            for pg in pgs:
+                name = _attr(pg, "name", "")
+                if not isinstance(name, str) or not name.startswith(prefix):
+                    continue
+                try:
+                    handle = ray.util.get_placement_group(name)
+                except Exception:
+                    pg_id = _attr(pg, "placement_group_id", None)
+                    try:
+                        handle = ray.util.get_placement_group(pg_id)
+                    except Exception as e:
+                        sys.stderr.write(f"[schedrl][ERROR] Failed to get placement group handle for {name!r}: {e}\n")
+                        continue
+                try:
+                    ray.util.remove_placement_group(handle)
+                    removed += 1
+                except Exception as e:
+                    sys.stderr.write(f"[schedrl][ERROR] Failed to remove placement group {name!r}: {e}\n")
+            if removed:
+                sys.stderr.write(f"[schedrl][INFO] Removed {removed} placement group(s) for pipeline_id={pipeline_id!r}\n")
+
         if shared_storage is not None:
             try:
                 ray.get(shared_storage.delete_port_claims.remote(pipeline_id))
@@ -277,8 +357,8 @@ class Orchestrator:
                 sys.stderr.write(f"[schedrl][ERROR] SharedStorage.delete_port_claims failed for pipeline_id={pipeline_id!r}: {e}\n")
             try:
                 ray.get(shared_storage.delete_prefix.remote(f"{pipeline_id}:"))
-            except Exception:
-                pass
+            except Exception as e:
+                sys.stderr.write(f"[schedrl][ERROR] SharedStorage.delete_prefix failed for prefix={pipeline_id + ':'!r}: {e}\n")
 
         self._pipelines.pop(pipeline_id, None)
 

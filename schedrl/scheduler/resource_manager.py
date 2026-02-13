@@ -18,6 +18,14 @@ class ResourceManager:
     def __post_init__(self):
         _require_ray()
 
+    def get_num_gpus(self) -> int:
+        """Return current Ray cluster GPU count (no waiting / gating)."""
+        _require_ray()
+        import ray
+
+        cluster_resources = ray.cluster_resources()
+        return int(cluster_resources.get("GPU", 0))
+
     def snapshot(
         self,
         *,

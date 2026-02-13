@@ -7,13 +7,13 @@ scheduler restart, pipelines are expected to re-register and be re-admitted.
 """
 
 import asyncio
+import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from schedrl.protocol.request_id import validate_pipeline_id
 from schedrl.protocol.types import Priority, ProgressReport
-from schedrl.scheduler.resource_manager import get_or_create_resource_manager
 from schedrl.scheduler.state import SchedulerState
 from schedrl.scheduler.types import (
     ClusterAllocation,
@@ -28,6 +28,7 @@ from schedrl.scheduler.types import (
     SignalPendingAllocationOp,
     is_generation_cluster,
     parse_cluster_id,
+    validate_cluster_id,
 )
 from schedrl.scheduler.validation import ValidationInputs, normalize_progress_oldest_ts, validate_execution_plan
 
@@ -63,6 +64,17 @@ class _GapRatioPipelineState:
 
 @dataclass(slots=True)
 class SchedulerImpl:
+    _state: SchedulerState = field(init=False)
+    _lock: asyncio.Lock = field(init=False)
+    _wakeup_event: asyncio.Event = field(init=False)
+    _topology_ready: asyncio.Event = field(init=False)
+    _loop_task: Optional[asyncio.Task] = field(init=False)
+    _resource_manager: Any = field(init=False)
+    _cycle_counter: int = field(init=False)
+    _request_seq: int = field(init=False)
+    _num_gpus: Optional[int] = field(init=False)
+    _adapter_handle_cache: Dict[str, Tuple[str, Any]] = field(init=False)
+
     def __post_init__(self):
         _require_ray()
         self._state = SchedulerState()
@@ -74,27 +86,39 @@ class SchedulerImpl:
         self._cycle_counter = 0
         self._request_seq = 0
         self._num_gpus: Optional[int] = None
+        self._adapter_handle_cache = {}
 
-    def register_pipeline(self, *, pipeline_id: str) -> None:
+    async def register_pipeline(
+        self,
+        *,
+        pipeline_id: str,
+        ray_namespace: str,
+        cluster_tp_configs: Dict[str, int],
+        cluster_device_mappings: Dict[str, List[int]],
+    ) -> None:
         validate_pipeline_id(pipeline_id)
-        if pipeline_id not in self._state.pipeline_registry:
-            self._state.pipeline_registry[pipeline_id] = {
-                "namespace": "default",
-                "cluster_configs": {},
-                "scheduler_cache": {},
-                "group_queue_cache": {},
-            }
+        await self._topology_ready.wait()
+        await self.register_pipeline_topology(
+            pipeline_id=pipeline_id,
+            ray_namespace=ray_namespace,
+            cluster_tp_configs=cluster_tp_configs,
+            cluster_device_mappings=cluster_device_mappings,
+        )
 
-    def admit_pipeline(self, *, pipeline_id: str) -> None:
+    async def admit_pipeline(self, *, pipeline_id: str) -> None:
         validate_pipeline_id(pipeline_id)
-        if pipeline_id not in self._state.pipeline_registry:
-            raise RuntimeError(f"Pipeline {pipeline_id!r} must be registered before admission")
+        async with self._lock:
+            info = self._state.pipeline_registry.get(pipeline_id)
+            if info is None:
+                raise RuntimeError(f"Pipeline {pipeline_id!r} must be registered before admission")
+            info["admitted"] = True
 
     async def unregister_pipeline(self, *, pipeline_id: str) -> None:
         validate_pipeline_id(pipeline_id)
         async with self._lock:
             self._state.pipeline_registry.pop(pipeline_id, None)
             self._state.latest_progress_by_pipeline.pop(pipeline_id, None)
+            self._adapter_handle_cache.pop(pipeline_id, None)
 
             active_cluster_ids = []
             for cluster_id in list(self._state.active_allocations.keys()):
@@ -133,20 +157,19 @@ class SchedulerImpl:
 
             self._wakeup_event.set()
 
-    async def initialize(self, *, expected_num_gpus: int | None = None) -> None:
+    async def initialize(self, *, resource_manager: Any | None = None) -> None:
         if self._topology_ready.is_set() and self._loop_task is not None:
             return
 
         _require_ray()
-        import ray
+        import ray  # noqa: F401
 
+        if resource_manager is not None:
+            self._resource_manager = resource_manager
         if self._resource_manager is None:
-            self._resource_manager = get_or_create_resource_manager()
+            raise RuntimeError("SchedulerImpl.initialize requires a ResourceManager actor (created by orchestrator)")
 
-        snap = await self._resource_manager.snapshot.remote(
-            wait_timeout_s=10.0, poll_interval_s=0.2, expected_num_gpus=expected_num_gpus
-        )
-        num_gpus = int(snap.get("num_gpus", 0))
+        num_gpus = int(await self._resource_manager.get_num_gpus.remote())
         if num_gpus <= 0:
             raise RuntimeError(f"ResourceManager reported num_gpus={num_gpus}, expected > 0")
 
@@ -191,13 +214,19 @@ class SchedulerImpl:
             raise ValueError("actor_infer cluster must be registered")
 
         cluster_configs: Dict[str, Dict[str, Any]] = {}
+        used_gpus_by_cluster: Dict[str, Set[int]] = {}
         for cluster_name, tp_size_raw in cluster_tp_configs.items():
             tp_size = int(tp_size_raw)
             if tp_size <= 0:
                 raise ValueError(f"tp_size must be > 0 for cluster {cluster_name!r}, got {tp_size!r}")
             device_mapping = list(cluster_device_mappings.get(cluster_name) or [])
-            if not device_mapping:
+            if not device_mapping and cluster_name != "reward":
                 raise ValueError(f"device_mapping must be non-empty for cluster {cluster_name!r}")
+            if cluster_name == "reward" and device_mapping:
+                # TODO(ENG-123): support GPU reward clusters (Phase 3 restricts reward to CPU-only).
+                raise ValueError("ENG-123 Phase 3 only supports CPU-only reward: reward.device_mapping must be empty")
+            if device_mapping and len(device_mapping) != len(set(device_mapping)):
+                raise ValueError(f"device_mapping has duplicates for cluster {cluster_name!r}")
             num_gpus = self._num_gpus
             if num_gpus is None or num_gpus <= 0:
                 raise RuntimeError("Scheduler GPU topology is not initialized (num_gpus unknown)")
@@ -208,7 +237,7 @@ class SchedulerImpl:
                     raise ValueError(
                         f"device_mapping GPU id out of range for cluster {cluster_name!r}: gpu={gpu} not in [0,{num_gpus - 1}]"
                     )
-            if len(device_mapping) % tp_size != 0:
+            if device_mapping and len(device_mapping) % tp_size != 0:
                 raise ValueError(
                     f"cluster {cluster_name!r} has len(device_mapping)={len(device_mapping)} not divisible by tp_size={tp_size}"
                 )
@@ -217,6 +246,23 @@ class SchedulerImpl:
             if is_gen:
                 cfg["max_dp_workers"] = len(device_mapping) // tp_size
             cluster_configs[cluster_name] = cfg
+            if device_mapping:
+                used_gpus_by_cluster[cluster_name] = set(int(x) for x in device_mapping)
+
+        # Phase 3: fail-fast on overlapping GPU assignments across clusters within a pipeline.
+        # Policy: allow `actor_infer` to overlap with other clusters (optional colocation), but disallow overlaps
+        # among non-actor_infer clusters.
+        used_non_infer: Set[int] = set()
+        for cluster_name, used in sorted(used_gpus_by_cluster.items()):
+            if cluster_name == "actor_infer":
+                continue
+            overlap = used_non_infer & used
+            if overlap:
+                raise ValueError(
+                    f"device_mapping overlaps across non-actor_infer clusters within pipeline {pipeline_id!r}: "
+                    f"{cluster_name!r} overlaps GPUs {sorted(overlap)}"
+                )
+            used_non_infer |= used
 
         async with self._lock:
             self._state.pipeline_registry[pipeline_id] = {
@@ -224,6 +270,7 @@ class SchedulerImpl:
                 "cluster_configs": cluster_configs,
                 "scheduler_cache": {},
                 "group_queue_cache": {},
+                "admitted": False,
             }
 
     async def get_pipeline_namespace(self, *, pipeline_id: str) -> str:
@@ -241,6 +288,8 @@ class SchedulerImpl:
         validate_pipeline_id(report.pipeline_id)
         if report.step_target_trajectories <= 0:
             raise ValueError("step_target_trajectories must be > 0")
+        if not (0.0 <= float(report.percent_completed) <= 1.0 + 1e-6):
+            raise ValueError(f"percent_completed must be in [0, 1], got {report.percent_completed!r}")
         oldest_ts = normalize_progress_oldest_ts(report.oldest_unfinished_creation_ts, report.fifo_timestamp)
         if report.oldest_unfinished_creation_ts is None and oldest_ts is not None:
             report = ProgressReport(
@@ -262,11 +311,22 @@ class SchedulerImpl:
 
     async def request_gpus(self, *, cluster_id: str, priority: Priority, global_step: Optional[int] = None) -> List[int]:
         await self._topology_ready.wait()
+        validate_cluster_id(cluster_id)
         event = asyncio.Event()
         pending: PendingRequest | None = None
         async with self._lock:
+            pipeline_id, _ = parse_cluster_id(cluster_id)
+            info = self._state.pipeline_registry.get(pipeline_id)
+            if info is None:
+                raise RuntimeError(f"pipeline_id {pipeline_id!r} not registered")
+            if not bool(info.get("admitted", False)):
+                raise RuntimeError(f"pipeline_id {pipeline_id!r} not admitted; call orchestrator.admit_pipeline first")
             existing = self._state.active_allocations.get(cluster_id)
             if existing is not None:
+                if existing.priority != priority:
+                    raise RuntimeError(
+                        f"cluster_id {cluster_id!r} already allocated with priority={existing.priority}, requested priority={priority}"
+                    )
                 if priority == Priority.GENERATION and not existing.active_dp_ranks:
                     pass
                 elif priority != Priority.GENERATION and not existing.gpu_ids:
@@ -312,6 +372,24 @@ class SchedulerImpl:
         event = asyncio.Event()
         pending: PendingRequest | None = None
         async with self._lock:
+            pipeline_id, _ = parse_cluster_id(request_cluster_id)
+            info = self._state.pipeline_registry.get(pipeline_id)
+            if info is None:
+                raise RuntimeError(f"pipeline_id {pipeline_id!r} not registered")
+            if not bool(info.get("admitted", False)):
+                raise RuntimeError(f"pipeline_id {pipeline_id!r} not admitted; call orchestrator.admit_pipeline first")
+            existing = self._state.active_allocations.get(request_cluster_id)
+            if existing is not None:
+                if existing.priority != request_priority:
+                    raise RuntimeError(
+                        f"cluster_id {request_cluster_id!r} already allocated with priority={existing.priority}, requested priority={request_priority}"
+                    )
+                if request_priority == Priority.GENERATION and not existing.active_dp_ranks:
+                    pass
+                elif request_priority != Priority.GENERATION and not existing.gpu_ids:
+                    pass
+                else:
+                    return list(existing.gpu_ids)
             if release_cluster_id is not None:
                 alloc = self._state.active_allocations.pop(release_cluster_id, None)
                 if alloc is None:
@@ -391,6 +469,8 @@ class SchedulerImpl:
             self._wakeup_event.clear()
             try:
                 await self.scheduling_cycle()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 async with self._lock:
                     self._signal_all_waiters_with_error(
@@ -401,12 +481,13 @@ class SchedulerImpl:
 
     async def scheduling_cycle(self) -> None:
         await self._topology_ready.wait()
-        async with self._lock:
-            self._cycle_counter += 1
-            plan = ExecutionPlan()
-            planned_allocation_targets: Set[str] = set()
+        plan = ExecutionPlan()
+        planned_allocation_targets: Set[str] = set()
+        shrink_calls: List[Tuple[Any, List[int]]] = []
 
-            try:
+        try:
+            async with self._lock:
+                self._cycle_counter += 1
                 planned_available_gpus = set(self._state.idle_gpus)
 
                 # Phase 0: completion notifications (generation only).
@@ -585,13 +666,91 @@ class SchedulerImpl:
                     ),
                 )
 
-                # Phase 5/6: execute + commit (Phase 2 simulation: state-only).
+                # Phase 5: prepare execution (Phase 3: propagate shrink to pipeline runtime).
+                # IMPORTANT: do not await adapter RPCs while holding scheduler lock.
+                shrink_calls = self._prepare_shrink_calls_locked(plan)
+
+            # Phase 5: execute outside the scheduler lock (avoid deadlocking progress/reporting paths).
+            await self._execute_shrink_calls(shrink_calls)
+
+            # Phase 6: commit (Phase 2 simulation: state-only).
+            async with self._lock:
                 self._apply_plan_and_signal(plan)
 
-            except Exception as e:
-                # Fail-fast rule (Issue 107): any execution-phase failure triggers controlled shutdown.
-                await self._fail_fast_shutdown(reason=f"scheduler_cycle_failed: {type(e).__name__}: {e}")
-                raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Fail-fast rule (Issue 107): any execution-phase failure triggers controlled shutdown.
+            await self._fail_fast_shutdown(reason=f"scheduler_cycle_failed: {type(e).__name__}: {e}")
+            raise
+
+    def _get_or_lookup_adapter_handle_locked(self, *, pipeline_id: str) -> Any:
+        _require_ray()
+        import ray
+
+        info = self._state.pipeline_registry.get(pipeline_id)
+        if info is None:
+            raise RuntimeError(f"pipeline_id {pipeline_id!r} not registered")
+        adapter_namespace = info.get("namespace")
+        if not isinstance(adapter_namespace, str) or adapter_namespace == "":
+            raise RuntimeError(f"pipeline_id {pipeline_id!r} has invalid registered namespace {adapter_namespace!r}")
+
+        cached = self._adapter_handle_cache.get(pipeline_id)
+        if cached is not None:
+            cached_namespace, cached_handle = cached
+            if cached_namespace == adapter_namespace:
+                return cached_handle
+
+        adapter_name = f"schedrl:adapter:{pipeline_id}"
+        try:
+            handle = ray.get_actor(adapter_name, namespace=adapter_namespace)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to resolve adapter actor {adapter_name!r} in namespace {adapter_namespace!r} for pipeline_id {pipeline_id!r}"
+            ) from e
+
+        self._adapter_handle_cache[pipeline_id] = (adapter_namespace, handle)
+        return handle
+
+    def _prepare_shrink_calls_locked(self, plan: ExecutionPlan) -> List[Tuple[Any, List[int]]]:
+        """Prepare shrink RPC calls under the scheduler lock.
+
+        Returns a list of (adapter_handle, dp_ranks) to execute outside the lock.
+        """
+        pipeline_to_dp_ranks: Dict[str, Set[int]] = {}
+
+        def _add(cluster_id: str, dp_ranks: List[int]) -> None:
+            if not dp_ranks:
+                return
+            pipeline_id, cluster_name = parse_cluster_id(cluster_id)
+            if cluster_name != "actor_infer":
+                raise RuntimeError(f"shrink ops only supported for actor_infer cluster, got cluster_id={cluster_id!r}")
+            ranks = pipeline_to_dp_ranks.setdefault(pipeline_id, set())
+            for r in dp_ranks:
+                ranks.add(int(r))
+
+        for op in plan.completion_driven_suspension_ops:
+            _add(op.cluster_id, list(op.dp_ranks_to_remove))
+        for op in plan.sched_guided_shrink_ops:
+            _add(op.cluster_id, list(op.dp_ranks_to_remove))
+
+        calls: List[Tuple[Any, List[int]]] = []
+        for pipeline_id, dp_ranks in sorted(pipeline_to_dp_ranks.items()):
+            if not dp_ranks:
+                continue
+            adapter = self._get_or_lookup_adapter_handle_locked(pipeline_id=pipeline_id)
+            calls.append((adapter, sorted(dp_ranks)))
+        return calls
+
+    async def _execute_shrink_calls(self, calls: List[Tuple[Any, List[int]]]) -> None:
+        """Execute pipeline shrinks (ENG-123 Phase 3) outside the scheduler lock.
+
+        Contract: fail-fast; any adapter RPC failure raises and triggers orchestrator shutdown via caller.
+        """
+        for adapter, dp_ranks in calls:
+            if not dp_ranks:
+                continue
+            await adapter.shrink_workers.remote(list(dp_ranks))
 
     def get_debug_state(self) -> Any:
         return self._state
@@ -602,11 +761,13 @@ class SchedulerImpl:
 
         try:
             orchestrator = ray.get_actor("schedrl:orchestrator", namespace="schedrl")
-        except Exception:
+        except Exception as e:
+            sys.stderr.write(f"[schedrl][ERROR] Failed to resolve orchestrator actor for shutdown: {type(e).__name__}: {e}\n")
             return
         try:
             orchestrator.shutdown.remote(force=True, reason=reason, source="scheduler")
-        except Exception:
+        except Exception as e:
+            sys.stderr.write(f"[schedrl][ERROR] Failed to call orchestrator.shutdown: {type(e).__name__}: {e}\n")
             return
 
     def _snapshot_generation_dp_workers(
@@ -998,7 +1159,14 @@ class SchedulerImpl:
             if not op.gpus_to_allocate:
                 if op.priority is None:
                     raise RuntimeError(f"signal_pending_allocation_ops missing priority for cluster_id={op.cluster_id!r}")
-                self._signal_pending_request(cluster_id=op.cluster_id, priority=Priority(op.priority), result=[])
+                priority = Priority(op.priority)
+                existing = self._state.active_allocations.get(op.cluster_id)
+                # If this is a wake-only signal (no new GPUs needed), return the existing allocation
+                # so callers don't misinterpret [] as "no allocation".
+                if existing is not None and existing.priority == priority and existing.gpu_ids:
+                    self._signal_pending_request(cluster_id=op.cluster_id, priority=priority, result=list(existing.gpu_ids))
+                else:
+                    self._signal_pending_request(cluster_id=op.cluster_id, priority=priority, result=[])
                 continue
             if op.priority is None:
                 raise RuntimeError(f"signal_pending_allocation_ops missing priority for cluster_id={op.cluster_id!r}")
