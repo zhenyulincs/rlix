@@ -1,6 +1,6 @@
 [submodule "third_party/ROLL"]
 	path = third_party/ROLL
-	url = git@github.com:alibaba/ROLL.git
+	url = git@github.com:taoluo/_rlos_ROLL.git
 [submodule "third_party/SkyRL"]
 	path = third_party/SkyRL
 	url = git@github.com:NovaSky-AI/SkyRL.git
