@@ -753,7 +753,7 @@ These findings were discovered by scanning upstream `third_party/ROLL` for multi
 
 **P1: Issue 64: Gap-Ratio Starvation (Work Inflation)**
 - **Finding**: New pipelines are starved (0 work) because they haven't reported progress yet.
-- **Fix**: Port "work inflation" heuristic from fork (already implemented at line 2805-2810 in `centralized_gpu_scheduler.py`). SchedRL Scheduler adds `rollout_batch_size` to remaining work for pipelines with pending requests.
+- **Fix**: Port "work inflation" heuristic from fork (already implemented at line 2805-2810 in `centralized_gpu_scheduler.py`). In SchedRL, inflate remaining work by **one rollout-batch worth of trajectories** for pipelines with pending GENERATION requests (i.e., add `step_target_trajectories`, where `step_target_trajectories` matches the actual get_batch contract such as `rollout_batch_size * num_return_sequences`). Do not scale this by `async_generation_ratio` or any topology-derived estimate.
 - **Review Decision**: **[Invalid]**. Already implemented in fork; needs porting to SchedRL Scheduler.
 - **Reviewed**: Yes
 
@@ -1460,7 +1460,7 @@ Backlog (post-ENG-123): if we ever need retries/HA, introduce intent/version tok
   - TODO (MULTI_LORA): add `adapter_id` mapping + per-adapter progress reporting hooks for fairness decisions, and validation rules for `base_version` by mode
   - `ActionResponse {success: bool, error: Optional[str]}`
 - Canonical validation rules (fail-fast):
-  - Abort ACK definition per-adapter (for ROLL: “no longer in-flight”; capture finish_reason if present)
+  - Abort ACK definition is framework-specific (ROLL: “no longer in-flight”; capture finish_reason if present). Do not model this in the SchedRL Adapter ABC; keep it in the framework runtime/adapter layer.
 
 **Additional required module**
 - `schedrl/protocol/request_id.py`:
@@ -1484,7 +1484,7 @@ Note: these are fields on SchedRL typed config objects (dataclasses) passed to t
 
 #### 2) `schedrl/client/*`
 **Files** (new):
-- `schedrl/protocol/adapter.py` (Adapter ABC; methods raise `NotImplementedError`)
+- `schedrl/protocol/adapter.py` (Adapter ABC; only `resize_infer` is part of the parity path)
 - `schedrl/client/client.py` (connect/get-or-create; register/report helpers)
 
 **Key behavior**

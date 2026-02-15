@@ -245,9 +245,7 @@ class Orchestrator:
 **Plan Requirement** (Line 75):
 > Abort ACK semantics: Define ACK as "targeted request IDs are no longer in-flight (removed from running_requests)"; tolerate "Success" finishes during abort
 
-**Current Implementation**: Not documented in code.
-
-**Fix Required**: Add docstring to `Adapter.abort_requests()` and `Adapter.wait_abort_ack()`.
+**Current Implementation**: Handled in the framework runtime (ROLL RequestScheduler / pipeline), not in the SchedRL core Adapter ABC (which only includes `resize_infer` in the executed parity path).
 
 ---
 
