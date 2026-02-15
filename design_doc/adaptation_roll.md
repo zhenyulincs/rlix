@@ -10,9 +10,9 @@ We keep the core training loop intact and introduce a **proxy layer** to interce
 We will keep one “simple async + multi-turn” example in ROLL as the main reference for SchedRL integration.
 We use **MathEnv** (multi-turn reasoning), not FrozenLake.
 
-- Best starting point: `third_party/ROLL/examples/qwen3_agentic_gem/gem_math_dapo.yaml`
+- Best starting point: `external/ROLL/examples/qwen3_agentic_gem/gem_math_dapo.yaml`
 - Where MathEnv is implemented:
-  - `third_party/ROLL/roll/pipeline/agentic/env/gem/math_env.py`
+  - `external/ROLL/roll/pipeline/agentic/env/gem/math_env.py`
 - Why it is a good reference:
   - It is **multi-turn** (agentic env loop).
   - It is **async** (uses `async_generation_ratio` in ROLL configs).
@@ -33,8 +33,8 @@ Why WebShop:
 
 Where to start:
 - Example configs in this repo:
-  - `third_party/ROLL/examples/qwen2.5-0.5B-agentic/agentic_val_webshop.yaml`
-  - `third_party/ROLL/examples/qwen2.5-7B-agentic_megatron/agentic_val_webshop.yaml`
+  - `external/ROLL/examples/qwen2.5-0.5B-agentic/agentic_val_webshop.yaml`
+  - `external/ROLL/examples/qwen2.5-7B-agentic_megatron/agentic_val_webshop.yaml`
 
 Async training mode in ROLL:
 - Use `async_generation_ratio > 0` to overlap rollout and training.
@@ -47,14 +47,14 @@ SchedRL safety note:
 This section reality-checks ROLL (Agentic pipeline) against the shared protocol in `design_doc/multi-pipeline-adaptation-plan_clean.md`.
 
 **Already present in the codebase**
-- **Abort primitive (request cancellation)**: `GenerateRequestType.ABORT` is implemented and sent to inference workers (`third_party/ROLL/roll/distributed/scheduler/generate_scheduler.py`).
-- **Generation pause/resume gate**: `RequestScheduler.suspend()` aborts in-flight requests, `resume()` re-opens scheduling (`third_party/ROLL/roll/distributed/scheduler/generate_scheduler.py`).
-- **Coordinator-controlled update boundary (QUIESCE-like)**: in `third_party/ROLL/roll/pipeline/agentic/agentic_pipeline.py`, the loop calls `train_rollout_scheduler.suspend()` and stops the server before `model_update()`.
-- **Retry safety (two-phase commit) is plausible**: on `ABORT`, the env loop does not advance env state (`GenerateStopReason.ABORT`), so a canceled turn can be retried without duplicate env side effects (`third_party/ROLL/roll/pipeline/agentic/env_manager/traj_env_manager.py`).
+- **Abort primitive (request cancellation)**: `GenerateRequestType.ABORT` is implemented and sent to inference workers (`external/ROLL/roll/distributed/scheduler/generate_scheduler.py`).
+- **Generation pause/resume gate**: `RequestScheduler.suspend()` aborts in-flight requests, `resume()` re-opens scheduling (`external/ROLL/roll/distributed/scheduler/generate_scheduler.py`).
+- **Coordinator-controlled update boundary (QUIESCE-like)**: in `external/ROLL/roll/pipeline/agentic/agentic_pipeline.py`, the loop calls `train_rollout_scheduler.suspend()` and stops the server before `model_update()`.
+- **Retry safety (two-phase commit) is plausible**: on `ABORT`, the env loop does not advance env state (`GenerateStopReason.ABORT`), so a canceled turn can be retried without duplicate env side effects (`external/ROLL/roll/pipeline/agentic/env_manager/traj_env_manager.py`).
 
 **Gaps / required extensions to support elastic shrink/expand**
 - **Subset lifecycle (DP-granular start/stop)**:
-  - Today `cluster.start_server()` / `cluster.stop_server()` are cluster-wide (`third_party/ROLL/roll/distributed/scheduler/generate_scheduler.py` and strategy impls).
+  - Today `cluster.start_server()` / `cluster.stop_server()` are cluster-wide (`external/ROLL/roll/distributed/scheduler/generate_scheduler.py` and strategy impls).
   - The shared protocol needs subset `expand_workers(indices)` / `shrink_workers(indices)`; this requires adapter-level “start/stop only these dp ranks” or per-rank server control.
 - **Subset-aware abort and reroute on shrink**:
   - Today `RequestScheduler.abort_request()` aborts *all* in-flight requests across all dp ranks.
@@ -76,7 +76,7 @@ This section reality-checks ROLL (Agentic pipeline) against the shared protocol 
   - Readiness rule: when `percent_completed >= 1.0`, the next train step’s batch is ready.
 
 **Concrete file refs & immediate actions**
-- Files: `third_party/ROLL/roll/distributed/scheduler/generate_scheduler.py`, `third_party/ROLL/roll/distributed/executor/model_update_group.py`, `third_party/ROLL/roll/pipeline/agentic/agentic_pipeline.py`.
+- Files: `external/ROLL/roll/distributed/scheduler/generate_scheduler.py`, `external/ROLL/roll/distributed/executor/model_update_group.py`, `external/ROLL/roll/pipeline/agentic/agentic_pipeline.py`.
 - Actions:
   - Implement `start_server_subset(worker_indices)` / `stop_server_subset(worker_indices)` helpers in the scheduler/cluster adapter to support subset expand/shrink.
   - Extend `ModelUpdateGroup.model_update(worker_indices=...)` to build per-subset comm-plans and add a `LatestWeightsCache` snapshot after training for sync-on-resume.
@@ -114,11 +114,11 @@ This section reality-checks ROLL (Agentic pipeline) against the shared protocol 
 ## 2. Existing Code Integration Points (Pre-Adaptation)
 
 ### 2.1 Training Entry Point
-*   **File**: `third_party/ROLL/roll/pipeline/agentic/agentic_pipeline.py`
+*   **File**: `external/ROLL/roll/pipeline/agentic/agentic_pipeline.py`
 *   **Hook**: Inside `AgenticPipeline.run()`, before/after the training phase (`actor_train.train_step()` and any critic/reference work).
 
 ### 2.2 Generation Entry Point
-*   **File**: `third_party/ROLL/roll/pipeline/agentic/agentic_pipeline.py`
+*   **File**: `external/ROLL/roll/pipeline/agentic/agentic_pipeline.py`
 *   **Method**: `AgenticPipeline.run()`
 *   **Hook**: `actor_infer.start_server()` / `stop_server()` are invoked in the existing pipeline loop (before/after `RolloutScheduler.get_batch(...)`).
 *   **Hook (rollout loop)**: `RolloutScheduler.get_batch(...)` resumes generation via `RequestScheduler.resume()` and drains completed trajectories from `GroupQueueManager.get_batch(...)`.
@@ -246,7 +246,7 @@ Goal: support elastic time-sharing with `migration_policy=REQUEST_RETRY` (abort/
   - abort all in-flight requests running on `P` (the shrinking subset) by default, and
   - optionally abort a caller-provided subset of request IDs in the future.
 - Routing + bookkeeping cleanup:
-  - When a dp rank is shrunk, clear sticky mappings that point to it (`src_rank2_dp_rank`) so the next retry goes to a remaining active dp rank (`third_party/ROLL/roll/distributed/scheduler/generate_scheduler.py` `RequestScheduler.generate_one_request`).
+  - When a dp rank is shrunk, clear sticky mappings that point to it (`src_rank2_dp_rank`) so the next retry goes to a remaining active dp rank (`external/ROLL/roll/distributed/scheduler/generate_scheduler.py` `RequestScheduler.generate_one_request`).
   - When aborting requests on `P`, also clear any per-request routing/bookkeeping for the aborted request IDs (e.g., remove entries from `request_id_2_dp_rank`) to avoid stale mappings and make retries land cleanly on `new_S`.
 - Concurrency detail (async safety): when building the abort set per dp-rank, take a snapshot of `inflight_requests[dp_rank].keys()` **before any `await`** (e.g., `list(...)`). This avoids dict-mutation hazards without requiring an `asyncio.Lock`.
 - Abort/drain ordering (safety): do **not** stop/offload `P` immediately after sending abort.
@@ -257,7 +257,7 @@ Goal: support elastic time-sharing with `migration_policy=REQUEST_RETRY` (abort/
   - Backlog (C): remove the magic sleep by adding worker-side engine drain/flush + “engine idle” confirmation (vLLM/SGLang), and require **A AND C** before stop/offload for maximum safety.
     - Preferred shape: add a unified `wait_for_engine_idle(worker_indices, timeout_s)` RPC at the scheduler/proxy layer, and implement it by wrapping backend-specific calls under vLLM vs SGLang.
   - Timeout policy: if drain does not complete within a configured timeout, **fail loudly** (crash pipeline) and do not proceed with stop/offload.
-- Retry trigger (already exists): aborted request yields `None` from `PolicyProxy.generate`, which becomes `GenerateStopReason.ABORT`, and the env loop retries the same turn without stepping env state (`third_party/ROLL/roll/pipeline/agentic/env_manager/traj_env_manager.py`).
+- Retry trigger (already exists): aborted request yields `None` from `PolicyProxy.generate`, which becomes `GenerateStopReason.ABORT`, and the env loop retries the same turn without stepping env state (`external/ROLL/roll/pipeline/agentic/env_manager/traj_env_manager.py`).
 
 ## 4.X Mid-Flight Shrink (DP workers) — Implementation sketch
 
@@ -303,7 +303,7 @@ Important background: Training and inference clusters remain separate, with fixe
 *   **Minimal intrusion**: The pipeline coordinator keeps its core logic and calls the central scheduler directly at phase boundaries. Progress *can* be emitted from the rollout buffer (`GroupQueue.put`), but the scheduler heartbeat wiring is a required extension (it currently only updates a local `tqdm` progress bar).
 
 ### 5.1 Pipeline Coordinator ↔ Central Scheduler
-*   **Who is the pipeline coordinator?** The `AgenticPipeline.run()` loop in `third_party/ROLL/roll/pipeline/agentic/agentic_pipeline.py`.
+*   **Who is the pipeline coordinator?** The `AgenticPipeline.run()` loop in `external/ROLL/roll/pipeline/agentic/agentic_pipeline.py`.
 *   **Request/Release (Training)**: The coordinator calls the **central scheduler API** directly to request/release training GPUs; once granted, it gates compute via `actor_train.offload_states()` at phase boundaries.
 *   **Blocking allocation**: Training compute starts only after the allocation is granted.
 *   **Training offload granularity**: Cluster-wide only in Phase 1 (no subset offload for training).

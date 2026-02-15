@@ -13,8 +13,8 @@ but they are not combined into one simple example today.
 
 We will make one main reference “async + multi-turn” example based on Retool because it is usually the easiest multi-turn example (no extra services).
 
-- Multi-turn Retool example: `third_party/miles/examples/retool/generate_with_retool.py`
-- Async training loop to reuse: `third_party/miles/train_async.py`
+- Multi-turn Retool example: `external/miles/examples/retool/generate_with_retool.py`
+- Async training loop to reuse: `external/miles/train_async.py`
 
 Planned work (doc-level):
 - Add one entrypoint/config that runs Retool multi-turn rollouts under the async loop.
@@ -27,7 +27,7 @@ Rough estimate: 3–7 days (wire multi-turn generator into async loop + debug).
 Goal: make the existing Mini-SWE tool-loop work in Miles run with the Miles async training loop.
 
 What exists today:
-- Tool-loop training example: `third_party/miles/examples/experimental/swe-agent/`
+- Tool-loop training example: `external/miles/examples/experimental/swe-agent/`
   - It uses a Mini-SWE agent server (via NeMo-Gym) and runs `train.py` today.
 
 Phase 2 plan:
@@ -51,18 +51,18 @@ This section reality-checks Miles against the shared protocol in `design_doc/mul
 
 **Already present in the codebase**
 - **Global router / dispatcher exists**:
-  - Miles can launch a router (`third_party/miles/miles/router/router.py`, also launched from `third_party/miles/miles/ray/rollout.py`).
-  - SGLang engines register with the router (`third_party/miles/miles/backends/sglang_utils/sglang_engine.py` uses `/add_worker`).
+  - Miles can launch a router (`external/miles/miles/router/router.py`, also launched from `external/miles/miles/ray/rollout.py`).
+  - SGLang engines register with the router (`external/miles/miles/backends/sglang_utils/sglang_engine.py` uses `/add_worker`).
   - **Reality check**: MilesRouter currently exposes `/add_worker` and `/list_workers` but does **not** implement `/remove_worker`. Meanwhile `SGLangEngine.shutdown()` calls `/remove_worker` when `args.use_miles_router` (or older sglang-router versions). This mismatch must be resolved for admission-close and clean shrink/offload.
   - This matches the shared protocol’s requirement that shrink-time retries must go back to a global dispatcher, not local engine memory.
 - **Engine-side memory lifecycle primitives**:
-  - SGLang server supports `release_memory_occupation` / `resume_memory_occupation(tags=[...])` (`third_party/miles/miles/backends/sglang_utils/sglang_engine.py`), which maps to “offload/remove weights from GPU” vs “resume weights/kv_cache”.
+  - SGLang server supports `release_memory_occupation` / `resume_memory_occupation(tags=[...])` (`external/miles/miles/backends/sglang_utils/sglang_engine.py`), which maps to “offload/remove weights from GPU” vs “resume weights/kv_cache”.
 - **Abort endpoint for in-flight work**:
-  - Miles can abort requests across workers via router-discovered worker URLs (`third_party/miles/miles/rollout/sglang_rollout.py` `abort()` calls `/abort_request` on workers).
+  - Miles can abort requests across workers via router-discovered worker URLs (`external/miles/miles/rollout/sglang_rollout.py` `abort()` calls `/abort_request` on workers).
 
 **Gaps / required extensions for elastic shrink/expand**
 - **Subset lifecycle (indices)**:
-  - `RolloutManager.onload/offload` are currently cluster-wide (`third_party/miles/miles/ray/rollout.py`); shared protocol needs subset `indices=...` to implement `expand_workers` / `shrink_workers`.
+  - `RolloutManager.onload/offload` are currently cluster-wide (`external/miles/miles/ray/rollout.py`); shared protocol needs subset `indices=...` to implement `expand_workers` / `shrink_workers`.
   - Engine registration exists (`/add_worker`), and `SGLangEngine` has a shutdown path that *attempts* to unregister via `/remove_worker`, but MilesRouter does not currently implement `/remove_worker`. For true subset admission-close, either add router-side disable/remove (recommended) or implement an alternative admission gating mechanism.
   - The missing part is plumbing indices through `RolloutManager` and mapping indices → engine handles, plus router-side admission gating for `P`.
 - **Shrink-time migration semantics**:
@@ -77,19 +77,19 @@ This section reality-checks Miles against the shared protocol in `design_doc/mul
     - a global data source buffer (`RolloutDataSourceWithBuffer`),
     - a per-worker abort endpoint (`/abort_request` supports `rid` in SGLang), and
     - a step-based training loop (`train.py` / `train_async.py`) that can be extended to re-enqueue aborted work back into that global data source.
-  - Not supported (for SchedRL adaptation): the “persistent background worker” rollout mode in `third_party/miles/examples/fully_async`.
+  - Not supported (for SchedRL adaptation): the “persistent background worker” rollout mode in `external/miles/examples/fully_async`.
     - Reason: it is not driven by the training loop, and it does not provide a clean scheduler-controlled stop point for GPU time-sharing shrink.
   - **Required extension (hard requirement)**: coordinator-generated deterministic request id.
     - The coordinator must set SGLang `rid = f"{trajectory_id}:{turn_id}:{attempt}"` for every turn request.
     - This requires a stable `trajectory_id` (same across retries) and a stable `turn_id` within that trajectory.
     - Miles’ generate wrapper must pass `rid` through the router/engine so abort can target it later.
 - **Admission control before offload / weight sync (starvation risk)**:
-  - `RolloutManager.offload()` calls `SGLangEngine.release_memory_occupation()`, which first calls `flush_cache()` that polls `/flush_cache` until the engine reports an empty queue (`third_party/miles/miles/ray/rollout.py`, `third_party/miles/miles/backends/sglang_utils/sglang_engine.py`).
+  - `RolloutManager.offload()` calls `SGLangEngine.release_memory_occupation()`, which first calls `flush_cache()` that polls `/flush_cache` until the engine reports an empty queue (`external/miles/miles/ray/rollout.py`, `external/miles/miles/backends/sglang_utils/sglang_engine.py`).
   - Today this does **not** close admission at the router/dispatcher level. If requests keep being routed to that engine while `flush_cache()` is polling, the queue may never drain (or time out), delaying offload and any update that depends on it.
   - Required: the adapter must close admission for the target subset before offload/sync (e.g., remove/disable those workers from routing, or otherwise ensure no new requests are routed to them), then abort/drain, then offload.
   - **Required code change**: add a router-side worker disable/remove API (or equivalent gating) so subset shrink can stop new admissions reliably, and/or change `SGLangEngine.shutdown()` to not depend on an unsupported router endpoint.
 - **Checkpoint/weight version tagging**:
-  - SGLang supports `weight_version` in weight update calls (e.g. `update_weights_from_tensor(..., weight_version=...)` in `third_party/miles/miles/backends/sglang_utils/sglang_engine.py`).
+  - SGLang supports `weight_version` in weight update calls (e.g. `update_weights_from_tensor(..., weight_version=...)` in `external/miles/miles/backends/sglang_utils/sglang_engine.py`).
   - The adapter must propagate `active_checkpoint_version` into rollout outputs (e.g., sample metadata) as `generation_checkpoint_version`.
 - **Progress reporting for the central scheduler**:
   - The shared scheduler needs heartbeats based on **trajectory counts**: `queued_trajectories`, `inflight_trajectories`, `percent_completed`, and `oldest_unfinished_creation_ts`.
@@ -98,20 +98,20 @@ This section reality-checks Miles against the shared protocol in `design_doc/mul
 
 **Model update boundary (make this explicit)**
 - **Miles assumes weight sync happens at safe boundaries** (between rollout batches / when the rollout engines are quiesced), not as a “hot swap” in the middle of multi-turn interactions.
-  - `third_party/miles/train.py` does `generate → (optional offload) → train → onload_weights → actor_model.update_weights → onload_kv` (update happens after generation finishes).
-  - `third_party/miles/train_async.py` explicitly syncs generation before updating weights: “sync generate before update weights to prevent update weight in the middle of generation”.
+  - `external/miles/train.py` does `generate → (optional offload) → train → onload_weights → actor_model.update_weights → onload_kv` (update happens after generation finishes).
+  - `external/miles/train_async.py` explicitly syncs generation before updating weights: “sync generate before update weights to prevent update weight in the middle of generation”.
 - **Weight activation cadence is interval-driven in `train_async.py`**:
   - `--update-weights-interval` controls how often rollout engines observe new weights (sync/broadcast happens only when `(rollout_id + 1) % update_weights_interval == 0`).
   - Because `train_async.py` prefetches the “next rollout” early, it will (by design) *finish* that prefetched rollout under the *previous* weights, then update weights (it drains `rollout_data_next_future` before calling `actor_model.update_weights()`).
   - **SchedRL implication**: Miles `active_checkpoint_version` / “weight activation” must advance only on these interval boundaries. With `update_weights_interval=3`, the rollout engines intentionally run up to ~3 train-steps behind the trainer weights between broadcasts (still only one rollout future in flight; this is not a “3-step-ahead” pipelining contract).
 - **What this means for multi-turn rollouts**:
-  - The multi-turn reference implementations treat `finish_reason=abort` as terminal and return `Sample.Status.ABORTED` immediately (e.g. `third_party/miles/examples/geo3k_vlm_multi_turn/rollout.py`, `third_party/miles/examples/retool/generate_with_retool.py`, `third_party/miles/examples/search-r1/generate_with_search.py`, `third_party/miles/examples/tau-bench/trainable_agents.py`).
+  - The multi-turn reference implementations treat `finish_reason=abort` as terminal and return `Sample.Status.ABORTED` immediately (e.g. `external/miles/examples/geo3k_vlm_multi_turn/rollout.py`, `external/miles/examples/retool/generate_with_retool.py`, `external/miles/examples/search-r1/generate_with_search.py`, `external/miles/examples/tau-bench/trainable_agents.py`).
   - There is no generic “pause / update / resume the same trajectory” mechanism in these examples. If a model update happens mid-trajectory and triggers abort, the trajectory is dropped (or retried from scratch by higher-level logic).
-  - `partial_rollout`-style continuation is not available when using the Miles router today (`third_party/miles/miles/router/middleware_hub/radix_tree_middleware.py` asserts `not args.partial_rollout`), so “resume after abort” is not a baseline capability.
+  - `partial_rollout`-style continuation is not available when using the Miles router today (`external/miles/miles/router/middleware_hub/radix_tree_middleware.py` asserts `not args.partial_rollout`), so “resume after abort” is not a baseline capability.
   - For SchedRL time-sharing shrink/expand, we only require turn-level abort+retry. We do not need a full multi-turn “resume from inside a turn” feature.
 
 **Concrete file refs & immediate actions**
-- Files: `third_party/miles/miles/ray/rollout.py`, `third_party/miles/miles/backends/sglang_utils/sglang_engine.py`, `third_party/miles/miles/rollout/sglang_rollout.py`.
+- Files: `external/miles/miles/ray/rollout.py`, `external/miles/miles/backends/sglang_utils/sglang_engine.py`, `external/miles/miles/rollout/sglang_rollout.py`.
 - Actions:
   - Update `RolloutManager.onload(offload)` to accept `worker_indices` and map indices to engine handles so the scheduler can onload/offload a DP subset.
   - Ensure `onload_weights()` propagates a `generation_checkpoint_version` into sample metadata so trainer and scheduler can reconcile staleness.
@@ -146,11 +146,11 @@ This section reality-checks Miles against the shared protocol in `design_doc/mul
 ## 2. Existing Code Integration Points (Pre-Adaptation)
 
 ### 2.1 Training Entry Point
-*   **File**: `third_party/miles/train.py`
+*   **File**: `external/miles/train.py`
 *   **Hook**: `actor_model.async_train()` loop.
 
 ### 2.2 Generation Entry Point
-*   **File**: `third_party/miles/ray/rollout.py`
+*   **File**: `external/miles/ray/rollout.py`
 *   **Method**: `RolloutManager.generate()`
 *   **Hook**: `rollout_manager.onload()` / `offload()` to manage engine lifecycle.
 
@@ -232,7 +232,7 @@ For the `swe-agent` example, integration involves modifying the `train.py` loop:
 
 ### 5.2 Scheduler Progress Hooks
 *   **Integration Point**: `rollout_manager.py`.
-*   **Trigger**: When `results` are pushed to the training queue / buffer and at batch start (hook at the top of the `for rollout_id in range(...)` loop in `third_party/miles/train.py`, before `rollout_manager.generate(...)`).
+*   **Trigger**: When `results` are pushed to the training queue / buffer and at batch start (hook at the top of the `for rollout_id in range(...)` loop in `external/miles/train.py`, before `rollout_manager.generate(...)`).
 *   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, active_base_version)`.
 *   **Required TODO (Miles async semantics)**: implement **arrival vs consumption** accounting so the denominator/remaining logic is correct even when generation and training overlap.
     - Track at least these monotonic counters for the current backlog window:
@@ -249,8 +249,8 @@ For the `swe-agent` example, integration involves modifying the `train.py` loop:
 ### 5.3 Native Request Migration During Stop (Framework-Specific)
 *   **Miles native pattern (baseline)**: stop at batch boundaries; then sync weights; then start the next batch.
 *   **What exists in code**:
-    1.  `RolloutManager.offload()` offloads engine memory (`third_party/miles/miles/ray/rollout.py`).
-    2.  There is an explicit abort primitive for in-flight work (`third_party/miles/miles/rollout/sglang_rollout.py` `abort()` calls `/abort_request`), but the common multi-turn examples treat abort as terminal (no automatic resume).
+    1.  `RolloutManager.offload()` offloads engine memory (`external/miles/miles/ray/rollout.py`).
+    2.  There is an explicit abort primitive for in-flight work (`external/miles/miles/rollout/sglang_rollout.py` `abort()` calls `/abort_request`), but the common multi-turn examples treat abort as terminal (no automatic resume).
 *   **SchedRL integration**:
     - Prefer `update_policy=BATCH`: coordinate so weight sync happens only when there is no in-flight generation on the target subset.
     - For time-sharing shrink, implement `REQUEST_RETRY`: remove subset from router admission, abort those engines, and re-queue the affected prompt/groups back to the global data source so they are regenerated on surviving workers.
@@ -260,7 +260,7 @@ For the `swe-agent` example, integration involves modifying the `train.py` loop:
 Goal: implement `migration_policy=REQUEST_RETRY` for mid-flight shrink by reusing Miles’ existing global data source buffer and SGLang abort endpoint, with coordinator-provided per-turn `rid`.
 
 **Shrink (mid-flight) — required**
-- Subset lifecycle: extend `RolloutManager.onload/offload` to accept `worker_indices` and map indices → engine handles (`third_party/miles/miles/ray/rollout.py`).
+- Subset lifecycle: extend `RolloutManager.onload/offload` to accept `worker_indices` and map indices → engine handles (`external/miles/miles/ray/rollout.py`).
 - Admission control: remove/disable the shrinking subset from routing so no new requests are routed to it.
   - Required extension: MilesRouter needs a worker disable/remove API (today it only supports `/add_worker` + `/list_workers`).
 - Deterministic request id (required): coordinator generates `rid = f"{trajectory_id}:{turn_id}:{attempt}"` and passes it into every `/generate` request.
@@ -309,7 +309,7 @@ This section describes how reused Miles components and required extensions imple
 *   **Release ACK**: After normal generation release, the proxy notifies the central scheduler (`notify_cluster_released`) before new preemption decisions are applied.
 
 ## 7. Implementation Steps (Phase 4)
-1.  **Add Indices**: Update `onload`/`offload` signatures in `third_party/miles/ray/rollout.py` and `actor_group.py`.
+1.  **Add Indices**: Update `onload`/`offload` signatures in `external/miles/ray/rollout.py` and `actor_group.py`.
 2.  **Proxy Layer**: Implement a lightweight proxy to emit release ACKs and execute scheduler-initiated expand/shrink.
 3.  **Inject Hooks**: Add batch-start + 2% band progress reporting to `generate_rollout` and integrate with `scheduler.report_progress`.
 4.  **Verify**: Validate subset selective execution with `swe-agent`.

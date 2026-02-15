@@ -9,11 +9,11 @@ We keep the core training loop intact and introduce a **proxy layer** to interce
 NeMo-RL supports async GRPO and it already has a multi-turn environment example. But the repo does not yet have a ready “async + multi-turn” example that we can run as-is.
 
 - Best multi-turn task to start from: sliding puzzle
-  - Script: `third_party/nemo-rl/examples/run_grpo_sliding_puzzle.py`
-  - Config: `third_party/nemo-rl/examples/configs/grpo_sliding_puzzle.yaml` (already multi-turn; `max_rollout_turns` is set)
+  - Script: `external/nemo-rl/examples/run_grpo_sliding_puzzle.py`
+  - Config: `external/nemo-rl/examples/configs/grpo_sliding_puzzle.yaml` (already multi-turn; `max_rollout_turns` is set)
 - Best async reference to reuse:
-  - Guide: `third_party/nemo-rl/docs/guides/async-grpo.md`
-  - Core logic: `third_party/nemo-rl/nemo_rl/algorithms/async_utils.py` already runs multi-turn async rollout (`run_async_multi_turn_rollout`)
+  - Guide: `external/nemo-rl/docs/guides/async-grpo.md`
+  - Core logic: `external/nemo-rl/nemo_rl/algorithms/async_utils.py` already runs multi-turn async rollout (`run_async_multi_turn_rollout`)
 
 Planned work (doc-level):
 - Add one new “async sliding puzzle” config and/or run script that turns on:
@@ -32,9 +32,9 @@ Goal: add a **Mini-SWE** training example for NeMo-RL that is:
 
 What we can reuse in this workspace:
 - Mini-SWE agent server code exists in NeMo-Gym:
-  - `third_party/nemo-gym/responses_api_agents/mini_swe_agent/`
+  - `external/nemo-gym/responses_api_agents/mini_swe_agent/`
 - Mini-SWE resource configs exist:
-  - `third_party/nemo-gym/resources_servers/mini_swe_agent/`
+  - `external/nemo-gym/resources_servers/mini_swe_agent/`
 
 Planned work (doc-level first, then code):
 - Define a NeMo-RL rollout “task” that uses the Mini-SWE agent server as the environment/tool runner.
@@ -53,15 +53,15 @@ Safety rules (important for tools):
 This section reality-checks NeMo-RL against the shared protocol in `design_doc/multi-pipeline-adaptation-plan_clean.md` and lists concrete gaps.
 
 **Already present in the codebase**
-- **In-flight / in-place weight update (INFLIGHT semantics)**: `third_party/nemo-rl/nemo_rl/algorithms/grpo.py` `refit_policy_generation(...)` supports colocated (IPC/ZMQ) and non-colocated (NCCL collective) weight update.
-- **Admission gating around update**: `third_party/nemo-rl/nemo_rl/algorithms/async_utils.py` `AsyncTrajectoryCollector.prepare_for_refit()` pauses launching new **prompt-group rollout threads** (one thread per prompt index; each thread runs a multi-turn rollout over `num_generations_per_prompt` trajectories) and optionally waits for those in-flight threads depending on `async_engine` + `in_flight_weight_updates`.
-- **Version tagging for async GRPO**: trajectories are pushed with `(generation_weight_version, target_weight_version)` and consumed with target matching (bounded staleness) (`third_party/nemo-rl/nemo_rl/algorithms/async_utils.py`).
+- **In-flight / in-place weight update (INFLIGHT semantics)**: `external/nemo-rl/nemo_rl/algorithms/grpo.py` `refit_policy_generation(...)` supports colocated (IPC/ZMQ) and non-colocated (NCCL collective) weight update.
+- **Admission gating around update**: `external/nemo-rl/nemo_rl/algorithms/async_utils.py` `AsyncTrajectoryCollector.prepare_for_refit()` pauses launching new **prompt-group rollout threads** (one thread per prompt index; each thread runs a multi-turn rollout over `num_generations_per_prompt` trajectories) and optionally waits for those in-flight threads depending on `async_engine` + `in_flight_weight_updates`.
+- **Version tagging for async GRPO**: trajectories are pushed with `(generation_weight_version, target_weight_version)` and consumed with target matching (bounded staleness) (`external/nemo-rl/nemo_rl/algorithms/async_utils.py`).
 
 **Gaps / required extensions to support elastic shrink/expand**
 - **Subset lifecycle (DP-granular wake/sleep)**:
-  - `third_party/nemo-rl/nemo_rl/models/generation/vllm/vllm_generation.py` `prepare_for_generation()` / `finish_generation()` call wake/sleep for *all* workers via `run_all_workers_single_data`.
+  - `external/nemo-rl/nemo_rl/models/generation/vllm/vllm_generation.py` `prepare_for_generation()` / `finish_generation()` call wake/sleep for *all* workers via `run_all_workers_single_data`.
   - The shared protocol requires subset activation/deactivation for `expand_workers(indices)` / `shrink_workers(indices)`.
-  - Good news: `third_party/nemo-rl/nemo_rl/distributed/worker_groups.py` has `run_single_worker_single_data(...)`, so we can target specific worker indices once the generation wrapper exposes an indices parameter.
+  - Good news: `external/nemo-rl/nemo_rl/distributed/worker_groups.py` has `run_single_worker_single_data(...)`, so we can target specific worker indices once the generation wrapper exposes an indices parameter.
 - **Preemption migration on shrink**:
   - There is no obvious “abort these request_ids on this subset” API exposed at the NeMo-RL generation layer today (unlike ROLL’s `GenerateRequestType.ABORT`).
   - To support SchedRL mid-flight shrink (required for time-sharing), we should reuse existing primitives and add a small extension:
@@ -82,7 +82,7 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
   - NeMo-RL often reasons in “prompt-groups” (one prompt-group contains multiple trajectories: `num_generations_per_prompt`). The adapter must convert prompt-group counts into trajectory counts.
 
 **Concrete file refs & immediate actions**
-- Files: `third_party/nemo-rl/nemo_rl/algorithms/async_utils.py`, `third_party/nemo-rl/nemo_rl/algorithms/grpo.py`, `third_party/nemo-rl/nemo_rl/models/generation/vllm/vllm_generation.py`, `third_party/nemo-rl/nemo_rl/distributed/worker_groups.py`.
+- Files: `external/nemo-rl/nemo_rl/algorithms/async_utils.py`, `external/nemo-rl/nemo_rl/algorithms/grpo.py`, `external/nemo-rl/nemo_rl/models/generation/vllm/vllm_generation.py`, `external/nemo-rl/nemo_rl/distributed/worker_groups.py`.
 - Actions:
   - Add `wake(worker_indices)` / `sleep(worker_indices)` to `VllmGeneration` and thread through `RayWorkerGroup` helpers (use `run_single_worker_single_data` as a reference).
   - Instrument `AsyncTrajectoryCollector` to emit `scheduler.report_progress(...)` at batch start and on 2% progress bands:
@@ -142,19 +142,19 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
 *   **Mechanism**: `refit_policy_generation()` selects one of two weight-sync paths:
     *   **Colocated inference (`colocated_inference=True`)**: CUDA-IPC + ZMQ streaming (`policy.stream_weights_via_ipc_zmq(...)` + `policy_generation.update_weights_via_ipc_zmq()`).
     *   **Non-colocated inference (`colocated_inference=False`)**: NCCL collective broadcast (`policy.broadcast_weights_for_collective(...)` + `policy_generation.update_weights_from_collective()`).
-*   **Hook**: `refit_policy_generation()` is invoked at generation boundaries inside the training loop (e.g., `third_party/nemo-rl/nemo_rl/algorithms/grpo.py`), before `run_*_rollout`.
+*   **Hook**: `refit_policy_generation()` is invoked at generation boundaries inside the training loop (e.g., `external/nemo-rl/nemo_rl/algorithms/grpo.py`), before `run_*_rollout`.
 *   **Note (async GRPO)**: `AsyncTrajectoryCollector.prepare_for_refit()` pauses launching *new* prompt-group rollouts and may optionally wait for in-flight prompt-group threads depending on `async_engine` and `in_flight_weight_updates` (see Section 2.4).
 
 ### 2.4 Running Requests & Trajectories (Pre-Adaptation)
 *   **Running request handling (async GRPO / vLLM async engine)**
-    *   **File**: `third_party/nemo-rl/nemo_rl/algorithms/async_utils.py`
+    *   **File**: `external/nemo-rl/nemo_rl/algorithms/async_utils.py`
     *   **Hook**: `AsyncTrajectoryCollector.prepare_for_refit()`
     *   **Behavior**:
         *   Pauses **new** generation starts by clearing `_refit_pause_cleared`.
         *   If `vllm_cfg.async_engine=true` and `grpo.async_grpo.in_flight_weight_updates=true`, in-flight prompt-group rollouts are allowed to complete while weights are updated (no global abort).
         *   Otherwise, refit waits for all in-flight prompt-group threads to complete (`wait_for_pending_generations()`).
 *   **Running trajectory handling (buffering + versioning)**
-    *   **Files**: `third_party/nemo-rl/nemo_rl/algorithms/async_utils.py`, `third_party/nemo-rl/nemo_rl/algorithms/grpo.py`
+    *   **Files**: `external/nemo-rl/nemo_rl/algorithms/async_utils.py`, `external/nemo-rl/nemo_rl/algorithms/grpo.py`
     *   **Behavior**:
         *   Each rollout thread produces a per-prompt trajectory group and pushes it to `ReplayBuffer.push_with_wait_signal(...)` with `(generation_weight_version, target_weight_version)`.
         *   Training consumes only trajectories whose `target_weight_version == current_weight_version` (bounded staleness controlled by `max_trajectory_age_steps`).
@@ -226,7 +226,7 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
     3.  Add `wake(worker_indices)` and `sleep(worker_indices)` methods to `VllmGeneration` or `RayWorkerGroup` to support subset activation/deactivation without affecting the whole cluster.
 
 ### 4.2 Scheduler Progress Hooks
-*   **Integration Point**: `AsyncTrajectoryCollector._run_prompt_group_worker` in `third_party/nemo-rl/nemo_rl/algorithms/async_utils.py` (buffer enqueue via `replay_buffer.push_with_wait_signal(...)`), plus the `grpo_train` loop in `third_party/nemo-rl/nemo_rl/algorithms/grpo.py`.
+*   **Integration Point**: `AsyncTrajectoryCollector._run_prompt_group_worker` in `external/nemo-rl/nemo_rl/algorithms/async_utils.py` (buffer enqueue via `replay_buffer.push_with_wait_signal(...)`), plus the `grpo_train` loop in `external/nemo-rl/nemo_rl/algorithms/grpo.py`.
 *   **Trigger**: On buffer enqueue (inside `_run_prompt_group_worker`) and at the start of the batch loop (`for batch in dataloader:` around line 1118).
 *   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, active_base_version)`.
 *   **Frequency**: Report at **batch start** and whenever `percent_completed` crosses a **2% progress band** (event-driven). Denominator is the per-step rollout target in trajectories: `train_global_batch_size` (i.e., `num_prompt_groups_needed * num_generations_per_prompt`). Use `oldest_unfinished` timestamp for scheduler tie-breaking.
