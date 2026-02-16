@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
-from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
+
+from schedrl.utils.ray_head import ray_cli_path
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,22 +24,17 @@ def _base_env() -> dict[str, str]:
     return env
 
 
-def _ray_cli_path() -> str:
-    python_bin_dir = Path(sys.executable).parent
-    return str(python_bin_dir / "ray")
-
-
 def ray_stop_force() -> None:
-    subprocess.run([_ray_cli_path(), "stop", "--force"], check=False, env=_base_env())
+    subprocess.run([ray_cli_path(), "stop", "--force"], check=False, env=_base_env())
 
 
 def ray_start(cfg: RayLauncherConfig) -> None:
     if cfg.head:
-        cmd = [_ray_cli_path(), "start", "--head", f"--port={cfg.port}"]
+        cmd = [ray_cli_path(), "start", "--head", f"--port={cfg.port}"]
     else:
         if not cfg.address:
             raise ValueError("cfg.address is required when head=False")
-        cmd = [_ray_cli_path(), "start", f"--address={cfg.address}"]
+        cmd = [ray_cli_path(), "start", f"--address={cfg.address}"]
 
     if cfg.node_name:
         cmd.append(f"--node-name={cfg.node_name}")

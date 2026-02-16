@@ -7,6 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
 from typing import Any, Dict, Optional
 
 from schedrl.protocol.request_id import validate_pipeline_id
@@ -41,6 +42,11 @@ class PipelineState:
 
 
 def _ray_cli_path() -> str:
+    # Prefer PATH resolution (e.g. /usr/local/bin/ray) because sys.executable may be /usr/bin/python3
+    # while the ray CLI is installed elsewhere.
+    ray_path = shutil.which("ray")
+    if ray_path:
+        return ray_path
     python_bin_dir = Path(sys.executable).parent
     return str(python_bin_dir / "ray")
 
@@ -77,17 +83,22 @@ def _ensure_scheduler_singleton():
         # Admission control / topology gating happens here (orchestrator-owned).
         # Scheduler only seeds its idle_gpus from the resource manager after this is ready.
         ray.get(resource_manager.snapshot.remote(wait_timeout_s=10.0, poll_interval_s=0.2))
-        required_gpus_per_node_raw = os.environ.get("SCHEDRL_REQUIRED_GPUS_PER_NODE", "8")
-        try:
-            required_gpus_per_node = int(required_gpus_per_node_raw)
-        except Exception as e:
-            raise RuntimeError(
-                f"Invalid SCHEDRL_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected int"
-            ) from e
-        if required_gpus_per_node <= 0:
-            raise RuntimeError(
-                f"Invalid SCHEDRL_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected > 0"
-            )
+        # Default: infer GPUs-per-node from Ray topology (portable for local smoke tests).
+        # If set, this env var pins a stricter topology contract and must match observation.
+        required_gpus_per_node_raw = os.environ.get("SCHEDRL_REQUIRED_GPUS_PER_NODE")
+        if required_gpus_per_node_raw is None or required_gpus_per_node_raw.strip() == "":
+            required_gpus_per_node = None
+        else:
+            try:
+                required_gpus_per_node = int(required_gpus_per_node_raw)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Invalid SCHEDRL_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected int"
+                ) from e
+            if required_gpus_per_node <= 0:
+                raise RuntimeError(
+                    f"Invalid SCHEDRL_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected > 0"
+                )
         ray.get(resource_manager.init_topology.remote(required_gpus_per_node=required_gpus_per_node))
         ray.get(scheduler.initialize.remote(resource_manager=resource_manager))
     except Exception as e:
