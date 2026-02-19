@@ -16,9 +16,9 @@ Create `SchedRLMultiLoraPipeline` in `external/ROLL_schedrl` that:
 1. Reuses existing multi-LoRA patterns from ROLL_multi_lora
 2. Integrates with SchedRL scheduler like `SchedRLConcurrentPipeline` does
 3. Supports per-adapter progress tracking and reporting
-4. Handles shrink/expand with adapter-aware routing
-5. Supports Adapter Garbage Collection (GC) to prevent OOM
-6. Operates under SchedRL's `sleep_level=2` constraint
+5. Eliminates Adapter Garbage Collection (GC) by enforcing static VRAM limits for fixed adapter sets
+6. Operates under SchedRL's `sleep_level=2` constraint (GPU release only; actors remain alive)
+7. Ensures isolated, asynchronous LR decay per adapter via `per_adapter` optimizer mode
 
 ---
 
@@ -37,9 +37,11 @@ We enforce strict **sequential processing** of adapters during training (`Adapte
   - **Per-Adapter RNG**: Dropout masks and other random operations need isolation between adapters. Sequential processing allows us to save/restore per-adapter RNG states, preventing cross-adapter RNG pollution.
   - **Code Reuse**: This aligns with the existing single-LoRA training pattern, allowing us to reuse `inner_forward_step` and optimizer logic without complex modification.
 
-#### 2. SchedRL Execution Model (`sleep_level=2`)
+#### 2. SchedRL Execution Model (`sleep_level=2` & Actor Lifespan)
 Unlike `AgenticMultiLoraPipeline` which uses `partial_gpu_mode=True` (inference and training overlap), SchedRL requires **full GPU release** (`sleep_level=2`) during the training phase to allow for elastic resizing.
 - **Consequence**: `SchedRLMultiLoraPipeline` will operate in a **sequential** cycle: `Expand -> Rollout (all adapters) -> Shrink -> Train (dirty adapters) -> Repeat`.
+- **Actor Lifespan**: Codebase review confirms Ray actors are **NOT** destroyed during shrink. They remain alive; only GPU memory is freed via `offload_states()`.
+- **State Location**: Optimizer and model states reside in the actor's **CPU RAM** during the "Sleep" phase. This removes the need for expensive checkpoint-to-disk cycles during elastic scaling.
 - **Constraint**: `partial_gpu_mode` will be **disabled** or ignored. The pipeline must not rely on concurrent training/inference on the same GPU resources.
 - **Requirement**: Explicitly **REMOVE** the `sleep_level=1` validation check found in `AgenticMultiLoraPipeline` when porting.
 - **Validation**: Verify that reloading multiple adapters on every expand cycle is performant enough and that vLLM `sleep_level=2` restores both base model and adapter weights correctly.
@@ -102,9 +104,10 @@ The existing `_shrink_workers` / `_expand_workers` methods in `AgenticPipeline` 
 - **Requirement**: Enforce **Sequential Adapter Training**.
 - **Action**: `train_step_lora` must loop through adapters sequentially, processing *all* microbatches and stepping the optimizer for Adapter A **before** touching Adapter B. This ensures the global adapter state remains consistent during the entire forward-backward-step cycle for each adapter.
 
-#### 14. Resource Hygiene (Offload States Management)
+#### 14. Resource Hygiene (Offload States Management & CPU RAM)
 - **Problem**: After Megatron training completes, optimizer and model states may remain in GPU memory, preventing full release to SchedRL.
 - **Requirement**: Proper offload of states before releasing GPUs.
+- **Persistence**: Since Ray actors remain alive during `sleep_level=2`, states are moved to **CPU RAM** via `offload_states()`. Metadata (RNG, step counters) is persisted via `WorkerState.kv` (JSON).
 - **Action**:
   - **Use existing `offload_states` mechanism** (already in ROLL_multi_lora):
     - Call `optimizer.offload_states(include=[OffloadStateType.optimizer_states])` after training completes.
@@ -179,8 +182,9 @@ The existing `_shrink_workers` / `_expand_workers` methods in `AgenticPipeline` 
 - **Validation**: Add test with shared BN/LN layer to verify the buffer check raises `ValueError`.
 
 #### 17. Partial Failure Handling (Fatal Error with Orchestrator Shutdown)
-- **Problem**: A single worker failing to load an adapter in a tensor-parallel (TP) group can leave the group in a zombie state (stranded GPUs). The Ray cluster may be in a corrupted state requiring full shutdown.
-- **Requirement**: Coordinator detection, proper error signaling to SchedRL orchestrator, and cluster shutdown.
+- **Problem**: During `expand_workers`, a single worker failing to load the base model or adapters in a tensor-parallel (TP) group leaves the group in a zombie state.
+- **Cause**: TP requires all ranks to participate; one failed rank = corrupted group.
+- **Note**: This is NOT related to adapter GC/eviction. It occurs during initial worker expansion when loading model weights into fresh GPU workers.
 - **Action**:
   - **In `SchedRLMultiLoraPipeline._expand_all_schedulers()`**: Wrap `load_adapter` calls in try/except block.
   - **On failure**: Catch `WorkerLoadError`, log fatal error, and raise `RuntimeError(f"PARTIAL_TP_GROUP_FAILURE: {e}")`.
@@ -201,11 +205,14 @@ The existing `_shrink_workers` / `_expand_workers` methods in `AgenticPipeline` 
     )
     ```
   - **Recovery**: SchedRL restarts pipeline from clean state.
-- **Validation**: Add test case injecting failure on Rank 1 during `load_adapter` to verify:
-  - Exception is caught and `ActionResponse(success=False, error=...)` is returned
-  - Orchestrator receives the error reason and triggers `shutdown(force=True, reason=..., source=...)`
-  - Ray cluster is fully shut down and released
-  - No zombie state remains
+
+#### 18. Asynchronous Learning Rate Decay (LR Desync Prevention)
+- **Requirement**: Adapters that train sparsely (e.g., 10 samples) must not have their learning rate decayed based on a global step dominated by highly active adapters (e.g., 10,000 samples).
+- **Mechanism**: Use `lora_optimizer_mode="per_adapter"`. 
+- **Correct Behavior**:
+  - Each adapter has its own `adapter_schedulers[adapter_name]`.
+  - `sch.step()` is ONLY called when that specific adapter is active in a training batch.
+  - This ensures LR decay is mathematically bounded to the adapter's **local progress**, not the pipeline's wall-clock global step.
 
 ### Key Files to Port/Modify
 
@@ -291,17 +298,18 @@ def model_update(self, step=None, adapters_to_update: set[str] | None = None):
 - [ ] `train_step_lora` processes adapters sequentially.
 - [ ] Metrics are correctly namespaced (e.g. `adapter_A/loss`).
 
-#### Phase 2: LoRA Routing & GC (Adapter Eviction)
+#### Phase 2: Static Memory Hard-Capping (Issue 2 Fix)
 **Files**:
-- `roll/utils/lora_routing.py`: Copy file.
-- **Adapter GC**:
-  - Implement `remove_lora(adapter_id)` in strategy layer (vLLM and Megatron).
-  - Implement LRU eviction logic in `SchedRLMultiLoraPipeline` or `GroupQueueManager`.
-  - Define capacity limits (e.g., `max_resident_adapters`).
+- `roll/schedrl_adapter/multi_lora_pipeline.py`
+- **Adapter Validation**:
+  - Since adapters are fixed in config, we apply static validation and remove complex GC.
+  - Implement `max_resident_adapters` validation in `__init__`.
+  - Compare `len(active_model_spec.adapter_names)` to `max_resident_adapters` and fail fast with clear ValueError if the limit is exceeded.
+  - *No runtime GC, no LRU eviction required.*
 
 **Success Criteria**:
-- [ ] `remove_lora` successfully unloads adapter weights and frees VRAM.
-- [ ] System does not OOM when rotating through N > capacity adapters (verifiable via VRAM usage check).
+- [ ] VRAM limits are enforced during `__init__` before any GPUs are allocated.
+- [ ] A pipeline given > N adapters fails to start and shuts down.
 
 #### Phase 3: SchedRLMultiLoraPipeline Implementation
 **Files**:
