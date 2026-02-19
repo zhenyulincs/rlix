@@ -375,6 +375,65 @@ class SchedRLMultiLoraPipeline(BasePipeline):
   - Verify SchedRL orchestrator triggers `shutdown(force=True, reason=..., source="pipeline_adapter")`.
   - Verify Ray cluster is fully shut down and no zombie state remains.
 
+### Phase 1 Unit Tests: `per_adapter` Single-LoRA Step Correctness
+
+**File**: `external/ROLL_schedrl/tests/integration/test_per_adapter_single_lora_step_equivalence.py`
+
+#### Rationale — Cross-Mode Equivalence
+
+With `lora_optimizer_mode="per_adapter"` and a **single adapter** per `train_step_lora` call, the per-adapter code path degenerates to the same sequence as the upstream single-LoRA `train_step`:
+
+```
+forward/backward over 1 micro-batch → optimizer.step() for that adapter → scheduler.step() → zero_grad
+```
+
+By running both modes on identical weights and identical tokens we get a cheap, ground-truth-free correctness signal across DP × TP configurations, without needing a separate oracle or numerical baseline.
+
+#### Test Matrix
+
+| TC | `dp` | `tp` | Adapters | GPUs needed | Description |
+|----|------|------|----------|-------------|-------------|
+| 1  | 1    | 1    | a, b     | 2           | Baseline: single GPU per side |
+| 2  | 2    | 1    | a, b, c  | 4           | Data parallelism |
+| 3  | 1    | 2    | a, b, c  | 4           | Tensor parallelism |
+| 4  | 2    | 2    | a, b, c  | 8           | Combined DP + TP |
+
+#### Setup (per test)
+
+1. **per_adapter cluster** (ROLL_schedrl `SFTWorker`, `lora_optimizer_mode="per_adapter"`) on GPUs `[0, dp*tp)`.
+2. **Reference cluster** (ROLL_schedrl `SFTWorker`, standard `megatron_train`, no `lora_optimizer_mode`) on GPUs `[dp*tp, 2*dp*tp)`.
+3. All adapters in the per_adapter cluster are seeded with identical initial weights via `copy_lora_params`.
+4. For each adapter in sequence:
+   - Weights are copied from per_adapter cluster → reference cluster via `get/set_lora_tensors`.
+   - One `train_step_lora(mb)` call (single adapter only) is run on the per_adapter cluster.
+   - One `train_step(mb)` call (upstream single-LoRA) is run on the reference cluster.
+   - Final LoRA weights are compared with `torch.testing.assert_close(rtol=1e-5, atol=1e-6)`.
+   - The per_adapter adapter weight is reset to its pre-step init so each adapter's test is independent.
+
+#### Skip Conditions
+- `torch.cuda.device_count() < 2*dp*tp` — skipped cleanly on smaller machines.
+- ModelScope cache missing for `Qwen/Qwen2.5-0.5B-Instruct`.
+
+#### How to Run
+
+```bash
+# All 4 test cases
+cd external/ROLL_schedrl
+pytest tests/integration/test_per_adapter_single_lora_step_equivalence.py -v
+
+# Individual test cases
+pytest tests/integration/test_per_adapter_single_lora_step_equivalence.py -k "tc1" -v
+pytest tests/integration/test_per_adapter_single_lora_step_equivalence.py -k "tc2" -v
+pytest tests/integration/test_per_adapter_single_lora_step_equivalence.py -k "tc3" -v
+pytest tests/integration/test_per_adapter_single_lora_step_equivalence.py -k "tc4" -v
+```
+
+#### Dependencies (must be ported in Phase 1 before tests pass)
+- `MegatronTrainStrategy.train_step_lora` with `lora_optimizer_mode="per_adapter"` (from ROLL_multi_lora).
+- `Worker.{get_lora_tensors, set_lora_tensors, copy_lora_params, train_step_lora}` (from ROLL_multi_lora).
+
+---
+
 ### Design Decisions & Clarifications
 
 1.  **Sleep Level vs Partial GPU**:
