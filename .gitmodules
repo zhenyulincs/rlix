@@ -31,12 +31,12 @@
 	path = external/ROLL_multi_lora
 	url = git@github.com:taoluo/_rlos_ROLL.git
 	update = none
-	branch = sync/multi-lora
+	branch = multi-lora
 [submodule "external/ROLL_multi_pipeline"]
 	path = external/ROLL_multi_pipeline
 	url = git@github.com:taoluo/_rlos_ROLL.git
 	update = none
-	branch = sync/multi-pipeline
+	branch = multi-pipeline
 [submodule "external/ROLL_upstream_main"]
 	path = external/ROLL_upstream_main
 	url = git@github.com:alibaba/ROLL.git
