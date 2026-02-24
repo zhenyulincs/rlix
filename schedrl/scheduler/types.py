@@ -20,6 +20,7 @@ class ClusterAllocation:
     dp_rank_to_gpus: Dict[int, List[int]] = field(default_factory=dict)
     global_step: Optional[int] = None
     timestamp: Optional[float] = None
+    lora_name: Optional[str] = None  # GPU tracing: LoRA adapter name for non-generation clusters
 
 
 class ValidationError(RuntimeError):
@@ -80,6 +81,7 @@ class PendingRequest:
     request: Request
     event: asyncio.Event
     global_step: Optional[int] = None
+    lora_name: Optional[str] = None  # GPU tracing: LoRA adapter name for non-generation clusters
     result: List[int] = field(default_factory=list)
     error: Optional[str] = None
 
