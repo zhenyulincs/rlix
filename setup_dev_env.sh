@@ -1,9 +1,9 @@
-export RAY_grpc_server_thread_pool_size=4 # reduce the thread usage to save limited pid resouce 
+# export RAY_grpc_server_thread_pool_size=4 # reduce the thread usage to save limited pid resouce 
 cd external/ROLL_schedrl
 conda activate main # ensure we are in main env 
 uv pip install -r requirements_torch260_vllm.txt
 uv pip install --no-build-isolation transformer-engine[pytorch]==2.2.0
-curl -fsSL https://opencode.ai/install | bash
+# curl -fsSL https://opencode.ai/install | bash
 curl -fsSL https://claude.ai/install.sh | bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 npm i -g @openai/codex
