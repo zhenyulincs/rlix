@@ -326,6 +326,20 @@ class SchedulerImpl:
             self._gpu_tracks[gpu_id] = track
         return track
 
+    def _init_gpu_tracks(self) -> None:
+        """Eagerly create all GPU tracks for correct ordering in Perfetto UI.
+
+        MUST be called after _num_gpus and _required_gpus_per_node are set.
+        Track order in Perfetto is determined by creation order.
+        """
+        if not self._enable_gpu_tracing:
+            return
+        if self._num_gpus is None or self._required_gpus_per_node is None:
+            return
+
+        for gpu_id in range(self._num_gpus):
+            self._get_or_create_gpu_track(gpu_id)
+
     def _get_or_create_queue_group(self, priority: Priority) -> Optional[_QueueSubGroup]:
         """Get or create the Queue_<KEY> sub-group wrapper for a priority tier.
 
@@ -586,6 +600,40 @@ class SchedulerImpl:
             self._safe_trace(self._scheduler_group.instant, time.time_ns(), name, kwargs=payload)
         else:
             self._safe_trace(self._scheduler_group.instant, time.time_ns(), name)
+
+    def _trace_execution_marker(self, payload: Dict[str, Any]) -> None:
+        """Record a per-cycle execution marker summarizing all GPU allocation changes."""
+        if not self._enable_gpu_tracing or self._scheduler_group is None:
+            return
+        self._safe_trace(
+            self._scheduler_group.instant,
+            time.time_ns(),
+            f"Exec C{self._cycle_counter}",
+            kwargs=payload,
+        )
+
+    def _trace_enqueue_marker(self, cluster_id: str, priority: Priority) -> None:
+        """Record an instant marker when request is successfully enqueued."""
+        if not self._enable_gpu_tracing or self._scheduler_group is None:
+            return
+        key = _PRIORITY_SHORT.get(priority, priority.name[:3])
+        self._safe_trace(
+            self._scheduler_group.instant,
+            time.time_ns(),
+            f"Enqueue: {key}",
+            kwargs={"cluster_id": cluster_id, "priority": priority.name},
+        )
+
+    def _trace_release_marker(self, cluster_id: str, gpus_released: List[int]) -> None:
+        """Record an instant marker when GPUs are released via release_gpus()."""
+        if not self._enable_gpu_tracing or self._scheduler_group is None:
+            return
+        self._safe_trace(
+            self._scheduler_group.instant,
+            time.time_ns(),
+            f"Release: {cluster_id}",
+            kwargs={"cluster_id": cluster_id, "gpus_released": gpus_released},
+        )
 
     def _maybe_flush_trace(self) -> None:
         """Throttled flush - only flush if interval elapsed."""
@@ -919,6 +967,8 @@ class SchedulerImpl:
         if self._enable_gpu_tracing:
             # Prefer explicit parameter, fall back to env var, then cwd
             self._init_tracing(trace_output_dir or env_trace_dir)
+            # Eagerly create GPU tracks for correct UI ordering (before any queue operations)
+            self._init_gpu_tracks()
             # Active GPU counter: emit initial value (all GPUs idle = 0 active)
             self._trace_active_gpus_update()
 
@@ -1146,6 +1196,8 @@ class SchedulerImpl:
             self._state.pending_bucket(priority).append(pending)
             # Queue Tracing: Track enqueue AFTER append (depth is correct)
             self._trace_queue_enqueue(cluster_id, priority, lora_name)
+            # GPU Tracing: Instant marker for successful enqueue
+            self._trace_enqueue_marker(cluster_id, priority)
             self._wakeup_event.set()
         await event.wait()
         if pending is None:
@@ -1164,6 +1216,8 @@ class SchedulerImpl:
             self._end_traces_for_gpu_ids(alloc.gpu_ids)
             self._state.idle_gpus |= set(alloc.gpu_ids)
             self._trace_active_gpus_update()
+            # GPU Tracing: Instant marker for release
+            self._trace_release_marker(cluster_id, alloc.gpu_ids)
             self._wakeup_event.set()
 
     async def release_and_request_gpus(
@@ -1206,6 +1260,8 @@ class SchedulerImpl:
                 self._end_traces_for_gpu_ids(alloc.gpu_ids)
                 self._state.idle_gpus |= set(alloc.gpu_ids)
                 self._trace_active_gpus_update()
+                # GPU Tracing: Instant marker for release
+                self._trace_release_marker(release_cluster_id, alloc.gpu_ids)
             if self._has_any_pending_request_locked(cluster_id=request_cluster_id):
                 raise RuntimeError(f"Duplicate pending request for cluster_id={request_cluster_id!r} is not supported")
             self._request_seq += 1
@@ -1218,6 +1274,8 @@ class SchedulerImpl:
             self._state.pending_bucket(request_priority).append(pending)
             # Queue Tracing: Track enqueue AFTER append (depth is correct)
             self._trace_queue_enqueue(request_cluster_id, request_priority, request_lora_name)
+            # GPU Tracing: Instant marker for successful enqueue
+            self._trace_enqueue_marker(request_cluster_id, request_priority)
             self._wakeup_event.set()
         await event.wait()
         if pending is None:
@@ -1549,11 +1607,15 @@ class SchedulerImpl:
             await self._execute_resize_calls(resize_calls)
 
             # Phase 6: commit (Phase 2 simulation: state-only).
+            exec_details: Dict[str, Any] = {}
             async with self._lock:
-                self._apply_plan_and_signal(plan)
+                exec_details = self._apply_plan_and_signal(plan)
 
-            # GPU Tracing: Cycle end marker + throttled flush (OUTSIDE lock to avoid I/O latency)
-            self._trace_cycle_marker(f"C{self._cycle_counter} End")
+            # GPU Tracing: Execution marker + throttled flush (OUTSIDE lock to avoid I/O latency)
+            # Emit execution marker only if there were any operations
+            if any([exec_details.get("shrinks"), exec_details.get("removes"), 
+                    exec_details.get("allocates"), exec_details.get("expands")]):
+                self._trace_execution_marker(exec_details)
             self._maybe_flush_trace()
 
         except asyncio.CancelledError:
@@ -2014,7 +2076,14 @@ class SchedulerImpl:
 
         return idle_gpus
 
-    def _apply_plan_and_signal(self, plan: ExecutionPlan) -> None:
+    def _apply_plan_and_signal(self, plan: ExecutionPlan) -> Dict[str, Any]:
+        """Apply execution plan and return operation details for tracing."""
+        # Collect operation details for execution marker
+        exec_shrinks: List[Dict[str, Any]] = []
+        exec_removes: List[Dict[str, Any]] = []
+        exec_allocates: List[Dict[str, Any]] = []
+        exec_expands: List[Dict[str, Any]] = []
+
         def _reconstruct_bundle(*, cluster_id: str, dp_rank: int) -> Set[int]:
             pipeline_id, cluster_name = parse_cluster_id(cluster_id)
             if cluster_name != "actor_infer":
@@ -2042,6 +2111,12 @@ class SchedulerImpl:
                 # GPU Tracing: End traces for shrunk GPUs
                 self._end_traces_for_gpu_ids(list(bundle))
                 self._trace_active_gpus_update()
+                # Collect shrink detail for execution marker
+                exec_shrinks.append({
+                    "cluster_id": op.cluster_id,
+                    "gpus_freed": sorted(bundle),
+                    "dp_rank": dp_rank,
+                })
 
         for cluster_id in plan.clusters_to_remove:
             alloc = self._state.active_allocations.pop(cluster_id, None)
@@ -2050,6 +2125,11 @@ class SchedulerImpl:
                 self._end_traces_for_gpu_ids(alloc.gpu_ids)
                 self._state.idle_gpus |= set(alloc.gpu_ids)
                 self._trace_active_gpus_update()
+                # Collect remove detail for execution marker
+                exec_removes.append({
+                    "cluster_id": cluster_id,
+                    "gpus_freed": alloc.gpu_ids,
+                })
 
         # Apply allocations.
         for op in plan.signal_pending_allocation_ops:
@@ -2112,6 +2192,12 @@ class SchedulerImpl:
                         "initial", dp_ranks, lora_name,
                     )
             self._signal_pending_request(cluster_id=op.cluster_id, priority=priority, result=sorted(op.gpus_to_allocate))
+            # Collect allocate detail for execution marker
+            exec_allocates.append({
+                "cluster_id": op.cluster_id,
+                "gpus_allocated": sorted(op.gpus_to_allocate),
+                "priority": priority.name,
+            })
 
         # Apply expansions (state commit; adapter.expand_workers executed in scheduling_cycle before commit).
         # State commit is unconditional; signaling is deferred to a set-based pass to handle
@@ -2146,6 +2232,12 @@ class SchedulerImpl:
                         )
             if op.has_pending_request:
                 cluster_ids_to_signal.add(op.cluster_id)
+            # Collect expand detail for execution marker
+            exec_expands.append({
+                "cluster_id": op.cluster_id,
+                "gpus_allocated": sorted(op.gpus_to_allocate),
+                "dp_ranks_added": sorted(op.dp_ranks_to_add),
+            })
         for cluster_id in cluster_ids_to_signal:
             if self._has_pending_request_locked(cluster_id=cluster_id, priority=Priority.GENERATION):
                 alloc = self._state.active_allocations[cluster_id]
@@ -2156,6 +2248,13 @@ class SchedulerImpl:
             # If the cluster still exists, we assume shrink commit applied.
             req.event.set()
             self._state.pending_planned_release_requests.pop(cluster_id, None)
+
+        return {
+            "shrinks": exec_shrinks,
+            "removes": exec_removes,
+            "allocates": exec_allocates,
+            "expands": exec_expands,
+        }
 
     def _signal_pending_request(self, *, cluster_id: str, priority: Priority, result: Optional[List[int]] = None) -> None:
         bucket = self._state.pending_bucket(priority)
