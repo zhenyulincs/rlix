@@ -1377,15 +1377,6 @@ class SchedulerImpl:
             async with self._lock:
                 self._cycle_counter += 1
 
-                # GPU Tracing: Cycle start marker
-                self._trace_cycle_marker(
-                    f"C{self._cycle_counter} Start",
-                    payload={
-                        "idle_gpus": len(self._state.idle_gpus),
-                        "active": len(self._state.active_allocations),
-                    },
-                )
-
                 planned_available_gpus = set(self._state.idle_gpus)
 
                 # Phase 0.5: planned release requests (blocking release hint from pipeline/coordinator).
