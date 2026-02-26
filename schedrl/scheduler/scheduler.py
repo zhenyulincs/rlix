@@ -448,6 +448,20 @@ class SchedulerImpl:
         """
         self._release_marker_track = self._create_marker_track("release_markers")
 
+    def _init_queue_tracks(self) -> None:
+        """Eagerly create queue groups and counter tracks in priority order.
+
+        MUST be called AFTER _init_gpu_tracks() to ensure correct UI ordering.
+        Creates Queue_<KEY> groups in priority order (highest priority first):
+        INIT, TRN, CRT, OLD, REF, VAL, GEN
+        """
+        if not self._enable_gpu_tracing:
+            return
+        # Create queue groups in priority order (lower value = higher priority)
+        for priority in Priority:
+            self._get_or_create_queue_group(priority)
+            self._get_or_create_queue_counter_track(priority)
+
     def _create_queue_slice_track(self, cluster_id: str, priority: Priority) -> Optional["NormalTrack"]:
         """Create a per-cluster slice track for queue visualization.
 
@@ -1014,6 +1028,8 @@ class SchedulerImpl:
             self._init_active_gpus_counter()
             # Eagerly create GPU tracks for correct UI ordering (after counter)
             self._init_gpu_tracks()
+            # Eagerly create queue tracks for correct UI ordering (after GPU tracks, in priority order)
+            self._init_queue_tracks()
             # Active GPU counter: emit initial value (all GPUs idle = 0 active)
             self._trace_active_gpus_update()
 
