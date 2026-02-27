@@ -652,6 +652,38 @@ class SchedulerImpl:
         for gpu_id in gpu_ids:
             self._end_gpu_trace(gpu_id)
 
+    def _plan_to_exec_details(self, plan: "ExecutionPlan") -> Dict[str, Any]:
+        """Convert a finalized ExecutionPlan to the exec_details dict used by the execution marker.
+
+        Called right after planning (before resize RPCs) so the marker fires at decision time.
+        """
+        return {
+            "shrinks": [
+                {"cluster_id": op.cluster_id, "dp_ranks": sorted(op.dp_ranks_to_remove)}
+                for op in plan.sched_guided_shrink_ops
+                if op.dp_ranks_to_remove
+            ],
+            "removes": [{"cluster_id": cid} for cid in sorted(plan.clusters_to_remove)],
+            "allocates": [
+                {
+                    "cluster_id": op.cluster_id,
+                    "gpus_allocated": sorted(op.gpus_to_allocate),
+                    "priority": op.priority.name if op.priority else None,
+                }
+                for op in plan.signal_pending_allocation_ops
+                if op.gpus_to_allocate
+            ],
+            "expands": [
+                {
+                    "cluster_id": op.cluster_id,
+                    "gpus_allocated": sorted(op.gpus_to_allocate),
+                    "dp_ranks": sorted(op.dp_ranks_to_add),
+                }
+                for op in plan.sched_guided_allocation_ops
+                if op.gpus_to_allocate
+            ],
+        }
+
     def _trace_execution_marker(self, payload: Dict[str, Any]) -> None:
         """Record a per-cycle execution marker summarizing all GPU allocation changes."""
         if not self._enable_gpu_tracing or self._exec_marker_track is None:
@@ -1283,8 +1315,8 @@ class SchedulerImpl:
     async def release_and_request_gpus(
         self,
         *,
-        release_cluster_id: Optional[str],
-        release_global_step: Optional[int],
+        release_cluster_id: str,
+        release_global_step: int,
         request_cluster_id: str,
         request_priority: Priority,
         request_global_step: Optional[int] = None,
@@ -1300,28 +1332,30 @@ class SchedulerImpl:
                 raise RuntimeError(f"pipeline_id {pipeline_id!r} not registered")
             if not bool(info.get("admitted", False)):
                 raise RuntimeError(f"pipeline_id {pipeline_id!r} not admitted; call orchestrator.admit_pipeline first")
-            existing = self._state.active_allocations.get(request_cluster_id)
-            if existing is not None:
-                if existing.priority != request_priority:
-                    raise RuntimeError(
-                        f"cluster_id {request_cluster_id!r} already allocated with priority={existing.priority}, requested priority={request_priority}"
-                    )
-                if request_priority == Priority.GENERATION and not existing.active_dp_ranks:
-                    pass
-                elif request_priority != Priority.GENERATION and not existing.gpu_ids:
-                    pass
-                else:
-                    return list(existing.gpu_ids)
-            if release_cluster_id is not None:
-                alloc = self._state.active_allocations.pop(release_cluster_id, None)
-                if alloc is None:
-                    raise RuntimeError(f"release_cluster_id {release_cluster_id!r} not found")
-                # GPU Tracing: End traces for released GPUs
-                self._end_traces_for_gpu_ids(alloc.gpu_ids)
-                self._state.idle_gpus |= set(alloc.gpu_ids)
-                self._trace_active_gpus_update()
-                # GPU Tracing: Instant marker for release
-                self._trace_release_marker(release_cluster_id, alloc.gpu_ids)
+            assert release_cluster_id in self._state.active_allocations, (
+                f"release_cluster_id {release_cluster_id!r} is not currently allocated"
+            )
+            existing_to_release = self._state.active_allocations.get(release_cluster_id)
+            # Redundant guard: the in-check above already ensures this, but kept explicit.
+            assert existing_to_release is not None, (
+                f"release_cluster_id {release_cluster_id!r} not found in active_allocations"
+            )
+            # Releasing a cluster whose priority already matches the incoming request priority
+            # indicates a caller bug (e.g. releasing GENERATION to re-request GENERATION).
+            assert existing_to_release.priority != request_priority, (
+                f"release_cluster_id {release_cluster_id!r} priority is already {existing_to_release.priority}; "
+                f"releasing and immediately re-requesting the same priority {request_priority!r} is a no-op"
+            )
+
+            alloc = self._state.active_allocations.pop(release_cluster_id, None)
+            if alloc is None:
+                raise RuntimeError(f"release_cluster_id {release_cluster_id!r} not found")
+            # GPU Tracing: End traces for released GPUs
+            self._end_traces_for_gpu_ids(alloc.gpu_ids)
+            self._state.idle_gpus |= set(alloc.gpu_ids)
+            self._trace_active_gpus_update()
+            # GPU Tracing: Instant marker for release
+            self._trace_release_marker(release_cluster_id, alloc.gpu_ids)
             if self._has_any_pending_request_locked(cluster_id=request_cluster_id):
                 raise RuntimeError(f"Duplicate pending request for cluster_id={request_cluster_id!r} is not supported")
             self._request_seq += 1
@@ -1662,21 +1696,22 @@ class SchedulerImpl:
                 # Phase 5: prepare execution (Phase 3: propagate shrink to pipeline runtime).
                 # IMPORTANT: do not await adapter RPCs while holding scheduler lock.
                 resize_calls = self._prepare_resize_calls_locked(plan)
+                # GPU Tracing: snapshot plan details before releasing the lock so the marker
+                # fires at decision time (before slow resize RPCs), not after sync completes.
+                exec_details = self._plan_to_exec_details(plan)
+
+            # GPU Tracing: Emit execution marker right after planning, before resize RPCs.
+            if any([exec_details.get("shrinks"), exec_details.get("removes"),
+                    exec_details.get("allocates"), exec_details.get("expands")]):
+                self._trace_execution_marker(exec_details)
+            self._maybe_flush_trace()
 
             # Phase 5: execute outside the scheduler lock (avoid deadlocking progress/reporting paths).
             await self._execute_resize_calls(resize_calls)
 
             # Phase 6: commit (Phase 2 simulation: state-only).
-            exec_details: Dict[str, Any] = {}
             async with self._lock:
-                exec_details = self._apply_plan_and_signal(plan)
-
-            # GPU Tracing: Execution marker + throttled flush (OUTSIDE lock to avoid I/O latency)
-            # Emit execution marker only if there were any operations
-            if any([exec_details.get("shrinks"), exec_details.get("removes"), 
-                    exec_details.get("allocates"), exec_details.get("expands")]):
-                self._trace_execution_marker(exec_details)
-            self._maybe_flush_trace()
+                self._apply_plan_and_signal(plan)
 
         except asyncio.CancelledError:
             raise
