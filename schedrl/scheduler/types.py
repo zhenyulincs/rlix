@@ -20,7 +20,6 @@ class ClusterAllocation:
     dp_rank_to_gpus: Dict[int, List[int]] = field(default_factory=dict)
     global_step: Optional[int] = None
     timestamp: Optional[float] = None
-    lora_name: Optional[str] = None  # GPU tracing: LoRA adapter name for non-generation clusters
 
 
 class ValidationError(RuntimeError):
@@ -53,6 +52,7 @@ class SignalPendingAllocationOp:
     cluster_id: str
     gpus_to_allocate: List[int]
     priority: Optional[Any] = None
+    lora_name: Optional[str] = None  # GPU Tracing: carried from PendingRequest at planning time
 
 
 @dataclass(slots=True)

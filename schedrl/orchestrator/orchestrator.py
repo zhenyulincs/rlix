@@ -8,7 +8,11 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
+
+# Identifies whether a pipeline trains a full model or LoRA adapters.
+# Used as a prefix in pipeline_id for trace readability (e.g., "ft_abc123", "lora_abc123").
+PipelineType = Literal["ft", "lora"]
 
 from schedrl.protocol.request_id import validate_pipeline_id
 from schedrl.protocol.validation import RegisterValidationInput, validate_register_pipeline
@@ -158,13 +162,15 @@ class Orchestrator:
         self._pipelines: Dict[str, PipelineState] = {}
         self._shutdown_started = False
 
-    def allocate_pipeline_id(self) -> str:
-        """Allocate a new pipeline_id.
+    def allocate_pipeline_id(self, pipeline_type: PipelineType) -> str:
+        """Allocate a new pipeline_id prefixed with the pipeline type.
 
         Contract: driver scripts call this first, then create the pipeline adapter actor using the returned id.
+        The prefix ("ft_" or "lora_") makes the pipeline type visible in Perfetto trace labels.
         """
         while True:
-            pipeline_id = f"p_{uuid.uuid4().hex}"
+            # 12 hex chars = 48 bits of entropy; unique enough for any realistic cluster size.
+            pipeline_id = f"{pipeline_type}_{uuid.uuid4().hex[:12]}"
             validate_pipeline_id(pipeline_id)
             if pipeline_id not in self._pipelines:
                 return pipeline_id

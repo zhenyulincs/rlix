@@ -170,6 +170,20 @@ class _GPUAllocTraceContext:
     lora_name: Optional[str] = None  # Training clusters only
 
 
+@dataclass(frozen=True, slots=True)
+class _GPUTraceInfo:
+    """Per-GPU context snapshot needed to open or close a Perfetto trace slice.
+
+    Collected under the scheduler lock so the data is stable when the RPC runs outside it.
+    Shrink close only uses gpu_id; expand open uses all four fields.
+    """
+
+    gpu_id: int
+    cluster_id: str
+    pipeline_id: str
+    dp_rank: int
+
+
 @dataclass(slots=True)
 class _QueueSubGroup:
     """Named-track factory wrapping a tg4perfetto GroupTrack sub-group.
@@ -462,7 +476,9 @@ class SchedulerImpl:
             self._get_or_create_queue_group(priority)
             self._get_or_create_queue_counter_track(priority)
 
-    def _create_queue_slice_track(self, cluster_id: str, priority: Priority) -> Optional["NormalTrack"]:
+    def _create_queue_slice_track(
+        self, cluster_id: str, priority: Priority, lora_name: Optional[str] = None
+    ) -> Optional["NormalTrack"]:
         """Create a per-cluster slice track for queue visualization.
 
         Returns None on failure OR if track cap exceeded.
@@ -482,10 +498,22 @@ class SchedulerImpl:
         queue_group = self._get_or_create_queue_group(priority)
         if queue_group is None:
             return None
+
+        # Build "[KEY] lora_name pipeline_id" track name so Perfetto rows are human-readable.
+        # Lora-relevant priorities (TRN, OLD, REF) pass lora_name; others leave it None.
+        key = _PRIORITY_SHORT.get(priority, priority.name[:3])
+        pipeline_id, _ = parse_cluster_id(cluster_id)
+        safe_pid = pipeline_id[:16]
+        if lora_name:
+            safe_lora = lora_name.replace("|", "_").replace(" ", "_")[:24]
+            track_name = f"[{key}] {safe_lora} {safe_pid}"
+        else:
+            track_name = f"[{key}] {safe_pid}"
+
         # create_track is a method on _QueueSubGroup (our wrapper) — always exists
         track = self._safe_trace_get(
             queue_group.create_track,
-            cluster_id[:16],  # Truncate cluster_id to avoid long names
+            track_name,
         )
         if track is not None:
             self._queue_track_count += 1
@@ -503,8 +531,8 @@ class SchedulerImpl:
         now_ns = time.time_ns()
         key = _PRIORITY_SHORT.get(priority, priority.name[:3])
 
-        # Create per-cluster track
-        slice_track = self._create_queue_slice_track(cluster_id, priority)
+        # Create per-cluster track (lora_name flows into the track row label)
+        slice_track = self._create_queue_slice_track(cluster_id, priority, lora_name)
 
         # Start slice FIRST
         if slice_track:
@@ -626,17 +654,18 @@ class SchedulerImpl:
         """Build trace label string. Testable in isolation.
 
         Label format:
-        - Training with LoRA:    [ACT] pipeline-1_actor_train | job:pipeline-1 | lora:adapter-0 | initial | C5
-        - Training without LoRA: [ACT] pipeline-1_actor_train | job:pipeline-1 | initial | C5
-        - Generation:            [GEN] pipeline-1_actor_infer | job:pipeline-1 | initial | C10 | DP:[0,1]
+        - Training with LoRA:    [TRN] | lora:adapter-0 | pipeline-1_actor_train | job:pipeline-1 | initial | C5
+        - Training without LoRA: [TRN] | pipeline-1_actor_train | job:pipeline-1 | initial | C5
+        - Generation:            [GEN] | pipeline-1_actor_infer | job:pipeline-1 | initial | C10 | DP:[0,1]
         """
         p = _PRIORITY_SHORT.get(priority, priority.name[:3])
-        parts = [f"[{p}]", cluster_id, f"job:{pipeline_id}"]
 
-        # LoRA only for non-generation clusters (with sanitization)
+        # LoRA comes right after [TRN] so the adapter name is visible at a glance
         if lora_name and priority != Priority.GENERATION:
             safe_lora = lora_name.replace("|", "_").replace(" ", "_")[:64]
-            parts.append(f"lora:{safe_lora}")
+            parts = [f"[{p}]", f"lora:{safe_lora}", cluster_id, f"job:{pipeline_id}"]
+        else:
+            parts = [f"[{p}]", cluster_id, f"job:{pipeline_id}"]
 
         parts.extend([alloc_type, f"C{self._cycle_counter}"])
         label = " | ".join(parts)
@@ -1645,7 +1674,14 @@ class SchedulerImpl:
                             non_gen_reserved_gpus |= needed
                             planned_allocation_targets.add(cluster_id)
                             plan.signal_pending_allocation_ops.append(
-                                SignalPendingAllocationOp(cluster_id=cluster_id, gpus_to_allocate=sorted(needed), priority=prio)
+                                SignalPendingAllocationOp(
+                                    cluster_id=cluster_id,
+                                    gpus_to_allocate=sorted(needed),
+                                    priority=prio,
+                                    # Carry lora_name directly from the pending so _apply_plan_and_signal
+                                    # does not need to re-search the bucket for it.
+                                    lora_name=pending.lora_name,
+                                )
                             )
 
                 # Phase 3: generation gap-ratio planning.
@@ -1696,8 +1732,10 @@ class SchedulerImpl:
                 # Phase 5: prepare execution (Phase 3: propagate shrink to pipeline runtime).
                 # IMPORTANT: do not await adapter RPCs while holding scheduler lock.
                 resize_calls = self._prepare_resize_calls_locked(plan)
-                # GPU Tracing: snapshot plan details before releasing the lock so the marker
-                # fires at decision time (before slow resize RPCs), not after sync completes.
+                # GPU Tracing: snapshot trace infos and plan details before releasing the lock.
+                # dp_rank_to_gpus and pipeline_registry must be read while the lock is held.
+                shrink_trace_infos = self._collect_shrink_trace_infos_locked(plan)
+                expand_trace_infos = self._collect_expand_trace_infos_locked(plan)
                 exec_details = self._plan_to_exec_details(plan)
 
             # GPU Tracing: Emit execution marker right after planning, before resize RPCs.
@@ -1707,7 +1745,11 @@ class SchedulerImpl:
             self._maybe_flush_trace()
 
             # Phase 5: execute outside the scheduler lock (avoid deadlocking progress/reporting paths).
-            await self._execute_resize_calls(resize_calls)
+            await self._execute_resize_calls(
+                resize_calls,
+                shrink_trace_infos=shrink_trace_infos,
+                expand_trace_infos=expand_trace_infos,
+            )
 
             # Phase 6: commit (Phase 2 simulation: state-only).
             async with self._lock:
@@ -1744,6 +1786,80 @@ class SchedulerImpl:
 
         self._adapter_handle_cache[pipeline_id] = (adapter_namespace, handle)
         return handle
+
+    def _reconstruct_bundle_for_dp_rank(self, *, cluster_id: str, dp_rank: int) -> Set[int]:
+        """Reconstruct the GPU bundle for a dp_rank when dp_rank_to_gpus mapping is absent.
+
+        Extracted from the nested _reconstruct_bundle fn in _apply_plan_and_signal so it
+        can be reused by _collect_shrink_trace_infos_locked without duplicating logic.
+        """
+        pipeline_id, cluster_name = parse_cluster_id(cluster_id)
+        if cluster_name != "actor_infer":
+            return set()
+        infer_cfg = self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"]
+        tp_size = int(infer_cfg.get("tp_size", 1))
+        device_mapping = list(infer_cfg.get("device_mapping") or [])
+        start = dp_rank * tp_size
+        return set(device_mapping[start : start + tp_size])
+
+    def _collect_shrink_trace_infos_locked(self, plan: "ExecutionPlan") -> List[_GPUTraceInfo]:
+        """Pre-collect GPU trace info for GPUs freed by shrink ops and cluster removals.
+
+        Called under the scheduler lock so dp_rank_to_gpus is still intact.
+        Only gpu_id is used at close time; the other fields satisfy the shared _GPUTraceInfo type.
+        """
+        infos: List[_GPUTraceInfo] = []
+        for op in plan.sched_guided_shrink_ops:
+            alloc = self._state.active_allocations.get(op.cluster_id)
+            if alloc is None:
+                continue
+            pipeline_id, _ = parse_cluster_id(op.cluster_id)
+            for dp_rank in op.dp_ranks_to_remove:
+                bundle = set(alloc.dp_rank_to_gpus.get(dp_rank) or [])
+                if not bundle:
+                    bundle = self._reconstruct_bundle_for_dp_rank(
+                        cluster_id=op.cluster_id, dp_rank=dp_rank
+                    )
+                for gpu_id in bundle:
+                    infos.append(_GPUTraceInfo(
+                        gpu_id=gpu_id, cluster_id=op.cluster_id,
+                        pipeline_id=pipeline_id, dp_rank=dp_rank,
+                    ))
+        for cluster_id in plan.clusters_to_remove:
+            alloc = self._state.active_allocations.get(cluster_id)
+            if alloc is None:
+                continue
+            pipeline_id, _ = parse_cluster_id(cluster_id)
+            for gpu_id in alloc.gpu_ids:
+                infos.append(_GPUTraceInfo(
+                    gpu_id=gpu_id, cluster_id=cluster_id, pipeline_id=pipeline_id, dp_rank=0,
+                ))
+        return infos
+
+    def _collect_expand_trace_infos_locked(self, plan: "ExecutionPlan") -> List[_GPUTraceInfo]:
+        """Pre-collect GPU trace info for proactive expand allocations.
+
+        Called under the scheduler lock so pipeline_registry is stable.
+        Mirrors the _start_gpu_trace loop in _apply_plan_and_signal (sched_guided_allocation_ops).
+        """
+        infos: List[_GPUTraceInfo] = []
+        for op in plan.sched_guided_allocation_ops:
+            if not op.gpus_to_allocate or not op.dp_ranks_to_add:
+                continue
+            pipeline_id, _ = parse_cluster_id(op.cluster_id)
+            tp_size = int(
+                self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"]
+                .get("tp_size", 1)
+            )
+            sorted_gpus = sorted(op.gpus_to_allocate)
+            for i, dp_rank in enumerate(sorted(op.dp_ranks_to_add)):
+                bundle = sorted_gpus[i * tp_size : (i + 1) * tp_size]
+                for gpu_id in bundle:
+                    infos.append(_GPUTraceInfo(
+                        gpu_id=gpu_id, cluster_id=op.cluster_id,
+                        pipeline_id=pipeline_id, dp_rank=dp_rank,
+                    ))
+        return infos
 
     def _prepare_resize_calls_locked(self, plan: ExecutionPlan) -> List[Tuple[Any, List[int], List[int]]]:
         """Prepare resize RPC calls under the scheduler lock.
@@ -1798,12 +1914,22 @@ class SchedulerImpl:
             calls.append((adapter, removes, adds))
         return calls
 
-    async def _execute_resize_calls(self, calls: List[Tuple[Any, List[int], List[int]]]) -> None:
+    async def _execute_resize_calls(
+        self,
+        calls: List[Tuple[Any, List[int], List[int]]],
+        *,
+        shrink_trace_infos: List[_GPUTraceInfo],
+        expand_trace_infos: List[_GPUTraceInfo],
+    ) -> None:
         """Execute pipeline resizes outside the scheduler lock.
 
-        Order: all shrinks first, then all expands. This ensures GPU memory is released
-        before expansion broadcasts attempt to allocate, preventing OOM during transitions.
+        Order: shrinks → close GPU traces → expands → open GPU traces.
+        Tracing happens here so timestamps reflect actual RPC completion, not state-commit time.
         Matches fork behavior in external/ROLL_multi_pipeline/.../centralized_gpu_scheduler.py Phase 5.
+
+        # TODO: only block an expand on the shrinks it actually depends on (i.e. its target GPUs
+        # overlap with GPUs being freed). Expands targeting already-idle GPUs can run concurrently
+        # with shrinks instead of waiting for all shrinks to finish first.
         """
         # Phase 5.2: execute all shrinks (dp_ranks_to_remove) concurrently and wait for all to complete
         shrink_tasks = [
@@ -1813,6 +1939,9 @@ class SchedulerImpl:
         ]
         if shrink_tasks:
             await asyncio.gather(*shrink_tasks)
+        # GPU Tracing: close slices right after shrinks complete, before expands start
+        if shrink_trace_infos:
+            self._end_traces_for_gpu_ids([info.gpu_id for info in shrink_trace_infos])
 
         # Phase 5.4: execute all expands (dp_ranks_to_add) concurrently after all shrinks complete
         expand_tasks = [
@@ -1822,6 +1951,12 @@ class SchedulerImpl:
         ]
         if expand_tasks:
             await asyncio.gather(*expand_tasks)
+        # GPU Tracing: open slices right after expands complete, before state commit
+        for info in expand_trace_infos:
+            self._start_gpu_trace(
+                info.gpu_id, info.cluster_id, info.pipeline_id,
+                Priority.GENERATION, "proactive", [info.dp_rank],
+            )
 
     async def _fail_fast_shutdown(self, *, reason: str) -> None:
         try:
@@ -2179,16 +2314,8 @@ class SchedulerImpl:
         exec_allocates: List[Dict[str, Any]] = []
         exec_expands: List[Dict[str, Any]] = []
 
-        def _reconstruct_bundle(*, cluster_id: str, dp_rank: int) -> Set[int]:
-            pipeline_id, cluster_name = parse_cluster_id(cluster_id)
-            if cluster_name != "actor_infer":
-                return set()
-            infer_cfg = self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"]
-            tp_size = int(infer_cfg.get("tp_size", 1))
-            device_mapping = list(infer_cfg.get("device_mapping") or [])
-            start = dp_rank * tp_size
-            return set(device_mapping[start : start + tp_size])
-
+        # GPU Tracing: shrink/remove trace closes already happened in _execute_resize_calls
+        # (right after shrink RPCs completed). Only state mutations happen here.
         for op in plan.sched_guided_shrink_ops:
             if not op.dp_ranks_to_remove:
                 continue
@@ -2198,13 +2325,13 @@ class SchedulerImpl:
             for dp_rank in op.dp_ranks_to_remove:
                 bundle = set(alloc.dp_rank_to_gpus.get(dp_rank) or [])
                 if not bundle:
-                    bundle = _reconstruct_bundle(cluster_id=op.cluster_id, dp_rank=dp_rank)
+                    bundle = self._reconstruct_bundle_for_dp_rank(
+                        cluster_id=op.cluster_id, dp_rank=dp_rank
+                    )
                 alloc.active_dp_ranks.discard(dp_rank)
                 alloc.dp_rank_to_gpus.pop(dp_rank, None)
                 alloc.gpu_ids = [g for g in alloc.gpu_ids if g not in bundle]
                 self._state.idle_gpus |= bundle
-                # GPU Tracing: End traces for shrunk GPUs
-                self._end_traces_for_gpu_ids(list(bundle))
                 self._trace_active_gpus_update()
                 # Collect shrink detail for execution marker
                 exec_shrinks.append({
@@ -2216,8 +2343,6 @@ class SchedulerImpl:
         for cluster_id in plan.clusters_to_remove:
             alloc = self._state.active_allocations.pop(cluster_id, None)
             if alloc is not None:
-                # GPU Tracing: End traces for removed cluster
-                self._end_traces_for_gpu_ids(alloc.gpu_ids)
                 self._state.idle_gpus |= set(alloc.gpu_ids)
                 self._trace_active_gpus_update()
                 # Collect remove detail for execution marker
@@ -2265,15 +2390,9 @@ class SchedulerImpl:
             )
             # GPU Tracing: Start traces for initial allocation
             if self._enable_gpu_tracing:
-                # Get lora_name from pending request
-                lora_name = None
-                for p in self._state.pending_bucket(priority):
-                    if p.request.cluster_id == op.cluster_id:
-                        lora_name = p.lora_name
-                        break
-                # Store in allocation for proactive allocation lookup
-                if lora_name:
-                    self._state.active_allocations[op.cluster_id].lora_name = lora_name
+                # lora_name was stamped onto the op at planning time (from PendingRequest.lora_name),
+                # so no bucket search is needed here.
+                lora_name = op.lora_name
                 for gpu_id in sorted(op.gpus_to_allocate):
                     # Extract DP rank for generation clusters
                     dp_ranks = None
@@ -2316,15 +2435,8 @@ class SchedulerImpl:
                 alloc.dp_rank_to_gpus[dp_rank] = sorted_needed[i * tp_size : (i + 1) * tp_size]
                 alloc.active_dp_ranks.add(dp_rank)
             alloc.gpu_ids = sorted(set(alloc.gpu_ids) | gpu_set)
-            # GPU Tracing: Start traces for proactive allocation
-            if self._enable_gpu_tracing:
-                for dp_rank in sorted(op.dp_ranks_to_add):
-                    bundle = alloc.dp_rank_to_gpus.get(dp_rank, [])
-                    for gpu_id in bundle:
-                        self._start_gpu_trace(
-                            gpu_id, op.cluster_id, pipeline_id,
-                            Priority.GENERATION, "proactive", [dp_rank],
-                        )
+            # GPU Tracing: proactive expand trace opens already happened in _execute_resize_calls
+            # (right after expand RPCs completed, before this state commit).
             if op.has_pending_request:
                 cluster_ids_to_signal.add(op.cluster_id)
             # Collect expand detail for execution marker
