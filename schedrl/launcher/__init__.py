@@ -1,6 +1,4 @@
 from __future__ import annotations
 
-__all__ = [
-    "launcher",
-]
+__all__: list[str] = []
 

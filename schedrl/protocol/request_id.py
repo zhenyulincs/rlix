@@ -29,37 +29,3 @@ def build_request_id(pipeline_id: str, traj_id: str, turn_id: int, attempt: int)
     if not isinstance(attempt, int) or attempt < 0:
         raise ValueError(f"attempt must be int >= 0, got {attempt!r}")
     return f"{pipeline_id}{REQUEST_ID_DELIMITER}{traj_id}{REQUEST_ID_DELIMITER}{turn_id}{REQUEST_ID_DELIMITER}{attempt}"
-
-
-def parse_request_id(request_id: str) -> tuple[str, str, int, int]:
-    return _parse_request_id(request_id)
-
-
-def _parse_request_id(request_id: str) -> tuple[str, str, int, int]:
-    if not isinstance(request_id, str):
-        raise ValueError(f"request_id must be str, got {type(request_id).__name__}")
-    parts = request_id.split(REQUEST_ID_DELIMITER)
-    if len(parts) != 4:
-        raise ValueError(
-            f"request_id must have 4 parts separated by {REQUEST_ID_DELIMITER!r}, got {len(parts)}: {request_id!r}"
-        )
-    pipeline_id, traj_id, turn_raw, attempt_raw = parts
-    validate_pipeline_id(pipeline_id)
-    _validate_traj_id(traj_id)
-    try:
-        turn_id = int(turn_raw)
-    except ValueError as e:
-        raise ValueError(f"request_id turn_id must be int, got {turn_raw!r}: {request_id!r}") from e
-    try:
-        attempt = int(attempt_raw)
-    except ValueError as e:
-        raise ValueError(f"request_id attempt must be int, got {attempt_raw!r}: {request_id!r}") from e
-    if turn_id < 0:
-        raise ValueError(f"request_id turn_id must be >= 0, got {turn_id}: {request_id!r}")
-    if attempt < 0:
-        raise ValueError(f"request_id attempt must be >= 0, got {attempt}: {request_id!r}")
-    return pipeline_id, traj_id, turn_id, attempt
-
-
-def validate_request_id(request_id: str) -> None:
-    _ = _parse_request_id(request_id)

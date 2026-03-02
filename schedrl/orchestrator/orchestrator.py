@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
-import shutil
 from typing import Any, Dict, Literal, Optional
 
 # Identifies whether a pipeline trains a full model or LoRA adapters.
@@ -40,16 +37,6 @@ class PipelineState:
     pipeline_id: str
     registered: bool
     admitted: bool
-
-
-def _ray_cli_path() -> str:
-    # Prefer PATH resolution (e.g. /usr/local/bin/ray) because sys.executable may be /usr/bin/python3
-    # while the ray CLI is installed elsewhere.
-    ray_path = shutil.which("ray")
-    if ray_path:
-        return ray_path
-    python_bin_dir = Path(sys.executable).parent
-    return str(python_bin_dir / "ray")
 
 
 def _kill_local_ray() -> None:
@@ -217,20 +204,6 @@ class Orchestrator:
         self._pipelines[pipeline_id] = PipelineState(pipeline_id=pipeline_id, registered=True, admitted=True)
         return AdmitResponse(pipeline_id=pipeline_id, scheduler=self._scheduler)
 
-    def get_pipeline_state(self, pipeline_id: str) -> PipelineState:
-        validate_pipeline_id(pipeline_id)
-        state = self._pipelines.get(pipeline_id)
-        if state is None:
-            return PipelineState(pipeline_id=pipeline_id, registered=False, admitted=False)
-        return state
-
-    def monitor_pipelines(self) -> Dict[str, PipelineState]:
-        return dict(self._pipelines)
-
-    def cleanup_pipeline(self, pipeline_id: str) -> None:
-        validate_pipeline_id(pipeline_id)
-        self._pipelines.pop(pipeline_id, None)
-
     def kill_pipeline(self, pipeline_id: str) -> None:
         validate_pipeline_id(pipeline_id)
 
@@ -377,6 +350,3 @@ class Orchestrator:
             pass  # Best-effort, don't stall shutdown
 
         _force_stop_cluster_workers_first()
-
-    def get_env_vars(self) -> Dict[str, str]:
-        return dict(self._env_vars)

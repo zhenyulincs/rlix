@@ -1,22 +1,5 @@
 from __future__ import annotations
 
-import shutil
-import sys
-from pathlib import Path
-
-
-def ray_cli_path() -> str:
-    """Return the ray CLI path for this Python environment.
-
-    Prefer PATH resolution (e.g. /usr/local/bin/ray) because sys.executable may be /usr/bin/python3
-    while the ray CLI entrypoint is installed elsewhere.
-    """
-    ray_path = shutil.which("ray")
-    if ray_path:
-        return ray_path
-    python_bin_dir = Path(sys.executable).parent
-    return str(python_bin_dir / "ray")
-
 
 def get_head_node_id() -> str:
     try:
