@@ -20,7 +20,7 @@ class SchedulerState:
 
     # Keep latest snapshot per pipeline/mode/stream:
     #   latest_progress_by_pipeline[pipeline_id][mode][stream_key] = ProgressReport
-    # where stream_key is adapter_id for adapter streams, or a reserved key for full-finetune.
+    # where stream_key is lora_id for LoRA streams, or a reserved key for full-finetune.
     latest_progress_by_pipeline: Dict[str, Dict[str, Dict[str, ProgressReport]]] = field(default_factory=dict)
 
     def pending_bucket(self, priority: Priority) -> List[PendingRequest]:

@@ -4,13 +4,13 @@ import enum
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-# Ray namespace and actor name protocol constants shared across schedrl and adapters.
+# Ray namespace and actor name protocol constants shared across schedrl modules.
 SCHEDRL_NAMESPACE: str = "schedrl"
 SCHEDULER_ACTOR_NAME: str = "schedrl:scheduler"
 ORCHESTRATOR_ACTOR_NAME: str = "schedrl:orchestrator"
 RESOURCE_MANAGER_ACTOR_NAME: str = "schedrl:resource_manager"
-# Prefix for per-pipeline adapter actors: full name = f"{ADAPTER_ACTOR_NAME_PREFIX}{pipeline_id}"
-ADAPTER_ACTOR_NAME_PREFIX: str = "schedrl:adapter:"
+# Prefix for per-pipeline coordinator actors: full name = f"{COORDINATOR_ACTOR_NAME_PREFIX}{pipeline_id}"
+COORDINATOR_ACTOR_NAME_PREFIX: str = "schedrl:coordinator:"
 # Prefix for per-pipeline coordinator actors: full name = f"{PIPELINE_ACTOR_NAME_PREFIX}{pipeline_id}"
 PIPELINE_ACTOR_NAME_PREFIX: str = "schedrl:pipeline:"
 # Name for the ROLL-specific ResourceManager singleton actor (used when SCHEDRL_CONTROL_PLANE=schedrl)

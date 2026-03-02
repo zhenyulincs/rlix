@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 from schedrl.protocol.request_id import validate_pipeline_id
-from schedrl.protocol.types import ADAPTER_ACTOR_NAME_PREFIX, ORCHESTRATOR_ACTOR_NAME, Priority, ProgressReport, SCHEDRL_NAMESPACE
+from schedrl.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, ORCHESTRATOR_ACTOR_NAME, Priority, ProgressReport, SCHEDRL_NAMESPACE
 from schedrl.scheduler.state import SchedulerState
 from schedrl.scheduler.types import (
     ClusterAllocation,
@@ -225,7 +225,7 @@ class SchedulerImpl:
     _request_seq: int = field(init=False)
     _num_gpus: Optional[int] = field(init=False)
     _required_gpus_per_node: Optional[int] = field(init=False)
-    _adapter_handle_cache: Dict[str, Tuple[str, Any]] = field(init=False)
+    _coordinator_handle_cache: Dict[str, Tuple[str, Any]] = field(init=False)
     # GPU Tracing: State fields (MUST be declared at class level for slots=True)
     _enable_gpu_tracing: bool = field(init=False, default=False)
     _trace_gen: Optional["TraceGenerator"] = field(init=False, default=None)
@@ -271,7 +271,7 @@ class SchedulerImpl:
         self._request_seq = 0
         self._num_gpus: Optional[int] = None
         self._required_gpus_per_node: Optional[int] = None
-        self._adapter_handle_cache = {}
+        self._coordinator_handle_cache = {}
 
     # =========================================================================
     # GPU Tracing: Core Methods
@@ -654,13 +654,13 @@ class SchedulerImpl:
         """Build trace label string. Testable in isolation.
 
         Label format:
-        - Training with LoRA:    [TRN] | lora:adapter-0 | pipeline-1_actor_train | job:pipeline-1 | initial | C5
+        - Training with LoRA:    [TRN] | lora:lora-0 | pipeline-1_actor_train | job:pipeline-1 | initial | C5
         - Training without LoRA: [TRN] | pipeline-1_actor_train | job:pipeline-1 | initial | C5
         - Generation:            [GEN] | pipeline-1_actor_infer | job:pipeline-1 | initial | C10 | DP:[0,1]
         """
         p = _PRIORITY_SHORT.get(priority, priority.name[:3])
 
-        # LoRA comes right after [TRN] so the adapter name is visible at a glance
+        # LoRA comes right after [TRN] so the lora name is visible at a glance
         if lora_name and priority != Priority.GENERATION:
             safe_lora = lora_name.replace("|", "_").replace(" ", "_")[:64]
             parts = [f"[{p}]", f"lora:{safe_lora}", cluster_id, f"job:{pipeline_id}"]
@@ -998,7 +998,7 @@ class SchedulerImpl:
             # ============================================================
             self._state.pipeline_registry.pop(pipeline_id, None)
             self._state.latest_progress_by_pipeline.pop(pipeline_id, None)
-            self._adapter_handle_cache.pop(pipeline_id, None)
+            self._coordinator_handle_cache.pop(pipeline_id, None)
 
             # Remove allocations
             for cluster_id in allocations_to_remove:
@@ -1230,37 +1230,37 @@ class SchedulerImpl:
             if report.pipeline_id not in self._state.pipeline_registry:
                 raise RuntimeError(f"pipeline_id {report.pipeline_id!r} not registered")
             # Keep latest nested by pipeline->mode->stream in one store.
-            # stream_key is adapter_id for adapter streams, or reserved for full-finetune.
+            # stream_key is lora_id for LoRA streams, or reserved for full-finetune.
             metrics = report.metrics if isinstance(report.metrics, dict) else {}
             mode = str(metrics.get("mode", "train"))
-            adapter_id = metrics.get("adapter_id")
+            lora_id = metrics.get("adapter_id")
             stream_key_full_ft = "__full_finetune__"
             pipeline_bucket = self._state.latest_progress_by_pipeline.setdefault(report.pipeline_id, {})
             has_full_ft = any(stream_key_full_ft in mode_bucket for mode_bucket in pipeline_bucket.values())
-            has_adapter = any(
+            has_lora = any(
                 any(stream_key != stream_key_full_ft for stream_key in mode_bucket.keys())
                 for mode_bucket in pipeline_bucket.values()
             )
-            if adapter_id is None:
-                # Source type (full-ft vs adapter) is fixed at caller init and must not flip mid-run.
-                if has_adapter:
+            if lora_id is None:
+                # Source type (full-ft vs LoRA) is fixed at caller init and must not flip mid-run.
+                if has_lora:
                     # Report exact conflicting modes to avoid misleading mode-specific errors.
-                    conflicting_adapter_modes = sorted(
+                    conflicting_lora_modes = sorted(
                         mode_name
                         for mode_name, mode_bucket in pipeline_bucket.items()
                         if any(stream_key != stream_key_full_ft for stream_key in mode_bucket.keys())
                     )
                     raise RuntimeError(
-                        f"pipeline_id {report.pipeline_id!r} already has adapter streams in modes {conflicting_adapter_modes}; "
+                        f"pipeline_id {report.pipeline_id!r} already has LoRA streams in modes {conflicting_lora_modes}; "
                         "full-finetune report (adapter_id=None) is a source-type mismatch"
                     )
                 mode_bucket = pipeline_bucket.setdefault(mode, {})
                 mode_bucket[stream_key_full_ft] = report
             else:
-                adapter_key = str(adapter_id)
-                if adapter_key == stream_key_full_ft:
-                    raise ValueError(f"adapter_id {adapter_key!r} is reserved for full-finetune stream")
-                # Source type (full-ft vs adapter) is fixed at caller init and must not flip mid-run.
+                lora_key = str(lora_id)
+                if lora_key == stream_key_full_ft:
+                    raise ValueError(f"adapter_id {lora_key!r} is reserved for full-finetune stream")
+                # Source type (full-ft vs LoRA) is fixed at caller init and must not flip mid-run.
                 if has_full_ft:
                     # Report exact conflicting modes to avoid misleading mode-specific errors.
                     conflicting_full_ft_modes = sorted(
@@ -1270,10 +1270,10 @@ class SchedulerImpl:
                     )
                     raise RuntimeError(
                         f"pipeline_id {report.pipeline_id!r} already has a full-finetune stream in modes {conflicting_full_ft_modes}; "
-                        f"adapter report (adapter_id={adapter_key!r}) is a source-type mismatch"
+                        f"LoRA report (adapter_id={lora_key!r}) is a source-type mismatch"
                     )
                 mode_bucket = pipeline_bucket.setdefault(mode, {})
-                mode_bucket[adapter_key] = report
+                mode_bucket[lora_key] = report
             self._wakeup_event.set()
 
     async def request_gpus(
@@ -1282,7 +1282,7 @@ class SchedulerImpl:
         cluster_id: str,
         priority: Priority,
         global_step: Optional[int] = None,
-        lora_name: Optional[str] = None,  # GPU Tracing: LoRA adapter name for non-generation clusters
+        lora_name: Optional[str] = None,  # GPU Tracing: LoRA name for non-generation clusters
     ) -> List[int]:
         await self._topology_ready.wait()
         validate_cluster_id(cluster_id)
@@ -1351,7 +1351,7 @@ class SchedulerImpl:
         request_cluster_id: str,
         request_priority: Priority,
         request_global_step: Optional[int] = None,
-        request_lora_name: Optional[str] = None,  # GPU Tracing: LoRA adapter name for non-generation clusters
+        request_lora_name: Optional[str] = None,  # GPU Tracing: LoRA name for non-generation clusters
     ) -> List[int]:
         await self._topology_ready.wait()
         event = asyncio.Event()
@@ -1732,7 +1732,7 @@ class SchedulerImpl:
                 )
 
                 # Phase 5: prepare execution (Phase 3: propagate shrink to pipeline runtime).
-                # IMPORTANT: do not await adapter RPCs while holding scheduler lock.
+                # IMPORTANT: do not await coordinator RPCs while holding scheduler lock.
                 resize_calls = self._prepare_resize_calls_locked(plan)
                 # GPU Tracing: snapshot trace infos and plan details before releasing the lock.
                 # dp_rank_to_gpus and pipeline_registry must be read while the lock is held.
@@ -1764,29 +1764,29 @@ class SchedulerImpl:
             await self._fail_fast_shutdown(reason=f"scheduler_cycle_failed: {type(e).__name__}: {e}")
             raise
 
-    def _get_or_lookup_adapter_handle_locked(self, *, pipeline_id: str) -> Any:
+    def _get_or_lookup_coordinator_handle_locked(self, *, pipeline_id: str) -> Any:
         info = self._state.pipeline_registry.get(pipeline_id)
         if info is None:
             raise RuntimeError(f"pipeline_id {pipeline_id!r} not registered")
-        adapter_namespace = info.get("namespace")
-        if not isinstance(adapter_namespace, str) or adapter_namespace == "":
-            raise RuntimeError(f"pipeline_id {pipeline_id!r} has invalid registered namespace {adapter_namespace!r}")
+        coordinator_namespace = info.get("namespace")
+        if not isinstance(coordinator_namespace, str) or coordinator_namespace == "":
+            raise RuntimeError(f"pipeline_id {pipeline_id!r} has invalid registered namespace {coordinator_namespace!r}")
 
-        cached = self._adapter_handle_cache.get(pipeline_id)
+        cached = self._coordinator_handle_cache.get(pipeline_id)
         if cached is not None:
             cached_namespace, cached_handle = cached
-            if cached_namespace == adapter_namespace:
+            if cached_namespace == coordinator_namespace:
                 return cached_handle
 
-        adapter_name = f"{ADAPTER_ACTOR_NAME_PREFIX}{pipeline_id}"
+        coordinator_name = f"{COORDINATOR_ACTOR_NAME_PREFIX}{pipeline_id}"
         try:
-            handle = ray.get_actor(adapter_name, namespace=adapter_namespace)
+            handle = ray.get_actor(coordinator_name, namespace=coordinator_namespace)
         except Exception as e:
             raise RuntimeError(
-                f"Failed to resolve adapter actor {adapter_name!r} in namespace {adapter_namespace!r} for pipeline_id {pipeline_id!r}"
+                f"Failed to resolve coordinator actor {coordinator_name!r} in namespace {coordinator_namespace!r} for pipeline_id {pipeline_id!r}"
             ) from e
 
-        self._adapter_handle_cache[pipeline_id] = (adapter_namespace, handle)
+        self._coordinator_handle_cache[pipeline_id] = (coordinator_namespace, handle)
         return handle
 
     def _reconstruct_bundle_for_dp_rank(self, *, cluster_id: str, dp_rank: int) -> Set[int]:
@@ -1912,8 +1912,8 @@ class SchedulerImpl:
                 )
             if not removes and not adds:
                 continue
-            adapter = self._get_or_lookup_adapter_handle_locked(pipeline_id=pipeline_id)
-            calls.append((adapter, removes, adds))
+            coordinator = self._get_or_lookup_coordinator_handle_locked(pipeline_id=pipeline_id)
+            calls.append((coordinator, removes, adds))
         return calls
 
     async def _execute_resize_calls(
@@ -1935,8 +1935,8 @@ class SchedulerImpl:
         """
         # Phase 5.2: execute all shrinks (dp_ranks_to_remove) concurrently and wait for all to complete
         shrink_tasks = [
-            adapter.resize_infer.remote(dp_ranks_to_remove=list(removes), dp_ranks_to_add=[])
-            for adapter, removes, adds in calls
+            coordinator.resize_infer.remote(dp_ranks_to_remove=list(removes), dp_ranks_to_add=[])
+            for coordinator, removes, adds in calls
             if removes
         ]
         if shrink_tasks:
@@ -1947,8 +1947,8 @@ class SchedulerImpl:
 
         # Phase 5.4: execute all expands (dp_ranks_to_add) concurrently after all shrinks complete
         expand_tasks = [
-            adapter.resize_infer.remote(dp_ranks_to_remove=[], dp_ranks_to_add=list(adds))
-            for adapter, removes, adds in calls
+            coordinator.resize_infer.remote(dp_ranks_to_remove=[], dp_ranks_to_add=list(adds))
+            for coordinator, removes, adds in calls
             if adds
         ]
         if expand_tasks:
@@ -2415,7 +2415,7 @@ class SchedulerImpl:
                 "priority": priority.name,
             })
 
-        # Apply expansions (state commit; adapter.expand_workers executed in scheduling_cycle before commit).
+        # Apply expansions (state commit; RequestScheduler.expand_workers executed in scheduling_cycle before commit).
         # State commit is unconditional; signaling is deferred to a set-based pass to handle
         # the case where signal_pending_allocation_ops already consumed the pending request, or
         # multiple ops target the same cluster (merged by _try_activate_one but guarded here too).

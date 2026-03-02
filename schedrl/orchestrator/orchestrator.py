@@ -150,7 +150,7 @@ class Orchestrator:
     def allocate_pipeline_id(self, pipeline_type: PipelineType) -> str:
         """Allocate a new pipeline_id prefixed with the pipeline type.
 
-        Contract: driver scripts call this first, then create the pipeline adapter actor using the returned id.
+        Contract: driver scripts call this first, then create the pipeline coordinator actor using the returned id.
         The prefix ("ft_" or "lora_") makes the pipeline type visible in Perfetto trace labels.
         """
         while True:

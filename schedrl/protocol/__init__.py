@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 __all__ = [
-    "adapter",
+    "coordinator",
     "request_id",
     "types",
     "validation",
