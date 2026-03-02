@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 from schedrl.protocol.request_id import validate_pipeline_id
-from schedrl.protocol.types import Priority, ProgressReport
+from schedrl.protocol.types import ADAPTER_ACTOR_NAME_PREFIX, ORCHESTRATOR_ACTOR_NAME, Priority, ProgressReport, SCHEDRL_NAMESPACE
 from schedrl.scheduler.state import SchedulerState
 from schedrl.scheduler.types import (
     ClusterAllocation,
@@ -1778,7 +1778,7 @@ class SchedulerImpl:
             if cached_namespace == adapter_namespace:
                 return cached_handle
 
-        adapter_name = f"schedrl:adapter:{pipeline_id}"
+        adapter_name = f"{ADAPTER_ACTOR_NAME_PREFIX}{pipeline_id}"
         try:
             handle = ray.get_actor(adapter_name, namespace=adapter_namespace)
         except Exception as e:
@@ -1962,7 +1962,7 @@ class SchedulerImpl:
 
     async def _fail_fast_shutdown(self, *, reason: str) -> None:
         try:
-            orchestrator = ray.get_actor("schedrl:orchestrator", namespace="schedrl")
+            orchestrator = ray.get_actor(ORCHESTRATOR_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
         except Exception as e:
             sys.stderr.write(f"[schedrl][ERROR] Failed to resolve orchestrator actor for shutdown: {type(e).__name__}: {e}\n")
             return

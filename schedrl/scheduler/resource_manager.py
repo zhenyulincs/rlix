@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from schedrl.protocol.types import RESOURCE_MANAGER_ACTOR_NAME, SCHEDRL_NAMESPACE
 from schedrl.utils.ray_head import head_node_affinity_strategy
 import ray
 
@@ -120,7 +121,7 @@ class ResourceManager:
         }
 
 
-def get_or_create_resource_manager(*, name: str = "schedrl:resource_manager", namespace: str = "schedrl"):
+def get_or_create_resource_manager(*, name: str = RESOURCE_MANAGER_ACTOR_NAME, namespace: str = SCHEDRL_NAMESPACE):
     try:
         return ray.get_actor(name, namespace=namespace)
     except ValueError:

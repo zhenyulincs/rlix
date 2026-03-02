@@ -15,16 +15,13 @@ from typing import Any, Dict, Literal, Optional
 PipelineType = Literal["ft", "lora"]
 
 from schedrl.protocol.request_id import validate_pipeline_id
+from schedrl.protocol.types import ORCHESTRATOR_ACTOR_NAME, SCHEDRL_NAMESPACE, SCHEDULER_ACTOR_NAME
 from schedrl.protocol.validation import RegisterValidationInput, validate_register_pipeline
 from schedrl.scheduler.resource_manager import get_or_create_resource_manager
 from schedrl.scheduler.scheduler import scheduler_actor_class
 from schedrl.utils.ray_head import get_head_node_id
 from schedrl.utils.ray_head import head_node_affinity_strategy
 import ray
-
-SCHEDRL_NAMESPACE = "schedrl"
-ORCHESTRATOR_ACTOR_NAME = "schedrl:orchestrator"
-SCHEDULER_ACTOR_NAME = "schedrl:scheduler"
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,40 +336,8 @@ class Orchestrator:
                 except Exception as e:
                     sys.stderr.write(f"[schedrl][ERROR] Failed to force-kill unnamed actor_id={actor_id_hex!r}: {e}\n")
 
-        # Best-effort placement group cleanup. ROLL ResourceManager names placement groups with prefix
-        # `schedrl_pg:{pipeline_id}:...` when PIPELINE_ID is set.
-        try:
-            from ray.util.state import list_placement_groups
-        except Exception:
-            list_placement_groups = None
-        if list_placement_groups is not None:
-            prefix = f"schedrl_pg:{pipeline_id}:"
-            try:
-                pgs = list_placement_groups()
-            except Exception as e:
-                sys.stderr.write(f"[schedrl][ERROR] list_placement_groups() failed: {e}\n")
-                pgs = []
-            removed = 0
-            for pg in pgs:
-                name = _attr(pg, "name", "")
-                if not isinstance(name, str) or not name.startswith(prefix):
-                    continue
-                try:
-                    handle = ray.util.get_placement_group(name)
-                except Exception:
-                    pg_id = _attr(pg, "placement_group_id", None)
-                    try:
-                        handle = ray.util.get_placement_group(pg_id)
-                    except Exception as e:
-                        sys.stderr.write(f"[schedrl][ERROR] Failed to get placement group handle for {name!r}: {e}\n")
-                        continue
-                try:
-                    ray.util.remove_placement_group(handle)
-                    removed += 1
-                except Exception as e:
-                    sys.stderr.write(f"[schedrl][ERROR] Failed to remove placement group {name!r}: {e}\n")
-            if removed:
-                sys.stderr.write(f"[schedrl][INFO] Removed {removed} placement group(s) for pipeline_id={pipeline_id!r}\n")
+        # Placement groups are owned by the RollResourceManager singleton actor;
+        # Ray cleans them up automatically when that actor is killed.
 
         if shared_storage is not None:
             try:
