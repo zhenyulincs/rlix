@@ -171,11 +171,11 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
         all_loras = list(dict.fromkeys(self._tag_to_lora.values()))
         for lora_name in all_loras:
             ray.get([
-                worker.build_latest_bucket_cache.remote(0, 0, lora_name)
+                worker.build_latest_bucket_cache.remote(0, lora_name)
                 for worker in self.actor_train.workers
             ])
             ray.get([
-                worker.promote_active_adapter_checkpoint.remote(lora_name, 0, 0)
+                worker.promote_active_adapter_checkpoint.remote(lora_name, 0)
                 for worker in self.actor_train.workers
             ])
 
@@ -501,7 +501,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                     for lora in trained_loras:
                         ray.get([
                             worker.promote_active_adapter_checkpoint.remote(
-                                lora, checkpoint_version, lora_step[lora_name]
+                                lora, checkpoint_version
                             )
                             for worker in self.actor_train.workers
                         ])

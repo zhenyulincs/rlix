@@ -285,13 +285,11 @@ class RlixFullFinetunePipeline(AgenticPipeline):
                 # Build and promote the initial base-model cache (-1/-1) before offload.
                 # Under sleep_level=2 this cache must stay active so expand can rehydrate infer workers.
                 init_checkpoint_version = -1
-                init_bucket_step = -1
                 self.actor_train.load_states(blocking=True)
                 ray.get(
                     [
                         w.build_latest_bucket_cache.remote(
                             checkpoint_version=int(init_checkpoint_version),
-                            global_step=int(init_bucket_step),
                         )
                         for w in self.actor_train.workers
                     ]
@@ -300,7 +298,6 @@ class RlixFullFinetunePipeline(AgenticPipeline):
                     [
                         w.promote_active_checkpoint.remote(
                             checkpoint_version=int(init_checkpoint_version),
-                            global_step=int(init_bucket_step),
                         )
                         for w in self.actor_train.workers
                     ]
@@ -903,7 +900,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
                     # Replaces Phase 3 model_update(): expand_sampler loads from the promoted checkpoint.
                     checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
                     ray.get([
-                        worker.promote_active_checkpoint.remote(checkpoint_version, int(global_step))
+                        worker.promote_active_checkpoint.remote(checkpoint_version)
                         for worker in self.actor_train.workers
                     ])
                     # Append metrics before do_checkpoint so log_history[-1] exists.
