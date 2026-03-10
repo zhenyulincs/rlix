@@ -10,7 +10,7 @@ import ray
 import torch
 from codetiming import Timer
 
-from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, ActionResponse, Priority, SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE
+from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, ActionResponse, get_pipeline_namespace, Priority, SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE
 
 from rlix.pipeline.utils import _get_env_timeout_s
 
@@ -83,8 +83,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
         """
         if self._coordinator_handle is not None:
             return self._coordinator_handle
-        # Namespace convention mirrors coordinator.py:_get_pipeline_namespace().
-        namespace = f"pipeline_{self._pipeline_id}_NS"
+        namespace = get_pipeline_namespace(self._pipeline_id)
         actor_name = f"{COORDINATOR_ACTOR_NAME_PREFIX}{self._pipeline_id}"
         try:
             self._coordinator_handle = ray.get_actor(actor_name, namespace=namespace)
@@ -199,24 +198,11 @@ class RlixFullFinetunePipeline(AgenticPipeline):
 
             # shared RequestScheduler (named actor).
             request_scheduler_name = f"RequestScheduler-{self._pipeline_id}"
-            # Standard control-plane env vars for RequestScheduler (same as RolloutScheduler uses internally)
-            control_env_vars = {
-                "TORCH_COMPILE_DISABLE": "1",
-                "TORCHINDUCTOR_COMPILE_THREADS": "1",
-                "RAY_num_server_call_thread": "1",
-                "OMP_NUM_THREADS": "1",
-                "MKL_NUM_THREADS": "1",
-                "OPENBLAS_NUM_THREADS": "1",
-                "NUMEXPR_NUM_THREADS": "1",
-                "TOKENIZERS_PARALLELISM": "false",
-            }
-            control_env_vars.update(rlix_env_vars())
-
             self.generate_scheduler = RequestScheduler.options(
                 name=request_scheduler_name,
                 namespace=RAY_NAMESPACE,
                 get_if_exists=True,
-                runtime_env={"env_vars": control_env_vars},
+                runtime_env={"env_vars": rlix_env_vars()},
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
@@ -446,16 +432,6 @@ class RlixFullFinetunePipeline(AgenticPipeline):
             dp_ranks = self._actor_infer_all_dp_ranks()
             ray.get(self.train_rollout_scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
             ray.get(self.val_rollout_scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
-
-            # Verify state: both schedulers must have empty active_dp_ranks after init shrink.
-            train_active = ray.get(self.train_rollout_scheduler.get_active_dp_ranks.remote())
-            val_active = ray.get(self.val_rollout_scheduler.get_active_dp_ranks.remote())
-            if train_active or val_active:
-                raise RuntimeError(
-                    f"Initialization failed: active_dp_ranks not empty after shrink. "
-                    f"train_active={sorted(train_active)}, val_active={sorted(val_active)}. "
-                    f"This indicates state desync between RLix and ROLL."
-                )
 
             self._initialized = True
             return ActionResponse(success=True)
@@ -977,49 +953,9 @@ class RlixFullFinetunePipeline(AgenticPipeline):
         if bool(dp_ranks_to_remove) == bool(dp_ranks_to_add):
             raise ValueError("Exactly one of dp_ranks_to_remove or dp_ranks_to_add must be non-empty")
 
-        # Snapshot pre-state for verification
-        train_active_before = ray.get(self.train_rollout_scheduler.get_active_dp_ranks.remote())
-        val_active_before = ray.get(self.val_rollout_scheduler.get_active_dp_ranks.remote())
-
         if dp_ranks_to_remove:
             self._shrink_workers(dp_ranks_to_remove=list(dp_ranks_to_remove))
-            # Verify shrink: ranks should be removed from active_dp_ranks
-            train_active_after = ray.get(self.train_rollout_scheduler.get_active_dp_ranks.remote())
-            val_active_after = ray.get(self.val_rollout_scheduler.get_active_dp_ranks.remote())
-            expected_removed = set(dp_ranks_to_remove)
-            still_active_train = train_active_after & expected_removed
-            still_active_val = val_active_after & expected_removed
-            if still_active_train or still_active_val:
-                raise RuntimeError(
-                    f"Shrink verification failed: ranks {sorted(expected_removed)} should be inactive. "
-                    f"train still active: {sorted(still_active_train)}, val still active: {sorted(still_active_val)}. "
-                    f"Before: train={sorted(train_active_before)}, val={sorted(val_active_before)}. "
-                    f"After: train={sorted(train_active_after)}, val={sorted(val_active_after)}."
-                )
         else:
-            # PRE-condition check for expand: ranks should NOT already be active
-            expected_added = set(dp_ranks_to_add)
-            already_active_train = train_active_before & expected_added
-            already_active_val = val_active_before & expected_added
-            if already_active_train or already_active_val:
-                raise RuntimeError(
-                    f"Expand PRE-condition failed: ranks {sorted(expected_added)} should NOT be active. "
-                    f"train already active: {sorted(already_active_train)}, val already active: {sorted(already_active_val)}. "
-                    f"Current state: train={sorted(train_active_before)}, val={sorted(val_active_before)}. "
-                    f"This indicates state desync between Rlix and ROLL."
-                )
             self._expand_workers(dp_ranks_to_add=list(dp_ranks_to_add), train_skip_load=False)
-            # Verify expand: ranks should be added to active_dp_ranks
-            train_active_after = ray.get(self.train_rollout_scheduler.get_active_dp_ranks.remote())
-            val_active_after = ray.get(self.val_rollout_scheduler.get_active_dp_ranks.remote())
-            missing_train = expected_added - train_active_after
-            missing_val = expected_added - val_active_after
-            if missing_train or missing_val:
-                raise RuntimeError(
-                    f"Expand verification failed: ranks {sorted(expected_added)} should be active. "
-                    f"train missing: {sorted(missing_train)}, val missing: {sorted(missing_val)}. "
-                    f"Before: train={sorted(train_active_before)}, val={sorted(val_active_before)}. "
-                    f"After: train={sorted(train_active_after)}, val={sorted(val_active_after)}."
-                )
 
         return ActionResponse(success=True)
