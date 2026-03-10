@@ -357,7 +357,7 @@ class RlixCoordinator(Coordinator):
                     f"in namespace {self._ray_namespace!r}"
                 ) from e
             ray.get(model_update_service.sync_selected_workers.remote(
-                active_ranks, loras_to_sync=list(loras_to_sync)
+                active_ranks, adapters_to_sync=list(loras_to_sync)
             ))
 
     def resize_infer(self, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]) -> ActionResponse:
