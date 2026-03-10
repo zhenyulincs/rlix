@@ -226,9 +226,7 @@ class ModelUpdateService:
                 sync_refs.append(
                     worker.selective_sync_active_cache.remote(
                         sync_id=sync_id,
-                        model_update_name=sync_id,
                         comm_plan=rank_comm_plan,
-                        is_leader=bool(is_owner),
                         tgt_dp_ranks=tgt_dp_ranks,
                         tgt_workers=self.tgt_cluster.workers,
                         tgt_device_mapping=tgt_device_mapping,

@@ -889,6 +889,8 @@ class RlixFullFinetunePipeline(AgenticPipeline):
                                 "actor_train/train_step",
                             )
                             metrics.update(dynamic_batching_metrics)
+                        # Time-sharing: tag batch with version for strategy-level cache build.
+                        batch.meta_info["checkpoint_version"] = global_step
                         actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
                         actor_train_metrics = DataProto.materialize_concat(
                             data_refs=actor_train_metrics_refs

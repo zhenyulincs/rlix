@@ -7,7 +7,7 @@ Key constraints vs AgenticMultiLoraPipeline:
   - sleep_level=2 (GPU weights released; actors stay alive in CPU RAM)
   - No partial_gpu_mode (sequential, not overlapping)
   - megatron_train strategy required
-  - lora_optimizer_mode='per_adapter' required
+  - is_lora_optimizer_isolated=true required
   - Per-tag RolloutSchedulers (one per env tag / lora)
 """
 from __future__ import annotations
@@ -62,8 +62,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
     Constraints:
     - actor_infer.strategy_args.strategy_config.sleep_level == 2
     - actor_train.strategy_args.strategy_name == 'megatron_train'
-    - actor_train.strategy_args.strategy_config.lora_optimizer_mode == 'per_adapter'
-    - actor_train.model_args.adapters is not None
+    - actor_train.model_args.adapters is not None (per-adapter optimizer)
     """
 
     def initialize_pipeline(self) -> ActionResponse:
@@ -88,15 +87,9 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                 f"RlixMultiLoraPipeline requires actor_train strategy_name='megatron_train', "
                 f"got {train_strategy_name!r}"
             )
-        train_strategy_config = (
-            getattr(getattr(pipeline_config.actor_train, "strategy_args", None), "strategy_config", None) or {}
-        )
-        lora_optimizer_mode = train_strategy_config.get("lora_optimizer_mode", "shared")
-        if lora_optimizer_mode != "per_adapter":
-            raise RuntimeError(
-                "RlixMultiLoraPipeline requires actor_train strategy_config.lora_optimizer_mode='per_adapter', "
-                f"got {lora_optimizer_mode!r}"
-            )
+        # Isolated multi-adapter config validation (is_lora_optimizer_isolated, use_distributed_optimizer,
+        # overlap_grad_reduce) is handled in MegatronTrainStrategy.initialize() to cover
+        # all init paths, not just this pipeline.
         adapters = getattr(pipeline_config.actor_train.model_args, "adapters", None) or {}
         if not adapters:
             raise RuntimeError(
@@ -472,6 +465,8 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                         )
 
                     with Timer(name="actor_train_step", logger=None) as actor_train_timer:
+                        # Time-sharing: tag batch with version for strategy-level cache build.
+                        batch.meta_info["checkpoint_version"] = lora_step[lora_name]
                         # (a) Train using per-lora optimizer step.
                         actor_train_metrics_refs = self.actor_train.train_step_lora(batch, blocking=False)
                         actor_train_metrics = DataProto.materialize_concat(
