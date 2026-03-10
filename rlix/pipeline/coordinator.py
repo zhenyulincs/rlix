@@ -165,12 +165,11 @@ class RlixCoordinator(Coordinator):
         # The actor is a namespace singleton (rlix:roll_resource_manager) shared across
         # all concurrent pipeline actors.  We also capture node-0's placement group
         # and base GPU rank here to pin pipeline actors to a GPU node for CUDA visibility.
-        from roll.distributed.scheduler.resource_manager import get_or_create_roll_resource_manager_actor
-        self._rm_actor = get_or_create_roll_resource_manager_actor(pipeline_config.num_gpus_per_node)
-        _rm_state = ray.get(self._rm_actor.get_state.remote())
+        from roll.distributed.scheduler.resource_manager import RollResourceManagerProxy
+        self._rm_proxy = RollResourceManagerProxy(num_gpus_per_node=pipeline_config.num_gpus_per_node)
         # Node 0's placement group is used to schedule the pipeline actor on a GPU node so
         # that Ray sets CUDA_VISIBLE_DEVICES (needed for platform detection + RNG state).
-        self._rm_node0_pg = _rm_state["node2pg"].get(0)
+        self._rm_node0_pg = self._rm_proxy.node2pg.get(0)
 
         self._pipeline_actor = None
         # Serializes resize_infer and sync_lora_weights: prevents a weight sync from
