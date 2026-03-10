@@ -16,6 +16,7 @@ import json
 import os
 import time
 import threading
+
 from collections import deque
 from dataclasses import replace
 from typing import Any, Dict, List, Optional
@@ -29,7 +30,7 @@ from ray.util.timer import _Timer
 from rlix.protocol.types import ActionResponse, Priority
 
 from roll.distributed.scheduler.protocol import DataProto
-from roll.pipeline.agentic.agentic_pipeline import compute_rollout_traj_metrics, compute_train_data_metrics
+from roll.pipeline.agentic.agentic_pipeline import compute_rollout_traj_metrics, compute_train_data_metrics, get_episode_scores
 from roll.pipeline.agentic.utils import (
     agentic_compute_advantage,
     compute_discounted_returns,
@@ -96,6 +97,18 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                 "RlixMultiLoraPipeline requires actor_train.model_args.adapters to be non-empty"
             )
 
+        # Create per-LoRA trackers for independent per-adapter metric logging.
+        self._create_lora_trackers()
+
+        # TODO: support GAE with per-LoRA critics: frozen backbone + per-LoRA adapters + per-LoRA value heads.
+        if self.pipeline_config.adv_estimator == "gae":
+            raise NotImplementedError(
+                "RlixMultiLoraPipeline does not support adv_estimator='gae'. "
+                "A single shared critic cannot produce accurate advantages across different LoRA tasks. "
+                "Requires per-LoRA critic adapters and per-LoRA value heads on a shared backbone "
+                "(not yet implemented). Use 'grpo' or 'reinforce_plus_plus' instead."
+            )
+
         # --- Static VRAM cap (Phase 2) ---
         max_resident = getattr(pipeline_config, "max_resident_adapters", None)
         if max_resident is not None and len(adapters) > int(max_resident):
@@ -130,17 +143,18 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
 
         self.rollout_schedulers: Dict[str, Any] = {}
         for tag, n_group in zip(tags, num_groups_partition):
+            # Shallow-copy the base config so per-tag mutations don't affect other tags.
             env_cfg = replace(base_env)
+            # Narrow the config to this single tag's env subset (one tag, one partition).
             env_cfg.tags = [tag]
             env_cfg.num_groups_partition = [n_group]
             env_cfg.num_env_groups = n_group
             env_cfg.name = f"train_env_{tag}"
+            # Recompute derived fields (world_size, max_env_num_per_worker, etc.) for the reduced env count.
             env_cfg.__post_init__()
-            # Ensure each per-tag scheduler can produce rollout_batch_size trajectories per step.
-            train_env_num = env_cfg.num_env_groups * env_cfg.group_size
-            traj_per_env = (pipeline_config.rollout_batch_size + train_env_num - 1) // train_env_num
-            if env_cfg.max_traj_per_env < traj_per_env:
-                env_cfg.max_traj_per_env = traj_per_env
+            # Ensure per-tag max_traj_per_env is sufficient after narrowing to this tag's env subset.
+            pipeline_config.ensure_min_traj_per_env(env_cfg, pipeline_config.rollout_batch_size)
+            # Rebuild env_configs so worker_rank → env_id mapping reflects only this tag's envs.
             pipeline_config.make_env_configs(env_cfg)
 
             self.rollout_schedulers[tag] = ray.remote(RolloutScheduler).options(
@@ -160,6 +174,80 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                 request_scheduler=self.generate_scheduler,
             )
 
+        # Shut down parent's single global val_rollout_scheduler (replaced by per-tag schedulers below).
+        ray.get(self.val_rollout_scheduler.shutdown.remote())
+
+        # Per-tag val rollout schedulers (mirrors train schedulers for per-adapter eval).
+        from roll.pipeline.agentic.agentic_config import EnvManagerConfig
+        val_env: EnvManagerConfig = pipeline_config.val_env_manager
+        val_tags = list(val_env.tags) if getattr(val_env, "tags", None) else []
+        # Val tags must match train tags exactly for correct per-adapter eval.
+        assert val_tags == tags, (
+            f"val_env_manager.tags must match train_env_manager.tags: "
+            f"val={val_tags} train={tags}"
+        )
+        num_tags = len(tags)
+
+        # Validate val partition: no fallback, require explicit valid config.
+        val_num_groups_partition = list(getattr(val_env, "num_groups_partition", []) or [])
+        assert len(val_num_groups_partition) == num_tags, (
+            f"val_env_manager.num_groups_partition length ({len(val_num_groups_partition)}) "
+            f"must match num_tags ({num_tags})"
+        )
+        assert all(n_group > 0 for n_group in val_num_groups_partition), (
+            f"val_env_manager.num_groups_partition entries must all be > 0: {val_num_groups_partition}"
+        )
+        assert sum(val_num_groups_partition) == val_env.num_env_groups, (
+            f"sum(val_env_manager.num_groups_partition) = {sum(val_num_groups_partition)} "
+            f"must equal val_env_manager.num_env_groups = {val_env.num_env_groups}"
+        )
+
+        # Per-tag val_batch_size: equal split, validated per-tag.
+        assert pipeline_config.val_batch_size % num_tags == 0, (
+            f"val_batch_size ({pipeline_config.val_batch_size}) must be divisible by "
+            f"num_tags ({num_tags})"
+        )
+        val_batch_size_per_tag = pipeline_config.val_batch_size // num_tags
+        self._val_batch_size_per_tag: Dict[str, int] = {}
+        for tag, val_n_group in zip(tags, val_num_groups_partition):
+            tag_val_env_num = val_n_group * val_env.group_size
+            assert val_batch_size_per_tag % tag_val_env_num == 0, (
+                f"per-tag val_batch_size ({val_batch_size_per_tag}) must be divisible by "
+                f"tag {tag!r} val_env_num ({tag_val_env_num} = {val_n_group} * {val_env.group_size})"
+            )
+            self._val_batch_size_per_tag[tag] = val_batch_size_per_tag
+
+        self.val_rollout_schedulers: Dict[str, Any] = {}
+        for tag, val_n_group in zip(tags, val_num_groups_partition):
+            val_env_cfg = replace(val_env)
+            val_env_cfg.tags = [tag]
+            val_env_cfg.num_groups_partition = [val_n_group]
+            val_env_cfg.num_env_groups = val_n_group
+            val_env_cfg.name = f"val_env_{tag}"
+            val_env_cfg.__post_init__()
+            # Ensure per-tag max_traj_per_env is sufficient for the proportional val batch.
+            pipeline_config.ensure_min_traj_per_env(val_env_cfg, self._val_batch_size_per_tag[tag])
+            pipeline_config.make_env_configs(val_env_cfg)
+            self.val_rollout_schedulers[tag] = ray.remote(RolloutScheduler).options(
+                name=f"RolloutScheduler-{self._pipeline_id}-val-{tag}",
+                namespace=ray_namespace,
+                runtime_env={"env_vars": rlix_env_vars()},
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=ray.get_runtime_context().get_node_id(),
+                    soft=False,
+                ),
+            ).remote(
+                config=pipeline_config,
+                env_manager_config=val_env_cfg,
+                resource_manager=self.resource_manager,
+                infer_cluster=self.actor_infer,
+                mode="val",
+                request_scheduler=self.generate_scheduler,
+            )
+
+        # Point parent's handle to first per-tag scheduler for parent code compatibility.
+        self.val_rollout_scheduler = list(self.val_rollout_schedulers.values())[0]
+
         # Build and promote initial per-lora caches so first expand can sync all loras.
         all_loras = list(dict.fromkeys(self._tag_to_lora.values()))
         for lora_name in all_loras:
@@ -176,6 +264,9 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
         dp_ranks = self._actor_infer_all_dp_ranks()
         for scheduler in self.rollout_schedulers.values():
             ray.get(scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
+        # Shrink val schedulers to zero as well (routing-only, same initial state).
+        for scheduler in self.val_rollout_schedulers.values():
+            ray.get(scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
 
         self._rollout_schedulers_initialized = True
         logger.info(
@@ -184,6 +275,61 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
         )
         return ActionResponse(success=True)
 
+    def _create_lora_trackers(self) -> None:
+        """Create one metrics tracker per LoRA adapter for independent per-adapter tracking."""
+        from roll.utils.tracking import create_lora_tracker
+
+        pipeline_config = self._pipeline_config
+        adapters = getattr(pipeline_config.actor_train.model_args, "adapters", None) or {}
+        if not adapters:
+            return
+        adapter_names = sorted(adapters.keys())
+        tracker_name = pipeline_config.track_with
+
+        self.lora_trackers: Dict[str, Any] = {}
+        for name in adapter_names:
+            self.lora_trackers[name] = create_lora_tracker(
+                tracker_name=tracker_name,
+                lora_name=name,
+                config=pipeline_config.to_dict(),
+                **pipeline_config.tracker_kwargs,
+            )
+        logger.info("Created per-LoRA trackers for adapters: %s", adapter_names)
+
+
+    def val_single(self, lora_name: str, global_step: int) -> dict:
+        """Validate a single adapter by running only its matching tag's val scheduler."""
+        metrics: dict = {}
+
+        for tag, val_scheduler in self.val_rollout_schedulers.items():
+            # Only validate the tag that maps to the given adapter.
+            if self._tag_to_lora[tag] != lora_name:
+                continue
+            metrics.update(self._val_tag(tag, val_scheduler, global_step))
+
+        logger.info(f"val_single lora={lora_name} metrics: {metrics}")
+        return metrics
+
+    def _val_tag(self, tag: str, val_scheduler: Any, global_step: int) -> dict:
+        """Run validation for a single tag and return prefixed metrics."""
+        metrics: dict = {}
+        batch = DataProto(meta_info={"is_offload_states": False, "global_step": global_step})
+        eval_batch = ray.get(val_scheduler.get_batch.remote(batch, self._val_batch_size_per_tag[tag]))
+
+        if "get_batch_return_start_time" in eval_batch.meta_info:
+            metrics[f"time/get_batch_cost_val/{tag}"] = (
+                time.time() - eval_batch.meta_info.pop("get_batch_return_start_time")
+            )
+
+        dump_rollout_trajectories(self.pipeline_config.rollout_dump_dir, global_step, eval_batch)
+        eval_metrics = reduce_metrics(eval_batch.meta_info.get("metrics", {}))
+        eval_score = get_episode_scores(eval_batch)
+        eval_metrics["score/mean"] = torch.mean(eval_score).detach().item()
+        eval_metrics["score/max"] = torch.max(eval_score).detach().item()
+        eval_metrics["score/min"] = torch.min(eval_score).detach().item()
+
+        metrics.update({f"val/{tag}/{k}": v for k, v in eval_metrics.items()})
+        return metrics
 
     @torch.no_grad()
     def run(self) -> None:
@@ -205,14 +351,31 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
         loras: List[str] = list(dict.fromkeys(self._tag_to_lora.values()))
         max_steps_per_lora: int = self.pipeline_config.max_steps
         # Per-lora step counters — each terminates independently.
-        # TODO: checkpoint resume — restore per-lora lora_step from saved state.
         lora_step: Dict[str, int] = {name: 0 for name in loras}
+        # Monotonic global tick for checkpoint ids and eval cadence.
+        global_tick: int = 0
+
+        # Resume per-lora state from checkpoint if available.
+        if "lora_step_by_adapter" in self.state.kv:
+            saved_mapping = self.state.kv["tag_to_adapter"]
+            if saved_mapping != self._tag_to_lora:
+                raise RuntimeError(
+                    f"Checkpoint tag_to_adapter mismatch: saved={saved_mapping} current={self._tag_to_lora}"
+                )
+            lora_step = dict(self.state.kv["lora_step_by_adapter"])
+            global_tick = int(self.state.kv["global_tick"])
+            logger.info(f"Resumed from checkpoint: global_tick={global_tick} lora_step={lora_step}")
         tags: List[str] = list(self.rollout_schedulers.keys())
 
         # Phase-1 / Phase-4.5 state: track whether any tick has completed to know
         # when it is safe to call _notify_ready_to_release_actor_infer.
         any_tick_completed: bool = False
         prev_trained_step: int = 0
+        # Tokens-per-second throughput tracker.
+        tps_timer = _Timer(window_size=5)
+        # Track submission time per tag for rollout wait_s computation
+        # (pattern from agentic_multi_lora_pipeline.py:680-683).
+        submitted_at_mono: Dict[str, float] = {}
 
         # ============================================================
         # Kick off initial get_batch for all active tags (mirrors agentic_multi_lora_pipeline.py:532-545).
@@ -228,6 +391,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                     self.pipeline_config.rollout_batch_size,
                 )
                 in_flight.append((tag, ref))
+                submitted_at_mono[tag] = time.monotonic()
 
         while any(lora_step[name] < max_steps_per_lora for name in loras):
             metrics: Dict[str, Any] = {}
@@ -241,10 +405,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                 # ============================================================
                 expected_gpus = list(self.actor_infer.worker_config.device_mapping)
                 assert len(expected_gpus) > 0
-                if any_tick_completed and (
-                    self.pipeline_config.adv_estimator != "gae"
-                    or self.pipeline_config.critic_warmup <= prev_trained_step
-                ):
+                if any_tick_completed:
                     # Release actor_train GPUs from last tick and request actor_infer GPUs.
                     allocated_actor_infer_gpus = self._release_and_request_static_cluster(
                         release_cluster_id=self._actor_train_cluster_id,
@@ -281,6 +442,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                             self.pipeline_config.rollout_batch_size,
                         )
                         in_flight.append((tag, ref))
+                        submitted_at_mono[tag] = time.monotonic()
 
                 # Build wait inputs using queue order (head first) to avoid fixed tag-order bias.
                 active_refs = [ref for _, ref in in_flight]
@@ -293,25 +455,41 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                     )
                 ready_ref = ready[0]
                 ready_tag = next(tag for tag, ref in in_flight if ref == ready_ref)
-                batch = ray.get(ready_ref)
-                in_flight = deque((tag, ref) for tag, ref in in_flight if tag != ready_tag)
-                lora_name = self._tag_to_lora[ready_tag]
+                # Compute rollout wait time (pattern from agentic_multi_lora_pipeline.py:680-683).
+                wait_s = time.monotonic() - submitted_at_mono.pop(ready_tag)
 
-                dump_rollout_trajectories(
-                    self.pipeline_config.rollout_dump_dir, lora_step[lora_name], batch
-                )
-                metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-                # Required by strategy._get_batch_num_tokens() to identify valid token masks.
-                batch.meta_info["loss_mask_keys"] = ["response_mask"]
-                # Required for workers to broadcast non_tensor_batch across DP ranks.
-                batch.meta_info["_broadcast_non_tensor_batch"] = True
-                # Pass per-lora step so base_worker.train_step_lora can build bucket cache.
-                batch.meta_info["global_step"] = lora_step[lora_name]
-                batch.meta_info["is_offload_states"] = True
-                logger.info(
-                    f"run() {self._pipeline_id=} Phase 7: ready tag={ready_tag!r} "
-                    f"lora={lora_name!r} lora_step={lora_step[lora_name]}"
-                )
+                with Timer(name="rollout", logger=None) as rollout_timer:
+                    batch = ray.get(ready_ref)
+                    in_flight = deque((tag, ref) for tag, ref in in_flight if tag != ready_tag)
+                    lora_name = self._tag_to_lora[ready_tag]
+
+                    # Measure scheduler-to-pipeline transfer latency (pattern from agentic_pipeline.py:340-341).
+                    if "get_batch_return_start_time" in batch.meta_info:
+                        metrics["time/get_batch_cost_train"] = (
+                            time.time() - batch.meta_info.pop("get_batch_return_start_time")
+                        )
+
+                    dump_rollout_trajectories(
+                        self.pipeline_config.rollout_dump_dir, lora_step[lora_name], batch
+                    )
+                    metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                    # Collect actor inference metrics (pattern from agentic_multi_lora_pipeline.py:688-691).
+                    actor_infer_metrics = self.actor_infer.get_metrics()
+                    if "metrics" in actor_infer_metrics.meta_info:
+                        metrics.update(reduce_metrics(actor_infer_metrics.meta_info.pop("metrics", {})))
+                    # Required by strategy._get_batch_num_tokens() to identify valid token masks.
+                    batch.meta_info["loss_mask_keys"] = ["response_mask"]
+                    # Required for workers to broadcast non_tensor_batch across DP ranks.
+                    batch.meta_info["_broadcast_non_tensor_batch"] = True
+                    # Pass per-lora step so base_worker.train_step_lora can build bucket cache.
+                    batch.meta_info["global_step"] = lora_step[lora_name]
+                    batch.meta_info["is_offload_states"] = True
+                    logger.info(
+                        f"run() {self._pipeline_id=} Phase 7: ready tag={ready_tag!r} "
+                        f"lora={lora_name!r} lora_step={lora_step[lora_name]}"
+                    )
+                # Rollout time = ray.wait duration + post-wait processing (matching ROLL line 801).
+                metrics["time/step_rollout"] = rollout_timer.last + wait_s
 
                 # ============================================================
                 # Phase 10: Batch processing (CPU).
@@ -324,47 +502,38 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                 with Timer(name="cal_response_level_mask", logger=None) as timer:
                     batch, mask_metrics = get_agentic_response_level_mask(batch, self.pipeline_config)
                     metrics.update(mask_metrics)
-                metrics["time/cal_response_level_mask"] = timer.last
+                metrics["time/step_cal_response_level_mask"] = timer.last
                 logger.info(f"run() {self._pipeline_id=} Phase 10: batch processing completed")
-
-                # ============================================================
-                # Phase 11: Value compute (GAE only).
-                # ============================================================
-                if self.pipeline_config.adv_estimator == "gae":
-                    self._request_static_cluster(
-                        cluster_id=self._critic_cluster_id,
-                        priority=Priority.VALUE_COMPUTE,
-                        global_step=lora_step[lora_name],
-                    )
-                    values_refs = self.critic.compute_values(batch, blocking=False)
-                    values = DataProto.materialize_concat(data_refs=values_refs)
-                    batch.batch["values"] = values.batch["values"]
 
                 # ============================================================
                 # Phase 13: Old log probs.
                 # ============================================================
-                if self.pipeline_config.adv_estimator != "gae":
-                    # Do NOT call _notify_ready_to_release_actor_infer here. In multi-lora, we
-                    # sync dirty lora weights directly to active infer workers at Phase 16.
-                    # The scheduler's preemption path frees only the GPUs that actor_train needs
-                    # (a partial shrink), so active_dp_ranks stays non-empty through Phase 16.
-                    # After actor_train releases, the scheduler calls expand_worker to sync
-                    # loras to any workers that were preempted (now idle).
-                    allocated_actor_train_gpus = self._request_static_cluster(
-                        cluster_id=self._actor_train_cluster_id,
-                        priority=Priority.OLD_LOG_PROBS,
-                        global_step=lora_step[lora_name],
-                        lora_name=lora_name,
+                # Do NOT call _notify_ready_to_release_actor_infer here. In multi-lora, we
+                # sync dirty lora weights directly to active infer workers at Phase 16.
+                # The scheduler's preemption path frees only the GPUs that actor_train needs
+                # (a partial shrink), so active_dp_ranks stays non-empty through Phase 16.
+                # After actor_train releases, the scheduler calls expand_worker to sync
+                # loras to any workers that were preempted (now idle).
+                allocated_actor_train_gpus = self._request_static_cluster(
+                    cluster_id=self._actor_train_cluster_id,
+                    priority=Priority.OLD_LOG_PROBS,
+                    global_step=lora_step[lora_name],
+                    lora_name=lora_name,
+                )
+                # Balance batch for old log-prob compute (production pattern: agentic_pipeline.py:442).
+                batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
+                # Dynamic batching for old log-prob path (matching agentic_pipeline.py:445-455).
+                if self.pipeline_config.actor_train.use_dynamic_batching_in_infer:
+                    batch, dynamic_batching_metrics = dynamic_batching_shard(
+                        batch,
+                        self.actor_train.dp_size,
+                        self.pipeline_config.actor_train.max_tokens_per_microbatch_in_infer,
+                        self.pipeline_config.actor_train.sequence_length_round_in_infer,
+                        self.pipeline_config.actor_train.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
+                        self.pipeline_config.actor_train.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
+                        "actor_train/compute_log_probs",
                     )
-                else:
-                    allocated_actor_train_gpus = self._release_and_request_static_cluster(
-                        release_cluster_id=self._critic_cluster_id,
-                        release_global_step=lora_step[lora_name],
-                        request_cluster_id=self._actor_train_cluster_id,
-                        request_priority=Priority.OLD_LOG_PROBS,
-                        request_global_step=lora_step[lora_name],
-                        request_lora_name=lora_name,
-                    )
+                    metrics.update(dynamic_batching_metrics)
                 with Timer(name="cal_old_log_probs_values", logger=None) as old_logpb_timer:
                     old_log_probs_refs = self.actor_train.compute_log_probs(batch, blocking=False)
                     old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
@@ -372,7 +541,18 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                     # TODO: support true ref_log_probs for enable_reference=True via dedicated
                     # reference cluster GPU cycle. Simplified: old_log_probs used as ref.
                     batch.batch["ref_log_probs"] = batch.batch["old_log_probs"]
-                metrics["time/old_log_probs_values"] = old_logpb_timer.last
+                    # Log old/ref log-prob and entropy metrics (pattern from agentic_pipeline.py:458-482).
+                    avg_old_log_prob = masked_mean(batch.batch["old_log_probs"], batch.batch["response_mask"][:, 1:])
+                    metrics["critic/old_log_prob/mean"] = avg_old_log_prob.item()
+                    avg_ref_log_prob = masked_mean(batch.batch["ref_log_probs"], batch.batch["response_mask"][:, 1:])
+                    metrics["critic/ref_log_prob/mean"] = avg_ref_log_prob.item()
+                    agg_entropy_val = agg_loss(
+                        loss_mat=old_log_probs.batch["entropy"],
+                        loss_mask=batch.batch["response_mask"][:, 1:],
+                        loss_agg_mode="token-mean",
+                    )
+                    metrics["critic/entropy/mean"] = agg_entropy_val.item()
+                metrics["time/step_old_log_probs_values"] = old_logpb_timer.last
                 logger.info(f"run() {self._pipeline_id=} Phase 13: old log probs completed")
 
                 # ============================================================
@@ -384,12 +564,12 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                     )
                     metrics.update(reward_metrics)
                     metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-                metrics["time/cal_norm_rewards"] = timer.last
+                metrics["time/step_cal_norm_rewards"] = timer.last
 
                 with Timer(name="cal_token_reward", logger=None) as timer:
                     batch, token_level_metrics = compute_token_reward(batch, self.pipeline_config, self.kl_ctrl)
                     metrics.update(token_level_metrics)
-                metrics["time/cal_token_reward"] = timer.last
+                metrics["time/step_cal_token_reward"] = timer.last
 
                 with Timer(name="compute_advantage", logger=None) as timer:
                     batch = agentic_compute_advantage(
@@ -402,7 +582,12 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                         whiten_rewards=self.pipeline_config.whiten_rewards,
                     )
                     metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-                metrics["time/adv"] = timer.last
+                metrics["time/step_adv"] = timer.last
+                # Compute training data metrics (pattern from agentic_pipeline.py:562).
+                # Timer matches base agentic_pipeline.py:564-566.
+                with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer:
+                    metrics.update(compute_train_data_metrics(batch=batch))
+                metrics["time/step_compute_data_metrics"] = data_metrics_timer.last
                 logger.info(f"run() {self._pipeline_id=} Phase 14: advantage computation completed")
 
                 if self.pipeline_config.enable_old_logprobs_recompute:
@@ -413,131 +598,140 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                     metrics.update(corr_metrics)
 
                 # ============================================================
-                # Phase 15: Critic training (GAE only).
-                # ============================================================
-                if self.pipeline_config.adv_estimator == "gae":
-                    self._release_and_request_static_cluster(
-                        release_cluster_id=self._actor_train_cluster_id,
-                        release_global_step=lora_step[lora_name],
-                        request_cluster_id=self._critic_cluster_id,
-                        request_priority=Priority.CRITIC_TRAINING,
-                        request_global_step=lora_step[lora_name],
-                    )
-                    with Timer(name="critic_train_step", logger=None) as critic_train_timer:
-                        critic_train_metrics_refs = self.critic.train_step(batch, blocking=False)
-                        critic_train_metrics = DataProto.materialize_concat(
-                            data_refs=critic_train_metrics_refs
-                        )
-                        metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
-                    metrics["time/critic_train_step"] = critic_train_timer.last
-
-                    if self.pipeline_config.critic_warmup > lora_step[lora_name]:
-                        self._release_static_cluster(
-                            cluster_id=self._critic_cluster_id,
-                            global_step=lora_step[lora_name],
-                        )
-                    logger.info(f"run() {self._pipeline_id=} Phase 15: critic training completed")
-
-                # ============================================================
                 # Phase 16: Actor training (train_step_lora) + promote + scheduler sync.
                 # Pattern copied from full_finetune_pipeline.py Phase 16 + HEAD multi_lora_pipeline.py:534-568.
                 # ============================================================
-                if self.pipeline_config.critic_warmup <= lora_step[lora_name]:
-                    # Request actor_train GPUs (release critic if GAE, else re-request actor_train).
-                    if self.pipeline_config.adv_estimator == "gae":
-                        self._release_and_request_static_cluster(
-                            release_cluster_id=self._critic_cluster_id,
-                            release_global_step=lora_step[lora_name],
-                            request_cluster_id=self._actor_train_cluster_id,
-                            request_priority=Priority.ACTOR_TRAINING,
-                            request_global_step=lora_step[lora_name],
-                            request_lora_name=lora_name,
-                        )
-                    else:
-                        # Switch actor_train from OLD_LOG_PROBS → ACTOR_TRAINING.
-                        self._release_and_request_static_cluster(
-                            release_cluster_id=self._actor_train_cluster_id,
-                            release_global_step=lora_step[lora_name],
-                            request_cluster_id=self._actor_train_cluster_id,
-                            request_priority=Priority.ACTOR_TRAINING,
-                            request_global_step=lora_step[lora_name],
-                            request_lora_name=lora_name,
-                        )
+                # Switch actor_train from OLD_LOG_PROBS → ACTOR_TRAINING.
+                self._release_and_request_static_cluster(
+                    release_cluster_id=self._actor_train_cluster_id,
+                    release_global_step=lora_step[lora_name],
+                    request_cluster_id=self._actor_train_cluster_id,
+                    request_priority=Priority.ACTOR_TRAINING,
+                    request_global_step=lora_step[lora_name],
+                    request_lora_name=lora_name,
+                )
 
-                    with Timer(name="actor_train_step", logger=None) as actor_train_timer:
-                        # Time-sharing: tag batch with version for strategy-level cache build.
-                        batch.meta_info["checkpoint_version"] = lora_step[lora_name]
-                        # (a) Train using per-lora optimizer step.
-                        actor_train_metrics_refs = self.actor_train.train_step_lora(batch, blocking=False)
-                        actor_train_metrics = DataProto.materialize_concat(
-                            data_refs=actor_train_metrics_refs
-                        )
-                        metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
-                    metrics["time/train_step"] = actor_train_timer.last
+                # Derive sample UUIDs from traj_id (same contract as agentic_pipeline.py:338-339).
+                sample_uuids = [f"{traj_id}_{idx}" for idx, traj_id in enumerate(batch.non_tensor_batch["traj_id"])]
+                batch.non_tensor_batch["sample_uuid"] = np.array(sample_uuids, dtype=object)
 
-                    # (b) Extract trained loras from lora_name; fail fast if missing or unknown.
-                    if "lora_name" not in batch.non_tensor_batch:
-                        raise RuntimeError("missing non_tensor_batch['lora_name']")
-                    valid_loras = set(self._tag_to_lora.values())
-                    trained_loras: List[str] = list(dict.fromkeys(
-                        str(n) for n in batch.non_tensor_batch["lora_name"].tolist()
-                        if str(n) in valid_loras
-                    ))
-                    if not trained_loras:
-                        raise RuntimeError(
-                            f"no recognized loras in lora_name: "
-                            f"{batch.non_tensor_batch['lora_name'].tolist()!r}"
-                        )
+                # Balance batch for training (production pattern: agentic_pipeline.py:534-537).
+                batch_balance_metrics = batch_balance(
+                    batch=batch,
+                    dp_size=self.actor_train.dp_size,
+                    minibatch_size=self.actor_train.dp_size
+                    * self.pipeline_config.actor_train.training_args.per_device_train_batch_size
+                    * self.pipeline_config.actor_train.training_args.gradient_accumulation_steps,
+                    logging_prefix="global_seqlen/actor_train",
+                )
+                metrics.update(batch_balance_metrics)
 
-                    # (c) Promote per-lora checkpoint — enables expand_sampler to load on next expand.
-                    checkpoint_version = int(
-                        batch.meta_info.get("checkpoint_version", lora_step[lora_name])
+                # Dynamic batching: shard batch before training (pattern from agentic_multi_lora_pipeline.py:747-761).
+                if self.pipeline_config.actor_train.use_dynamic_batching_in_train:
+                    batch, dynamic_batching_metrics = dynamic_batching_shard(
+                        batch,
+                        self.actor_train.dp_size,
+                        self.pipeline_config.actor_train.max_tokens_per_microbatch_in_train,
+                        self.pipeline_config.actor_train.sequence_length_round_in_train,
+                        self.pipeline_config.actor_train.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
+                        self.pipeline_config.actor_train.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
+                        "actor_train/train_step_lora",
                     )
-                    for lora in trained_loras:
-                        ray.get([
-                            worker.promote_active_adapter_checkpoint.remote(
-                                lora, checkpoint_version
-                            )
-                            for worker in self.actor_train.workers
-                        ])
+                    metrics.update(dynamic_batching_metrics)
 
-                    # (d) Push updated lora weights to active infer workers directly via
-                    # the coordinator actor. The coordinator looks up generate_scheduler itself and
-                    # queries active_dp_ranks inside _resize_sync_lock to avoid race conditions.
-                    # If all workers are sleeping (preempted by concurrent pipelines),
-                    # the coordinator skips sync and expand_worker handles it on next wake.
-                    ray.get(self._get_coordinator_handle().sync_lora_weights.remote(
-                        loras_to_sync=trained_loras,
-                    ))
-                    # Append metrics before do_checkpoint so log_history[-1] exists.
-                    # metrics is a mutable dict, so Phase 17 updates are visible via the same reference.
-                    self.state.step = lora_step[lora_name]
-                    self.state.log_history.append(metrics)
-                    # Checkpoint while actor_train GPU is still held, then offload all states
-                    # so the GPU is clean when Phase 4.5 of the next tick releases actor_train
-                    # and requests actor_infer (preventing OOM on the infer expand).
-                    self.do_checkpoint(global_step=lora_step[lora_name], offload_after_checkpoint=True)
-                    # actor_train GPU is released at Phase 4.5 of the next while-loop tick
-                    # via _release_and_request_static_cluster; GPU is clean (offloaded) by then.
-                    logger.info(f"run() {self._pipeline_id=} Phase 16: actor training + sync + checkpoint completed")
+                with Timer(name="actor_train_step", logger=None) as actor_train_timer:
+                    # Time-sharing: tag batch with version for strategy-level cache build.
+                    batch.meta_info["checkpoint_version"] = lora_step[lora_name]
+                    # (a) Train using per-lora optimizer step.
+                    actor_train_metrics_refs = self.actor_train.train_step_lora(batch, blocking=False)
+                    actor_train_metrics = DataProto.materialize_concat(
+                        data_refs=actor_train_metrics_refs
+                    )
+                    metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
+                metrics["time/step_train"] = actor_train_timer.last
+                tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
+                metrics["system/tps"] = tps_timer.mean_throughput
+
+                # (b) Extract trained loras from lora_name; fail fast if missing or unknown.
+                if "lora_name" not in batch.non_tensor_batch:
+                    raise RuntimeError("missing non_tensor_batch['lora_name']")
+                valid_loras = set(self._tag_to_lora.values())
+                trained_loras: List[str] = list(dict.fromkeys(
+                    str(n) for n in batch.non_tensor_batch["lora_name"].tolist()
+                    if str(n) in valid_loras
+                ))
+                if not trained_loras:
+                    raise RuntimeError(
+                        f"no recognized loras in lora_name: "
+                        f"{batch.non_tensor_batch['lora_name'].tolist()!r}"
+                    )
+
+                # (c) Promote per-lora checkpoint — enables expand_sampler to load on next expand.
+                checkpoint_version = int(
+                    batch.meta_info.get("checkpoint_version", lora_step[lora_name])
+                )
+                for lora in trained_loras:
+                    ray.get([
+                        worker.promote_active_adapter_checkpoint.remote(
+                            lora, checkpoint_version
+                        )
+                        for worker in self.actor_train.workers
+                    ])
+
+                # (d) Push updated lora weights to active infer workers directly via
+                # the coordinator actor. The coordinator looks up generate_scheduler itself and
+                # queries active_dp_ranks inside _resize_sync_lock to avoid race conditions.
+                # If all workers are sleeping (preempted by concurrent pipelines),
+                # the coordinator skips sync and expand_worker handles it on next wake.
+                ray.get(self._get_coordinator_handle().sync_lora_weights.remote(
+                    loras_to_sync=trained_loras,
+                ))
+                logger.info(f"run() {self._pipeline_id=} Phase 16: actor training + sync completed")
                 # ============================================================
                 # Phase 17: Per-lora step tracking and metrics.
                 # ============================================================
                 prev_trained_step = lora_step[lora_name]  # capture before increment
                 lora_step[lora_name] += 1
+                global_tick += 1
                 any_tick_completed = True
+
+                # Per-adapter validation: run after sync so inference weights are current.
+                if (self.pipeline_config.eval_steps > 0
+                        and lora_step[lora_name] % self.pipeline_config.eval_steps == 0):
+                    with Timer(name="val", logger=None) as val_timer:
+                        val_metrics = self.val_single(lora_name=lora_name, global_step=lora_step[lora_name])
+                    metrics.update(val_metrics)
+                    metrics["time/step_val"] = val_timer.last
 
                 metrics.update(compute_rollout_traj_metrics(batch))
                 metrics["system/lora_step"] = lora_step[lora_name]
+                metrics["system/global_tick"] = global_tick
                 for name, step in lora_step.items():
                     metrics[f"system/lora_step/{name}"] = step
+                # Cumulative sample count (pattern from agentic_pipeline.py:569).
+                metrics["system/samples"] = global_tick * self.pipeline_config.rollout_batch_size
+                metrics["system/lora_name"] = lora_name
                 logger.info(f"run() {self._pipeline_id=} Phase 17: metrics computed lora_step={lora_step}")
 
             # End of Timer block — record per-tick wall time before checkpointing.
-            metrics["time/per_step_e2e"] = step_timer.last
+            metrics["time/step_total"] = step_timer.last
 
-            # state.step and log_history were already set in Phase 16.
-            self.tracker.log(values=metrics, step=lora_step[lora_name], lora_name=lora_name)
+            # Per-LoRA tracker: per-adapter step counter (same view as full-finetune).
+            if hasattr(self, "lora_trackers"):
+                self.lora_trackers[lora_name].log(values=metrics, step=lora_step[lora_name])
+            # Shared tracker: global tick for pipeline-wide overview (no overlapping steps).
+            self.tracker.log(values=metrics, step=global_tick)
+
+            # Persist per-lora state for checkpoint resume.
+            all_done = all(lora_step[name] >= max_steps_per_lora for name in loras)
+            self.state.kv["lora_step_by_adapter"] = dict(lora_step)
+            self.state.kv["global_tick"] = global_tick
+            self.state.kv["tag_to_adapter"] = dict(self._tag_to_lora)
+            self.state.step = global_tick
+            # Minimal log_history entry for do_checkpoint (reads log_history[-1] for system/step).
+            # Do not persist full tick_metrics: base resume replay lacks lora_name context.
+            self.state.log_history.append({"system/step": global_tick})
+            self.do_checkpoint(global_step=global_tick, is_last_step=all_done, offload_after_checkpoint=True)
             logger.info(f"===== {self._pipeline_id} tick completed lora={lora_name!r} step={lora_step[lora_name]} =====")
 
             # Re-kick in-flight get_batch for the consumed tag if lora has more steps.
@@ -547,18 +741,35 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                     self.pipeline_config.rollout_batch_size,
                 )
                 in_flight.append((ready_tag, ref))
+                submitted_at_mono[ready_tag] = time.monotonic()
 
         # ============================================================
-        # End-of-loop cleanup: release GPUs and shut down schedulers.
+        # End-of-loop cleanup: release GPUs, shut down schedulers, close trackers.
+        # Each cleanup step isolated so one failure doesn't skip the rest.
         # ============================================================
-        max_lora_step = max(lora_step.values()) if lora_step else 0
-        if max_lora_step > 0:
-            self._notify_ready_to_release_actor_infer(global_step=max_lora_step - 1)
-            self._release_static_cluster(
-                cluster_id=self._actor_train_cluster_id, global_step=max_lora_step - 1
+        try:
+            max_lora_step = max(lora_step.values()) if lora_step else 0
+            if max_lora_step > 0:
+                self._notify_ready_to_release_actor_infer(global_step=max_lora_step - 1)
+                self._release_static_cluster(
+                    cluster_id=self._actor_train_cluster_id, global_step=max_lora_step - 1
+                )
+        except Exception:
+            logger.exception("Failed to release GPU clusters")
+        try:
+            ray.get(
+                [sched.shutdown.remote() for sched in self.rollout_schedulers.values()]
+                + [sched.shutdown.remote() for sched in self.val_rollout_schedulers.values()]
             )
-        ray.get([sched.shutdown.remote() for sched in self.rollout_schedulers.values()])
-        ray.get(self.val_rollout_scheduler.shutdown.remote())
+        except Exception:
+            logger.exception("Failed to shutdown rollout schedulers")
+        try:
+            if hasattr(self, "lora_trackers"):
+                for lora_tracker in self.lora_trackers.values():
+                    lora_tracker.finish()
+            self.tracker.finish()
+        except Exception:
+            logger.exception("tracker.finish failed")
         logger.info(f"{self._pipeline_id} pipeline run() completed")
 
     def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
@@ -586,23 +797,36 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
         return ActionResponse(success=True)
 
     def _shrink_all_schedulers(self, *, dp_ranks_to_remove: List[int]) -> None:
-        """Shrink all per-tag rollout schedulers (atomically via shared RequestScheduler)."""
+        """Shrink all per-tag rollout schedulers (train + val) atomically.
+
+        2-phase pattern: routing-only shrink on all except last, then physical offload on last.
+        """
         if not dp_ranks_to_remove:
             raise ValueError("dp_ranks_to_remove must be non-empty")
         with self._infer_resize_lock:
-            # All per-tag schedulers and val_rollout_scheduler share the same RequestScheduler actor.
-            # A single call with skip_offload=False updates routing state and performs physical offload.
-            # We use val_rollout_scheduler as the handle, but any would work.
-            ray.get(self.val_rollout_scheduler.shrink_sampler.remote(dp_ranks_to_remove, skip_offload=False))
+            # Include both train and val schedulers so shrink covers all dispatchers.
+            all_schedulers = list(self.rollout_schedulers.values()) + list(self.val_rollout_schedulers.values())
+            # Phase 1: routing-only shrink on all except last.
+            for scheduler in all_schedulers[:-1]:
+                ray.get(scheduler.shrink_sampler.remote(dp_ranks_to_remove, skip_offload=True))
+            # Phase 2: last scheduler does routing + physical offload.
+            ray.get(all_schedulers[-1].shrink_sampler.remote(dp_ranks_to_remove, skip_offload=False))
 
     def _expand_all_schedulers(self, *, dp_ranks_to_add: List[int]) -> None:
-        """Expand all per-tag rollout schedulers (atomically via shared RequestScheduler)."""
+        """Expand all per-tag rollout schedulers (train + val) atomically.
+
+        Sequential pattern: first scheduler does physical load, rest do routing-only expand.
+        """
         if not dp_ranks_to_add:
             raise ValueError("dp_ranks_to_add must be non-empty")
         with self._infer_resize_lock:
-            # All per-tag schedulers and val_rollout_scheduler share the same RequestScheduler actor.
-            # A single call with skip_load=False performs weight load/selection sync and updates routing.
-            expand_metrics = ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=False))
+            # Include both train and val schedulers so expand covers all dispatchers.
+            all_schedulers = list(self.rollout_schedulers.values()) + list(self.val_rollout_schedulers.values())
+            # First scheduler loads model states.
+            ray.get(all_schedulers[0].expand_sampler.remote(dp_ranks_to_add, skip_load=False))
+            # Rest do routing-only expand.
+            for scheduler in all_schedulers[1:]:
+                ray.get(scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
             # TODO(item-6): Run a dummy forward pass (batch_size=1) on newly expanded workers to
             # initialize CUDA kernels before exposing them to the scheduler (prevents first-request
             # timeout). Not implemented yet — monitor expand latency before adding.

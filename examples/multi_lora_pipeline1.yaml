@@ -20,7 +20,11 @@ logging_dir: ./output/lora_pipeline1/logs
 output_dir: ./output/lora_pipeline1
 render_save_dir: /tmp/roll_output/lora_pipeline1/render
 
-track_with: stdout
+track_with: wandb
+tracker_kwargs:
+  entity: "khd6t7hdhn-university-of-pennsylvania"
+  project: "rlix"
+  api_key: "PLACEHOLDER_WANDB_API_KEY"
 
 
 system_envs:
@@ -108,13 +112,13 @@ actor_train:
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
       use_distributed_optimizer: false
-      lora_optimizer_mode: per_adapter
+      is_lora_optimizer_isolated: true
       recompute_granularity: full
       sequence_parallel: true
-      overlap_grad_reduce: false # Per-adapter LoRA mode requires overlap_grad_reduce disabled to avoid grad-sync hang.
+      overlap_grad_reduce: false # Isolated LoRA mode requires overlap_grad_reduce disabled to avoid grad-sync hang.
   # Note: use_sequence_packing is NOT enabled here — sequence packing mixes sequences from different
   # LoRA adapters into one microbatch, violating the adapter-homogeneity constraint in inner_forward_step.
-  # Note: use_dynamic_batching_in_train is also NOT enabled — incompatible with lora_optimizer_mode=per_adapter.
+  # Note: use_dynamic_batching_in_train is also NOT enabled — incompatible with is_lora_optimizer_isolated=true.
   device_mapping: "[0, ]"
   infer_batch_size: 1
 

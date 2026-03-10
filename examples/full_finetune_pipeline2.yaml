@@ -16,7 +16,11 @@ logging_dir: ./output/ft_pipeline2/logs
 output_dir: ./output/ft_pipeline2
 # render_save_dir: ./output/ft_pipeline2/render
 render_save_dir: /tmp/roll_output/ft_pipeline2/render
-track_with: stdout
+track_with: wandb
+tracker_kwargs:
+  entity: "khd6t7hdhn-university-of-pennsylvania"
+  project: "rlix"
+  api_key: "PLACEHOLDER_WANDB_API_KEY"
 
 
 system_envs:
