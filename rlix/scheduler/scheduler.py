@@ -17,6 +17,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
+logger = logging.getLogger(__name__)
+
 from rlix.protocol.request_id import validate_pipeline_id
 from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, get_pipeline_namespace, ORCHESTRATOR_ACTOR_NAME, Priority, ProgressReport, RLIX_NAMESPACE
 from rlix.scheduler.state import SchedulerState
@@ -1686,16 +1688,17 @@ class SchedulerImpl:
                     plan=plan, idle_gpus=set(planned_available_gpus)
                 )
 
-                # Unblock pending generation requests only when all generation workers are already active.
-                # This must be mutually exclusive with expansion planning to avoid conflicting plan ops.
+                # Unblock pending generation requests when any generation worker is active.
+                # Previously this required ALL workers to be active, which caused a deadlock:
+                # when another pipeline held a GPU needed by a dp worker, the GEN request
+                # was never signaled, blocking the pipeline at release_then_request_gpus.
                 pending_gen = list(self._state.pending_bucket(Priority.GENERATION))
                 for pending in pending_gen:
                     cluster_id = pending.request.cluster_id
                     pipeline_id, cluster_name = parse_cluster_id(cluster_id)
                     if cluster_name != "actor_infer":
                         continue
-                    if inactive_dp_workers.get(pipeline_id):
-                        continue
+                    # Signal when any dp worker is active (partial allocation is valid).
                     if not active_dp_workers.get(pipeline_id):
                         continue
                     plan.signal_pending_allocation_ops.append(
