@@ -39,7 +39,7 @@ from roll.pipeline.agentic.utils import (
     get_agentic_response_level_mask,
 )
 from rlix.pipeline.full_finetune_pipeline import RlixFullFinetunePipeline
-from rlix.pipeline.utils import _get_env_timeout_s
+from rlix.pipeline.utils import parse_env_timeout_s, validate_resize_params
 from roll.utils.dynamic_batching import dynamic_batching_shard
 from roll.utils.functionals import (
     agg_loss,
@@ -342,7 +342,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
         self._ensure_initialized()
         logger.info(f"Starting RlixMultiLoraPipeline run: {self._pipeline_id}")
 
-        rollout_get_batch_timeout_s = _get_env_timeout_s("ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S", 1800.0)
+        rollout_get_batch_timeout_s = parse_env_timeout_s("ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S", 1800.0)
 
         # Build ordered lora + tag lists (insertion-order dedup via dict.fromkeys).
         loras: List[str] = list(dict.fromkeys(self._tag_to_lora.values()))
@@ -772,12 +772,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
     def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
         """Rlix hook for per-tag scheduler shrink/expand."""
         self._ensure_initialized()
-        if not isinstance(dp_ranks_to_remove, list):
-            raise ValueError("dp_ranks_to_remove must be list[int]")
-        if not isinstance(dp_ranks_to_add, list):
-            raise ValueError("dp_ranks_to_add must be list[int]")
-        if bool(dp_ranks_to_remove) == bool(dp_ranks_to_add):
-            raise ValueError("Exactly one of dp_ranks_to_remove or dp_ranks_to_add must be non-empty")
+        validate_resize_params(dp_ranks_to_remove, dp_ranks_to_add)
 
         if dp_ranks_to_remove:
             self._shrink_all_schedulers(dp_ranks_to_remove=list(dp_ranks_to_remove))

@@ -122,27 +122,19 @@ class ResourceManager:
 
 
 def get_or_create_resource_manager(*, name: str = RESOURCE_MANAGER_ACTOR_NAME, namespace: str = RLIX_NAMESPACE):
-    try:
-        return ray.get_actor(name, namespace=namespace)
-    except ValueError:
-        pass
-
     strategy = head_node_affinity_strategy(soft=False)
 
     @ray.remote(num_cpus=0, max_restarts=0, max_task_retries=0)
     class _ResourceManagerActor(ResourceManager):
         pass
 
-    try:
-        return (
-            _ResourceManagerActor.options(
-                name=name,
-                namespace=namespace,
-                scheduling_strategy=strategy,
-                max_restarts=0,
-                max_task_retries=0,
-            )
-            .remote()
-        )
-    except Exception:
-        return ray.get_actor(name, namespace=namespace)
+    # get_if_exists=True: Ray returns the existing actor if already created,
+    # avoiding manual race handling for concurrent creation attempts.
+    return _ResourceManagerActor.options(
+        name=name,
+        namespace=namespace,
+        scheduling_strategy=strategy,
+        max_restarts=0,
+        max_task_retries=0,
+        get_if_exists=True,
+    ).remote()

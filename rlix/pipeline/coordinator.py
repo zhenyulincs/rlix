@@ -12,6 +12,7 @@ import ray
 
 from rlix.protocol.coordinator import Coordinator
 from rlix.protocol.request_id import validate_pipeline_id
+from rlix.pipeline.utils import validate_resize_params
 from rlix.protocol.types import (
     ActionResponse,
     get_pipeline_namespace,
@@ -20,6 +21,11 @@ from rlix.protocol.types import (
     SCHEDULER_ACTOR_NAME,
     RLIX_NAMESPACE,
 )
+from rlix.utils.ray_actors import get_actor_or_raise
+
+# Max concurrent RPCs on the pipeline actor (resize + run can overlap).
+# Keep small: Ray uses a thread pool for sync actors; huge values hit thread limits.
+_PIPELINE_ACTOR_MAX_CONCURRENCY: int = 32
 
 
 def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[str, str]:
@@ -197,13 +203,10 @@ class RlixCoordinator(Coordinator):
         self._scheduler_reports: Dict[str, ProgressReport] = {}
         self._coord_progress_last_bucket: Optional[int] = None
         # Resolve rlix scheduler handle for forwarding aggregated progress.
-        try:
-            self._rlix_scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=RLIX_NAMESPACE)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to resolve {SCHEDULER_ACTOR_NAME!r} in namespace {RLIX_NAMESPACE!r}. "
-                "RlixCoordinator requires the central scheduler actor to exist at startup."
-            ) from exc
+        self._rlix_scheduler = get_actor_or_raise(
+            SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE,
+            error_context="RlixCoordinator requires the central scheduler actor to exist at startup.",
+        )
 
         # Driver is responsible for:
         # - orchestrator.allocate_pipeline_id()
@@ -237,9 +240,7 @@ class RlixCoordinator(Coordinator):
             get_if_exists=True,
             max_restarts=0,
             max_task_retries=0,
-            # Critical: allow resize RPCs to run while `run()` is in-flight.
-            # Keep this small: Ray uses a thread pool for sync actors; huge values can hit thread limits.
-            max_concurrency=32,
+            max_concurrency=_PIPELINE_ACTOR_MAX_CONCURRENCY,
             runtime_env={"env_vars": self._pipeline_env_vars},
             # Schedule pipeline actor inside node-0's placement group bundle so that Ray
             # sets CUDA_VISIBLE_DEVICES correctly (needed for checkpoint RNG state saving).
@@ -364,15 +365,10 @@ class RlixCoordinator(Coordinator):
                 # All infer workers preempted/sleeping; expand_worker syncs on next wake.
                 return
             model_update_service_name = f"{self._pipeline_id}_model_update_service"
-            try:
-                model_update_service = ray.get_actor(
-                    model_update_service_name, namespace=self._ray_namespace
-                )
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to resolve ModelUpdateService {model_update_service_name!r} "
-                    f"in namespace {self._ray_namespace!r}"
-                ) from e
+            model_update_service = get_actor_or_raise(
+                model_update_service_name, self._ray_namespace,
+                error_context=f"ModelUpdateService required for pipeline_id={self._pipeline_id!r}.",
+            )
             ray.get(model_update_service.sync_selected_workers.remote(
                 active_ranks, adapters_to_sync=list(loras_to_sync),
                 verify=self._verify_model_after_sync,
@@ -393,24 +389,16 @@ class RlixCoordinator(Coordinator):
         requests continue on remaining ranks. Shrink-to-zero and expand-from-zero are handled internally via
         need_suspend/resume().
         """
-        if not isinstance(dp_ranks_to_remove, list):
-            raise ValueError("dp_ranks_to_remove must be list[int]")
-        if not isinstance(dp_ranks_to_add, list):
-            raise ValueError("dp_ranks_to_add must be list[int]")
-        if bool(dp_ranks_to_remove) == bool(dp_ranks_to_add):
-            raise ValueError("Exactly one of dp_ranks_to_remove or dp_ranks_to_add must be non-empty")
+        validate_resize_params(dp_ranks_to_remove, dp_ranks_to_add)
 
         with self._resize_sync_lock:
             # NOTE: coordinator does not coordinate train/val request schedulers directly; it delegates to the
             # per-pipeline pipeline actor (single serialization boundary owned by pipeline runtime).
             resize_actor_name = f"{PIPELINE_ACTOR_NAME_PREFIX}{self._pipeline_id}"
-            try:
-                resize_actor = ray.get_actor(resize_actor_name, namespace=self._ray_namespace)
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to resolve pipeline actor {resize_actor_name!r} in namespace {self._ray_namespace!r} "
-                    f"for pipeline_id={self._pipeline_id!r}"
-                ) from e
+            resize_actor = get_actor_or_raise(
+                resize_actor_name, self._ray_namespace,
+                error_context=f"Pipeline actor required for resize_infer, pipeline_id={self._pipeline_id!r}.",
+            )
 
             ref = resize_actor.resize_infer.remote(
                 dp_ranks_to_remove=list(dp_ranks_to_remove),

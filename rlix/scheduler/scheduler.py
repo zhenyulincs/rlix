@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 from rlix.protocol.request_id import validate_pipeline_id
 from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, get_pipeline_namespace, ORCHESTRATOR_ACTOR_NAME, Priority, ProgressReport, RLIX_NAMESPACE
+from rlix.utils.ray_actors import get_actor_or_raise
 from rlix.scheduler.state import SchedulerState
 from rlix.scheduler.types import (
     ClusterAllocation,
@@ -65,6 +66,12 @@ _PRIORITY_SHORT = {
     Priority.VALUE_COMPUTE: "VAL",
     Priority.GENERATION: "GEN",
 }
+
+# Queue tracing: max slice tracks before disabling new queue slice creation.
+_QUEUE_TRACK_CAP: int = 1000
+# Gap-ratio generation planning iteration limits (safety bounds).
+_MAX_GAP_ITERATIONS: int = 10_000
+_MAX_GAP_ACTIVATIONS: int = 1_000
 
 
 def _validate_and_canonicalize_device_mapping(
@@ -151,27 +158,6 @@ class _GapRatioPipelineState:
     target_gpu_count: int = 0
 
 
-@dataclass(slots=True)
-class _GPUAllocTraceContext:
-    """Context for an active GPU allocation trace slice.
-
-    Stored in _gpu_contexts dict keyed by gpu_id.
-    Used for debugging and future features (e.g., duration tracking).
-
-    NOTE: Currently stored but not read - reserved for:
-    - Duration calculation in _end_gpu_trace
-    - Validation of end/start matching
-    - Label updates mid-slice (if needed)
-    """
-
-    pipeline_id: str
-    cluster_id: str
-    priority: Priority
-    alloc_type: str  # "initial" | "proactive"
-    dp_ranks: Optional[List[int]] = None  # Generation clusters only
-    lora_name: Optional[str] = None  # Training clusters only
-
-
 @dataclass(frozen=True, slots=True)
 class _GPUTraceInfo:
     """Per-GPU context snapshot needed to open or close a Perfetto trace slice.
@@ -194,7 +180,7 @@ class _QueueSubGroup:
     This wrapper holds GroupTrack's internal uuid and parent handles and calls _create_track
     directly (same private method Group.create_track uses) to pass an explicit name.
 
-    Source pattern: _GPUAllocTraceContext in scheduler.py
+    Source pattern: _QueueSubGroup wraps GroupTrack for named track creation
     """
 
     # GroupTrack internal handles — accessed via gt._uuid and gt._parent after create_group()
@@ -234,7 +220,6 @@ class SchedulerImpl:
     _trace_file_path: Optional[str] = field(init=False, default=None)
     _scheduler_group: Optional["Group"] = field(init=False, default=None)
     _gpu_tracks: Dict[int, "NormalTrack"] = field(init=False, default_factory=dict)
-    _gpu_contexts: Dict[int, _GPUAllocTraceContext] = field(init=False, default_factory=dict)
     _trace_last_flush_ns: int = field(init=False, default=0)  # Throttled flush state
     _trace_flush_interval_ns: int = field(init=False, default=1_000_000_000)  # 1 second
     _trace_shutdown_started: bool = field(init=False, default=False)  # Shutdown guard for idempotency
@@ -245,9 +230,6 @@ class SchedulerImpl:
     _queue_counter_tracks: Dict[str, "CounterTrack"] = field(
         init=False, default_factory=dict
     )  # priority_key -> counter track
-    _queue_depth: Dict[str, int] = field(
-        init=False, default_factory=dict
-    )  # priority_key -> depth (debug-only, may diverge from trace)
     _queue_track_count: int = field(
         init=False, default=0
     )  # Total slice tracks created (for cap enforcement)
@@ -387,9 +369,6 @@ class SchedulerImpl:
         self._queue_groups[key] = sub_group
         return sub_group
 
-    # Queue Tracing: Constants
-    _QUEUE_TRACK_CAP: int = 1000  # Max slice tracks before disabling queue slice creation
-
     def _get_or_create_queue_counter_track(self, priority: Priority) -> Optional["CounterTrack"]:
         """Get or create counter track for queue depth. Returns None on failure."""
         key = _PRIORITY_SHORT.get(priority, priority.name[:3])
@@ -487,11 +466,11 @@ class SchedulerImpl:
         When cap is exceeded, counter tracks still work but slice tracks are skipped.
         """
         # Check cap BEFORE creating
-        if self._queue_track_count >= self._QUEUE_TRACK_CAP:
+        if self._queue_track_count >= _QUEUE_TRACK_CAP:
             # Log once when cap first hit
-            if self._queue_track_count == self._QUEUE_TRACK_CAP:
+            if self._queue_track_count == _QUEUE_TRACK_CAP:
                 logging.getLogger(__name__).warning(
-                    f"Queue slice track cap ({self._QUEUE_TRACK_CAP}) reached. "
+                    f"Queue slice track cap ({_QUEUE_TRACK_CAP}) reached. "
                     "Subsequent queue slices will not be traced (counters continue)."
                 )
             self._queue_track_count += 1  # Increment to avoid repeated warnings
@@ -555,7 +534,6 @@ class SchedulerImpl:
         counter_track = self._get_or_create_queue_counter_track(priority)
         if counter_track:
             depth = len(self._state.pending_bucket(priority))
-            self._queue_depth[key] = depth  # Debug-only cache
             self._safe_trace(counter_track.count, now_ns, depth)
 
     def _trace_queue_slice_close(self, cluster_id: str) -> None:
@@ -606,7 +584,6 @@ class SchedulerImpl:
 
         counter_track = self._get_or_create_queue_counter_track(priority)
         if counter_track:
-            self._queue_depth[key] = depth  # Debug-only cache
             self._safe_trace(counter_track.count, now_ns, depth)
 
     def _trace_active_gpus_update(self) -> None:
@@ -838,9 +815,7 @@ class SchedulerImpl:
         # Step 3: Clear all trace state before flush
         # NormalTrack holds parent generator refs - must clear to prevent writes after flush
         self._gpu_tracks.clear()
-        self._gpu_contexts.clear()
         self._queue_counter_tracks.clear()
-        self._queue_depth.clear()
         self._queue_groups.clear()  # wrapper refs hold _parent (TraceGenerator) — must clear
         self._active_gpus_counter = None
         self._scheduler_group = None
@@ -896,19 +871,8 @@ class SchedulerImpl:
             cluster_id, pipeline_id, priority, alloc_type, dp_ranks, lora_name
         )
 
-        # Open slice - ONLY store context on success
-        ok, _ = self._safe_trace_call(track.open, time.time_ns(), label)
-        if not ok:
-            return
-
-        self._gpu_contexts[gpu_id] = _GPUAllocTraceContext(
-            pipeline_id=pipeline_id,
-            cluster_id=cluster_id,
-            priority=priority,
-            alloc_type=alloc_type,
-            dp_ranks=dp_ranks,
-            lora_name=lora_name,
-        )
+        # Open slice
+        self._safe_trace_call(track.open, time.time_ns(), label)
 
     def _end_gpu_trace(self, gpu_id: int) -> None:
         """End a trace slice for GPU release.
@@ -919,7 +883,6 @@ class SchedulerImpl:
         if not self._enable_gpu_tracing:
             return
 
-        self._gpu_contexts.pop(gpu_id, None)
         track = self._gpu_tracks.get(gpu_id)
         if track:
             self._safe_trace(track.close, time.time_ns())
@@ -1775,12 +1738,10 @@ class SchedulerImpl:
                 return cached_handle
 
         coordinator_name = f"{COORDINATOR_ACTOR_NAME_PREFIX}{pipeline_id}"
-        try:
-            handle = ray.get_actor(coordinator_name, namespace=coordinator_namespace)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to resolve coordinator actor {coordinator_name!r} in namespace {coordinator_namespace!r} for pipeline_id {pipeline_id!r}"
-            ) from e
+        handle = get_actor_or_raise(
+            coordinator_name, coordinator_namespace,
+            error_context=f"Coordinator required for pipeline_id={pipeline_id!r}.",
+        )
 
         self._coordinator_handle_cache[pipeline_id] = (coordinator_namespace, handle)
         return handle
@@ -2266,7 +2227,7 @@ class SchedulerImpl:
         activations = 0
         while True:
             iterations += 1
-            if iterations > 10_000 or activations > 1_000:
+            if iterations > _MAX_GAP_ITERATIONS or activations > _MAX_GAP_ACTIVATIONS:
                 raise RuntimeError("gap_ratio_generation_planning_exceeded_limits")
 
             _update_gaps()

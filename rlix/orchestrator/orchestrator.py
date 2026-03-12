@@ -20,6 +20,16 @@ from rlix.utils.ray_head import get_head_node_id
 from rlix.utils.ray_head import head_node_affinity_strategy
 import ray
 
+# Timeouts for orchestrator operations (seconds).
+_RESOURCE_SNAPSHOT_TIMEOUT_S: float = 10.0
+_RESOURCE_SNAPSHOT_POLL_S: float = 0.2
+_WORKER_STOP_TIMEOUT_S: float = 10.0
+_POST_STOP_SETTLE_S: float = 0.2
+_UNNAMED_ACTOR_CLEANUP_TIMEOUT_S: float = 10.0
+_SCHEDULER_FLUSH_TIMEOUT_S: float = 0.5
+# 12 hex chars = 48 bits of entropy; unique enough for any realistic cluster size.
+_PIPELINE_ID_RANDOM_HEX_LEN: int = 12
+
 
 @dataclass(frozen=True, slots=True)
 class RegisterResponse:
@@ -53,35 +63,27 @@ def _kill_local_ray() -> None:
 
 
 def _ensure_scheduler_singleton(env_vars: Optional[Dict[str, str]] = None):
-    try:
-        return ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=RLIX_NAMESPACE)
-    except ValueError:
-        pass
-
     strategy = head_node_affinity_strategy(soft=False)
     SchedulerActor = scheduler_actor_class()
     # Thread-limiting env vars for the scheduler actor process.
     scheduler_runtime_env = {"env_vars": env_vars} if env_vars else {}
-    try:
-        scheduler = (
-            SchedulerActor.options(
-                name=SCHEDULER_ACTOR_NAME,
-                namespace=RLIX_NAMESPACE,
-                scheduling_strategy=strategy,
-                max_restarts=0,
-                max_task_retries=0,
-                runtime_env=scheduler_runtime_env,
-            )
-            .remote()
-        )
-    except Exception:
-        scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=RLIX_NAMESPACE)
+    # get_if_exists=True: Ray returns the existing actor if already created,
+    # avoiding manual race handling for concurrent creation attempts.
+    scheduler = SchedulerActor.options(
+        name=SCHEDULER_ACTOR_NAME,
+        namespace=RLIX_NAMESPACE,
+        scheduling_strategy=strategy,
+        max_restarts=0,
+        max_task_retries=0,
+        runtime_env=scheduler_runtime_env,
+        get_if_exists=True,
+    ).remote()
 
     try:
         resource_manager = get_or_create_resource_manager()
         # Admission control / topology gating happens here (orchestrator-owned).
         # Scheduler only seeds its idle_gpus from the resource manager after this is ready.
-        ray.get(resource_manager.snapshot.remote(wait_timeout_s=10.0, poll_interval_s=0.2))
+        ray.get(resource_manager.snapshot.remote(wait_timeout_s=_RESOURCE_SNAPSHOT_TIMEOUT_S, poll_interval_s=_RESOURCE_SNAPSHOT_POLL_S))
         # Default: infer GPUs-per-node from Ray topology (portable for local smoke tests).
         # If set, this env var pins a stricter topology contract and must match observation.
         required_gpus_per_node_raw = os.environ.get("RLIX_REQUIRED_GPUS_PER_NODE")
@@ -113,7 +115,7 @@ def _kill_ray_on_node(node_ip: str):
     return _kill_local_ray_task.options(resources={f"node:{node_ip}": 0.01}).remote()
 
 
-def _force_stop_cluster_workers_first(*, timeout_s: float = 10.0) -> None:
+def _force_stop_cluster_workers_first(*, timeout_s: float = _WORKER_STOP_TIMEOUT_S) -> None:
     head_node_id = get_head_node_id()
     nodes = ray.nodes()
     alive_nodes = [n for n in nodes if n.get("Alive")]
@@ -130,7 +132,7 @@ def _force_stop_cluster_workers_first(*, timeout_s: float = 10.0) -> None:
     if worker_tasks:
         ray.wait(worker_tasks, timeout=timeout_s, num_returns=len(worker_tasks))
 
-    time.sleep(0.2)
+    time.sleep(_POST_STOP_SETTLE_S)
     _kill_local_ray()
 
 
@@ -156,8 +158,7 @@ class Orchestrator:
         The prefix ("ft_" or "lora_") makes the pipeline type visible in Perfetto trace labels.
         """
         while True:
-            # 12 hex chars = 48 bits of entropy; unique enough for any realistic cluster size.
-            pipeline_id = f"{pipeline_type}_{uuid.uuid4().hex[:12]}"
+            pipeline_id = f"{pipeline_type}_{uuid.uuid4().hex[:_PIPELINE_ID_RANDOM_HEX_LEN]}"
             validate_pipeline_id(pipeline_id)
             if pipeline_id not in self._pipelines:
                 return pipeline_id
@@ -273,14 +274,14 @@ class Orchestrator:
             )
 
         # Unnamed actors: assume temporary and wait briefly for natural teardown.
-        deadline = time.time() + 10.0
+        deadline = time.time() + _UNNAMED_ACTOR_CLEANUP_TIMEOUT_S
         while True:
             unnamed_alive = _list_alive_actors(name_filter="")
             if not unnamed_alive:
                 break
             if time.time() >= deadline:
                 break
-            time.sleep(0.2)
+            time.sleep(_POST_STOP_SETTLE_S)
 
         unnamed_alive = _list_alive_actors(name_filter="")
         if unnamed_alive:
@@ -347,7 +348,7 @@ class Orchestrator:
         # 0.5s is enough for flush() under normal conditions, but won't stall on dead actors
         try:
             shutdown_ref = self._scheduler.shutdown.remote()
-            ray.wait([shutdown_ref], timeout=0.5)
+            ray.wait([shutdown_ref], timeout=_SCHEDULER_FLUSH_TIMEOUT_S)
         except Exception:
             pass  # Best-effort, don't stall shutdown
 

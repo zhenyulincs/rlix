@@ -12,7 +12,8 @@ from codetiming import Timer
 
 from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, ActionResponse, get_pipeline_namespace, Priority, SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE
 
-from rlix.pipeline.utils import _get_env_timeout_s
+from rlix.pipeline.utils import parse_env_timeout_s, validate_resize_params
+from rlix.utils.ray_actors import get_actor_or_raise
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_pipeline import AgenticPipeline
@@ -57,17 +58,11 @@ class RlixFullFinetunePipeline(AgenticPipeline):
         self._initialized = False
         # Ray actor can run with max_concurrency>1; guard init so resize/run can't race it.
         self._init_lock = threading.Lock()
-        try:
-            self._rlix_scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=RLIX_NAMESPACE)
-        except Exception as e:
-            # Expectation: the central rlix scheduler actor ('rlix:scheduler')
-            # must already be created before the pipeline is instantiated.
-            # Fail loudly with a clear message to aid debugging of startup ordering.
-            raise RuntimeError(
-                f"Failed to resolve {SCHEDULER_ACTOR_NAME} in namespace '{RLIX_NAMESPACE}'. "
-                "The pipeline expects the central scheduler actor to be present before startup; "
-                "ensure the orchestrator created it earlier or that startup ordering is correct."
-            ) from e
+        self._rlix_scheduler = get_actor_or_raise(
+            SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE,
+            error_context="The pipeline expects the central scheduler actor to be present before startup; "
+            "ensure the orchestrator created it earlier or that startup ordering is correct.",
+        )
         self._actor_infer_cluster_id = f"{self._pipeline_id}_actor_infer"
         self._actor_train_cluster_id = f"{self._pipeline_id}_actor_train"
         self._critic_cluster_id = f"{self._pipeline_id}_critic"
@@ -85,12 +80,10 @@ class RlixFullFinetunePipeline(AgenticPipeline):
             return self._coordinator_handle
         namespace = get_pipeline_namespace(self._pipeline_id)
         actor_name = f"{COORDINATOR_ACTOR_NAME_PREFIX}{self._pipeline_id}"
-        try:
-            self._coordinator_handle = ray.get_actor(actor_name, namespace=namespace)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to resolve coordinator actor {actor_name!r} in namespace {namespace!r}"
-            ) from e
+        self._coordinator_handle = get_actor_or_raise(
+            actor_name, namespace,
+            error_context=f"Coordinator required for pipeline_id={self._pipeline_id!r}.",
+        )
         return self._coordinator_handle
 
     def initialize_pipeline(self) -> ActionResponse:
@@ -516,13 +509,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
         return allocated
 
     def _notify_ready_to_release_actor_infer(self, *, global_step: int) -> List[int]:
-        timeout_s_raw = os.environ.get("RLIX_NOTIFY_READY_TIMEOUT_S", "300")
-        try:
-            timeout_s = float(timeout_s_raw)
-        except ValueError as e:
-            raise RuntimeError(f"Invalid RLIX_NOTIFY_READY_TIMEOUT_S={timeout_s_raw!r}") from e
-        if timeout_s <= 0:
-            raise RuntimeError(f"RLIX_NOTIFY_READY_TIMEOUT_S must be > 0, got {timeout_s!r}")
+        timeout_s = parse_env_timeout_s("RLIX_NOTIFY_READY_TIMEOUT_S", 300.0)
 
         released = ray.get(
             self._rlix_scheduler.notify_ready_to_release.remote(
@@ -562,7 +549,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
 
         # RLix: timeouts for notify/gpu-request are managed internally by RLix methods.
         # RLix: model_update() removed — weights are promoted via promote_active_checkpoint after actor training.
-        rollout_get_batch_timeout_s = _get_env_timeout_s("ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S", 1800.0)
+        rollout_get_batch_timeout_s = parse_env_timeout_s("ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S", 1800.0)
 
         
         batch = DataProto()
@@ -916,12 +903,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
 
     def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
         self._ensure_initialized()
-        if not isinstance(dp_ranks_to_remove, list):
-            raise ValueError("dp_ranks_to_remove must be list[int]")
-        if not isinstance(dp_ranks_to_add, list):
-            raise ValueError("dp_ranks_to_add must be list[int]")
-        if bool(dp_ranks_to_remove) == bool(dp_ranks_to_add):
-            raise ValueError("Exactly one of dp_ranks_to_remove or dp_ranks_to_add must be non-empty")
+        validate_resize_params(dp_ranks_to_remove, dp_ranks_to_add)
 
         if dp_ranks_to_remove:
             self._shrink_workers(dp_ranks_to_remove=list(dp_ranks_to_remove))
