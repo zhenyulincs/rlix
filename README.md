@@ -2,7 +2,7 @@
 
 <img src="assets/rlix-logo-text.svg" width="40%" alt="RLix Logo">
 
-<h3>GPU time-sharing for concurrent LLM RL</h3>
+<h3>A control plane for concurrent LLM RL on shared GPUs</h3>
 
 <p>
   <a href="https://github.com/rlops/rlix/blob/main/LICENSE">
