@@ -1,0 +1,302 @@
+{
+  "repo_notes": [
+    {
+      "content": "A control plane for concurrent LLM RL on shared GPUs"
+    }
+  ],
+  "pages": [
+    {
+      "title": "Overview",
+      "purpose": "Introduce RLix, explain its purpose as a Ray-based control plane for concurrent LLM RL training with GPU time-sharing, and provide a high-level architectural summary",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "What is RLix?",
+      "purpose": "Explain the problem RLix solves (underutilized GPUs during RL rollouts), core value proposition (multi-pipeline GPU time-sharing), and key features",
+      "parent": "Overview",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Architecture at a Glance",
+      "purpose": "Present high-level system architecture diagrams showing Control Plane, Pipelines, GPU Clusters, and their relationships",
+      "parent": "Overview",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Key Concepts",
+      "purpose": "Define fundamental terminology: pipelines, coordinators, GPU time-sharing, priority-based scheduling, LoRA adapters, rollout workers, and scheduling stages",
+      "parent": "Overview",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Getting Started",
+      "purpose": "Guide users through initial setup, running their first pipeline, and understanding basic configuration",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Installation and Setup",
+      "purpose": "Cover dependencies, Ray cluster setup, environment variables, and initial configuration requirements",
+      "parent": "Getting Started",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Quick Start Example",
+      "purpose": "Walk through running start_multi_pipeline_test.py, explain the initialization sequence, and show expected output",
+      "parent": "Getting Started",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Configuration Basics",
+      "purpose": "Introduce Hydra configuration files, explain cluster_tp_configs and cluster_device_mappings, and show basic pipeline config structure",
+      "parent": "Getting Started",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Control Plane",
+      "purpose": "Document the singleton control plane components (Orchestrator, Scheduler, ResourceManager) that manage all pipelines",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Orchestrator",
+      "purpose": "Explain Orchestrator's role in pipeline lifecycle management: allocate_pipeline_id, register_pipeline, admit_pipeline, kill_pipeline, shutdown",
+      "parent": "Control Plane",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Scheduler",
+      "purpose": "Document SchedulerImpl's priority-based GPU allocation, request/release APIs, pending request queuing, and central scheduling loop",
+      "parent": "Control Plane",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Resource Manager",
+      "purpose": "Explain ResourceManager's role in GPU topology validation, cluster resource snapshots, and gpus-per-node enforcement",
+      "parent": "Control Plane",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Pipeline Registration Flow",
+      "purpose": "Detail the complete pipeline registration sequence: ID allocation → registration → topology validation → admission",
+      "parent": "Control Plane",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Pipeline Coordination",
+      "purpose": "Document the PipelineCoordinator actor's role in managing individual pipelines and coordinating with the control plane",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "PipelineCoordinator Actor",
+      "purpose": "Explain PipelineCoordinator's initialization, configuration validation (CPU-only reward, vLLM sleep_level, offload_nccl), and environment variable injection",
+      "parent": "Pipeline Coordination",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Progress Reporting",
+      "purpose": "Document how PipelineCoordinator aggregates progress from sub-schedulers and reports to central Scheduler at 2% cadence",
+      "parent": "Pipeline Coordination",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Resize and Sync Coordination",
+      "purpose": "Explain how PipelineCoordinator serializes resize_infer and sync_lora_weights operations using locks to prevent race conditions",
+      "parent": "Pipeline Coordination",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Pipeline Actor Creation",
+      "purpose": "Detail how PipelineCoordinator determines pipeline type (LoRA vs full finetune), injects environment variables, and creates the pipeline actor",
+      "parent": "Pipeline Coordination",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Pipeline Implementations",
+      "purpose": "Document the two pipeline implementations: RollFullFinetunePipeline for full finetuning and RollMultiLoraPipeline for multi-LoRA training",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "RollFullFinetunePipeline",
+      "purpose": "Explain full finetune pipeline's training loop, GPU request/release cycle, and integration with Rlix scheduler",
+      "parent": "Pipeline Implementations",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "RollMultiLoraPipeline",
+      "purpose": "Document multi-LoRA pipeline's per-tag schedulers, first-ready dispatch model, isolated optimizers, and independent step tracking",
+      "parent": "Pipeline Implementations",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "GPU Cluster Components",
+      "purpose": "Describe the five cluster types: actor_train, actor_infer, critic, reference, reward, and their roles in the RL pipeline",
+      "parent": "Pipeline Implementations",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Training Loop Phases",
+      "purpose": "Detail the sequential phases in the training loop: expand → rollout → shrink → old log probs → advantage → training → sync",
+      "parent": "Pipeline Implementations",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "GPU Resource Management",
+      "purpose": "Explain how RLix achieves GPU time-sharing through priority-based scheduling, elastic workers, and background rebalancing",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Scheduling Priorities",
+      "purpose": "Document the six priority levels (0-6), explain which stages are preemptable, and how priority determines GPU allocation",
+      "parent": "GPU Resource Management",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "GPU Allocation Strategies",
+      "purpose": "Contrast full device_mapping allocation for training clusters vs gap-ratio DP allocation for generation clusters",
+      "parent": "GPU Resource Management",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Elastic Rollout Workers",
+      "purpose": "Explain how actor_infer workers expand onto idle GPUs and shrink when higher-priority stages need capacity",
+      "parent": "GPU Resource Management",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Background Rebalancing",
+      "purpose": "Document the demand-driven rebalancing mechanism that redistributes generation workers based on progress reports and demand/GPU imbalance",
+      "parent": "GPU Resource Management",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Two-Level GPU Sharing",
+      "purpose": "Explain cross-pipeline sharing (elastic expand/shrink) and within-pipeline sharing (multi-LoRA adapters on shared base model)",
+      "parent": "GPU Resource Management",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Model Synchronization",
+      "purpose": "Document the ModelUpdateService's selective weight sync mechanism for pushing trained weights to inference workers",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    }
+  ]
+}creation.
