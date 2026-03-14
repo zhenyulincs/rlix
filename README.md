@@ -24,12 +24,13 @@
 
 </div>
 
-In agentic RL, long-horizon rollouts are increasingly long-tailed: a small number of stragglers dominate wall-clock time while many GPUs sit underutilized. 
+In agentic RL, long-horizon rollouts are increasingly long-tailed: a small number of stragglers dominate wall-clock time while many GPUs sit underutilized.
 
-RLix addresses this by time-sharing GPUs across concurrent RL training jobs, expanding rollout workers onto temporarily idle capacity and shrinking them when that capacity is needed elsewhere. RLix does not change pipeline-level training semantics: each recipe retains its original behavior, whether on-policy or off-policy with user-configured staleness bounds, while delivering much higher GPU utilization.
+RLix addresses this by time-sharing GPUs across concurrent RL training jobs, expanding rollout workers onto temporarily idle capacity and shrinking them when that capacity is needed elsewhere. RLix does not change pipeline-level training semantics: each recipe retains its original behavior, whether on-policy or off-policy under staleness bounds, while delivering much higher GPU utilization.
 
-RLix builds on **Partial Overlapping** scheduling from [ROLL](https://github.com/alibaba/ROLL) and extends it with a distributed control plane for coordinating multiple independent training jobs on a shared GPU cluster.
+RLix builds on **Partial Overlapping** scheduling from [**Alibaba/ROLL**](https://github.com/alibaba/ROLL) and extends it with a distributed control plane for coordinating multiple independent training jobs on a shared GPU cluster.
 
+RLix is an AI-native project, with AI deeply involved across design, planning, implementation, testing, and code review, alongside human oversight. Correctness, code quality, and maintainability remain first-class concerns.
 ## Features
 
 - **Recipe-Transparent Scheduling**: Training logic stays fully decoupled from GPU scheduling, so each pipeline can be developed in isolation.
