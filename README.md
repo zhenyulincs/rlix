@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/rlix-logo-text.svg" width="40%" alt="RLix Logo">
+<img src="assets/rlix-logo-text-horizontal.svg" width="40%" alt="RLix Logo">
 
 <h3>A control plane for concurrent LLM RL on shared GPUs</h3>
 
