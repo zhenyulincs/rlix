@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 import os
 import time
 from typing import Any, Dict, List, Optional
 
-import numpy as np
 import ray
 import torch
 from codetiming import Timer
@@ -28,10 +26,7 @@ from roll.pipeline.agentic.utils import (
 )
 from roll.utils.dynamic_batching import dynamic_batching_shard
 from roll.utils.functionals import (
-    agg_loss,
-    batch_balance,
     compute_token_reward,
-    masked_mean,
     reduce_metrics,
 )
 from roll.utils.logging import get_logger
@@ -231,14 +226,6 @@ class RollFullFinetunePipeline(AgenticPipeline):
                 runtime_env={"env_vars": rlix_env_vars()},
             ).remote()
 
-            # Infer resize serialization boundary.
-            infer_strategy_config = self.actor_infer.worker_config.strategy_args.strategy_config
-            tp_size = int(infer_strategy_config.get("tensor_parallel_size", 1))
-            pp_size = int(infer_strategy_config.get("pipeline_parallel_size", 1))
-            self._infer_gpus_per_dp_rank = tp_size * pp_size
-            self._infer_device_mapping = list(getattr(self.pipeline_config.actor_infer, "device_mapping", None) or [])
-            if not self._infer_device_mapping:
-                raise RuntimeError("actor_infer.device_mapping must be set")
             self._infer_resize_lock = threading.Lock()
 
             # INIT PHASE: Initialize clusters with central scheduler coordination and strict offload ordering.
