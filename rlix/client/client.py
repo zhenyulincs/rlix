@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 from typing import Optional
 
-from rlix.orchestrator.orchestrator import AdmitResponse, Orchestrator
+from rlix.orchestrator.orchestrator import Orchestrator
 from rlix.protocol.types import ORCHESTRATOR_ACTOR_NAME, RLIX_NAMESPACE
 from rlix.utils.ray import head_node_affinity_strategy
 import ray
@@ -13,6 +12,8 @@ import ray
 
 @dataclass(frozen=True, slots=True)
 class ConnectOptions:
+    """Internal options bundle passed to ``_get_or_create_orchestrator``."""
+
     address: str = "auto"
     create_if_missing: bool = True
     backoff_s: tuple[float, ...] = (0.05, 0.1, 0.2, 0.4, 0.8)
@@ -25,14 +26,25 @@ def connect(
     address: str = "auto",
     env_vars: Optional[dict[str, str]] = None,
 ):
+    """Initialize Ray and return the Rlix orchestrator actor handle.
+
+    Exported as ``rlix.init()``. Initializes Ray if not already connected,
+    then gets or creates the singleton orchestrator actor on the head node.
+
+    Args:
+        create_if_missing: If True (default), create the orchestrator when it
+            does not exist. If False, raise if the actor is not found.
+        address: Ray cluster address. Defaults to ``"auto"``.
+        env_vars: Environment variables forwarded to the orchestrator and
+            scheduler actors via Ray ``runtime_env``.
+
+    Returns:
+        Ray actor handle for the orchestrator.
+    """
     if not ray.is_initialized():
         ray.init(address=address, namespace=RLIX_NAMESPACE, ignore_reinit_error=True, log_to_driver=True)
 
-    # Ray actors don't inherit the driver's environment. Snapshot the full driver env
-    # so Rlix actors (orchestrator, scheduler) see the same vars the driver sees.
-    # Explicit env_vars overrides take priority over the driver snapshot.
-    driver_env: dict[str, str] = {k: v for k, v in os.environ.items() if isinstance(v, str)}
-    opts = ConnectOptions(address=address, create_if_missing=create_if_missing, env_vars=driver_env)
+    opts = ConnectOptions(address=address, create_if_missing=create_if_missing, env_vars=env_vars)
     return _get_or_create_orchestrator(opts)
 
 
@@ -67,7 +79,3 @@ def _get_or_create_orchestrator(opts: ConnectOptions):
             except ValueError:
                 continue
     raise RuntimeError(f"Failed to create or get orchestrator actor {ORCHESTRATOR_ACTOR_NAME!r}")
-
-
-def admit_pipeline(*, orchestrator, pipeline_id: str) -> AdmitResponse:
-    return ray.get(orchestrator.admit_pipeline.remote(pipeline_id=pipeline_id))
