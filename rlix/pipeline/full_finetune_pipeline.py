@@ -10,7 +10,7 @@ import ray
 import torch
 from codetiming import Timer
 
-from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, ActionResponse, get_pipeline_namespace, Priority, SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE
+from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, ActionResponse, GENERATION_CLUSTER_NAME, get_pipeline_namespace, Priority, SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE
 
 from rlix.pipeline.utils import parse_env_timeout_s, validate_resize_params
 from rlix.utils.ray import get_actor_or_raise
@@ -63,7 +63,7 @@ class RollFullFinetunePipeline(AgenticPipeline):
             error_context="The pipeline expects the central scheduler actor to be present before startup; "
             "ensure the orchestrator created it earlier or that startup ordering is correct.",
         )
-        self._actor_infer_cluster_id = f"{self._pipeline_id}_actor_infer"
+        self._actor_infer_cluster_id = f"{self._pipeline_id}_{GENERATION_CLUSTER_NAME}"
         self._actor_train_cluster_id = f"{self._pipeline_id}_actor_train"
         self._critic_cluster_id = f"{self._pipeline_id}_critic"
         self._reference_cluster_id = f"{self._pipeline_id}_reference"

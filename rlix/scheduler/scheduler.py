@@ -22,7 +22,9 @@ import ray
 from rlix.protocol.validation import validate_pipeline_id
 from rlix.protocol.types import (
     COORDINATOR_ACTOR_NAME_PREFIX,
+    GENERATION_CLUSTER_NAME,
     ORCHESTRATOR_ACTOR_NAME,
+    REWARD_CLUSTER_NAME,
     RLIX_NAMESPACE,
     Priority,
     ProgressReport,
@@ -1096,8 +1098,8 @@ class SchedulerImpl:
             missing_tp = sorted(set(cluster_device_mappings.keys()) - set(cluster_tp_configs.keys()))
             missing_map = sorted(set(cluster_tp_configs.keys()) - set(cluster_device_mappings.keys()))
             raise ValueError(f"cluster config mismatch: missing tp_size for {missing_tp}, missing device_mapping for {missing_map}")
-        if "actor_infer" not in cluster_tp_configs:
-            raise ValueError("actor_infer cluster must be registered")
+        if GENERATION_CLUSTER_NAME not in cluster_tp_configs:
+            raise ValueError(f"{GENERATION_CLUSTER_NAME} cluster must be registered")
 
         cluster_configs: Dict[str, Dict[str, Any]] = {}
         used_gpus_by_cluster: Dict[str, Set[int]] = {}
@@ -1106,9 +1108,9 @@ class SchedulerImpl:
             if tp_size <= 0:
                 raise ValueError(f"tp_size must be > 0 for cluster {cluster_name!r}, got {tp_size!r}")
             device_mapping = list(cluster_device_mappings.get(cluster_name) or [])
-            if not device_mapping and cluster_name != "reward":
+            if not device_mapping and cluster_name != REWARD_CLUSTER_NAME:
                 raise ValueError(f"device_mapping must be non-empty for cluster {cluster_name!r}")
-            if cluster_name == "reward" and device_mapping:
+            if cluster_name == REWARD_CLUSTER_NAME and device_mapping:
                 # TODO: support GPU reward clusters (currently restricted to CPU-only).
                 raise ValueError("reward cluster only supports CPU-only mode: reward.device_mapping must be empty")
             if device_mapping and len(device_mapping) != len(set(device_mapping)):
@@ -1130,7 +1132,7 @@ class SchedulerImpl:
                     device_mapping=device_mapping,
                     required_gpus_per_node=int(self._required_gpus_per_node),
                 )
-            is_gen = cluster_name == "actor_infer"
+            is_gen = cluster_name == GENERATION_CLUSTER_NAME
             cfg: Dict[str, Any] = {"tp_size": tp_size, "is_generation": is_gen, "device_mapping": device_mapping}
             if is_gen:
                 cfg["max_dp_workers"] = len(device_mapping) // tp_size
@@ -1917,7 +1919,7 @@ class SchedulerImpl:
 
         planned_removed_ranks: Dict[str, Set[int]] = {}
         for pipeline_id in self._state.pipeline_registry:
-            cluster_id = f"{pipeline_id}_actor_infer"
+            cluster_id = f"{pipeline_id}_{GENERATION_CLUSTER_NAME}"
             planned_removed_ranks[cluster_id] = set()
         for op in plan.sched_guided_shrink_ops:
             if not is_generation_cluster(op.cluster_id):
@@ -1939,7 +1941,7 @@ class SchedulerImpl:
             if tp_size <= 0 or not device_mapping:
                 continue
 
-            cluster_id = f"{pipeline_id}_actor_infer"
+            cluster_id = f"{pipeline_id}_{GENERATION_CLUSTER_NAME}"
             all_dp_ranks = list(range(len(device_mapping) // tp_size))
             removed_ranks = planned_removed_ranks.get(cluster_id, set())
 
@@ -2012,7 +2014,7 @@ class SchedulerImpl:
 
         pipeline_states: List[_GapRatioPipelineState] = []
         for pipeline_id in self._state.pipeline_registry:
-            cluster_id = f"{pipeline_id}_actor_infer"
+            cluster_id = f"{pipeline_id}_{GENERATION_CLUSTER_NAME}"
             infer_cfg = self._state.pipeline_registry[pipeline_id].get("cluster_configs", {}).get("actor_infer")
             if infer_cfg is None:
                 raise KeyError(f"pipeline_id={pipeline_id!r} missing actor_infer cluster config")
@@ -2169,7 +2171,7 @@ class SchedulerImpl:
             new_idle_gpus = planned_available - needed_bundle
 
             for _, donor_worker, _ in donor_plan:
-                _append_shrink_dp_rank(cluster_id=f"{donor_worker.pipeline_id}_actor_infer", dp_rank=donor_worker.dp_rank)
+                _append_shrink_dp_rank(cluster_id=f"{donor_worker.pipeline_id}_{GENERATION_CLUSTER_NAME}", dp_rank=donor_worker.dp_rank)
                 _remove_worker(donor_worker)
                 protected.add((donor_worker.pipeline_id, donor_worker.dp_rank))
 
@@ -2457,7 +2459,7 @@ class SchedulerImpl:
             raise ValueError("Exactly one of pipeline_id or cluster_id must be provided")
         if cluster_id is None:
             validate_pipeline_id(str(pipeline_id))
-            cluster_id = f"{pipeline_id}_actor_infer"
+            cluster_id = f"{pipeline_id}_{GENERATION_CLUSTER_NAME}"
         if timeout_s is not None and (not isinstance(timeout_s, (int, float)) or timeout_s <= 0):
             raise ValueError(f"timeout_s must be > 0, got {timeout_s!r}")
 

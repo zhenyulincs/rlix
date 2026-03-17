@@ -1,3 +1,8 @@
+"""Scheduler-internal types and cluster_id utilities.
+
+Defines the data structures used within the scheduler's planning and execution loop:
+request/response types, execution plan operations, and cluster_id parsing.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -6,12 +11,16 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 from rlix.protocol.validation import validate_pipeline_id
-from rlix.protocol.types import Priority
+from rlix.protocol.types import GENERATION_CLUSTER_NAME, GPU_CLUSTER_NAMES, Priority
 
 
 @dataclass(slots=True)
 class ClusterAllocation:
-    """Active GPU allocation for a cluster_id (format: '{pipeline_id}_{cluster_name}')."""
+    """Active GPU allocation for a cluster (a pipeline's named compute group).
+
+    A cluster_id has the format ``{pipeline_id}_{cluster_name}`` where cluster_name
+    is one of: ``actor_train``, ``actor_infer``, ``critic``, ``reference``.
+    """
 
     cluster_id: str
     gpu_ids: List[int]
@@ -23,6 +32,12 @@ class ClusterAllocation:
 
 
 class ValidationError(RuntimeError):
+    """Raised when the execution plan violates a scheduler invariant.
+
+    Carries a ``condition`` number (which validation check failed) and a ``context``
+    dict for debugging. Both are included in the string representation.
+    """
+
     def __init__(
         self,
         message: str,
@@ -43,12 +58,16 @@ class ValidationError(RuntimeError):
 
 @dataclass(slots=True)
 class SchedGuidedShrinkOp:
+    """Instruction to remove DP ranks from a cluster (scheduler-initiated shrink)."""
+
     cluster_id: str
     dp_ranks_to_remove: List[int]
 
 
 @dataclass(slots=True)
 class SignalPendingAllocationOp:
+    """Instruction to satisfy a pending allocation request with specific GPUs."""
+
     cluster_id: str
     gpus_to_allocate: List[int]
     priority: Optional[Any] = None
@@ -57,6 +76,8 @@ class SignalPendingAllocationOp:
 
 @dataclass(slots=True)
 class SchedGuidedAllocationOp:
+    """Instruction to expand a cluster by adding DP ranks onto specific GPUs."""
+
     cluster_id: str
     dp_ranks_to_add: List[int]
     gpus_to_allocate: List[int]
@@ -65,6 +86,7 @@ class SchedGuidedAllocationOp:
 
 @dataclass(slots=True)
 class ExecutionPlan:
+    """The complete set of operations for one scheduling cycle."""
     sched_guided_shrink_ops: List[SchedGuidedShrinkOp] = field(default_factory=list)
     signal_pending_allocation_ops: List[SignalPendingAllocationOp] = field(default_factory=list)
     sched_guided_allocation_ops: List[SchedGuidedAllocationOp] = field(default_factory=list)
@@ -73,6 +95,8 @@ class ExecutionPlan:
 
 @dataclass(frozen=True, slots=True)
 class Request:
+    """Immutable descriptor for a GPU allocation or release request."""
+
     cluster_id: str
     priority: Priority
     timestamp: float
@@ -80,6 +104,12 @@ class Request:
 
 @dataclass(slots=True)
 class PendingRequest:
+    """A GPU allocation request awaiting fulfillment by the scheduler loop.
+
+    The caller awaits ``event``; the scheduler sets ``result`` (allocated GPU IDs)
+    or ``error`` before signaling.
+    """
+
     request: Request
     event: asyncio.Event
     global_step: Optional[int] = None
@@ -90,6 +120,11 @@ class PendingRequest:
 
 @dataclass(slots=True)
 class PendingPlannedReleaseRequest:
+    """A planned GPU release awaiting execution by the scheduler loop.
+
+    The caller awaits ``event``; the scheduler sets ``result_released_gpu_ids``
+    or ``error`` before signaling.
+    """
     cluster_id: str
     dp_ranks_to_remove: List[int]
     event: asyncio.Event
@@ -99,13 +134,15 @@ class PendingPlannedReleaseRequest:
 
 
 def is_generation_cluster(cluster_id: str) -> bool:
-    return cluster_id.endswith("_actor_infer")
+    """Return True if the cluster is a generation (rollout) cluster."""
+    return cluster_id.endswith(f"_{GENERATION_CLUSTER_NAME}")
 
 _MAX_CLUSTER_ID_LEN = 256
 _CLUSTER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def validate_cluster_id(cluster_id: str) -> None:
+    """Validate cluster_id format: non-empty, bounded length, alphanumeric with ``_-``."""
     if not isinstance(cluster_id, str) or cluster_id == "":
         raise ValueError("cluster_id must be non-empty str")
     if len(cluster_id) > _MAX_CLUSTER_ID_LEN:
@@ -122,8 +159,7 @@ def parse_cluster_id(cluster_id: str) -> tuple[str, str]:
     """
     validate_cluster_id(cluster_id)
 
-    known_clusters = {"actor_train", "actor_infer", "critic", "reference"}
-    for cluster_name in known_clusters:
+    for cluster_name in GPU_CLUSTER_NAMES:
         suffix = f"_{cluster_name}"
         if cluster_id.endswith(suffix):
             pipeline_id = cluster_id[: -len(suffix)]
@@ -132,11 +168,15 @@ def parse_cluster_id(cluster_id: str) -> tuple[str, str]:
 
     raise ValueError(
         f"Unrecognized cluster_id {cluster_id!r}. Expected suffix _<cluster_name> where cluster_name is one of "
-        f"{sorted(known_clusters)!r}."
+        f"{sorted(GPU_CLUSTER_NAMES)!r}."
     )
 
 
 def build_dp_rank_mapping(gpu_ids: List[int], tp_size: int) -> Dict[int, List[int]]:
+    """Map DP ranks to GPU ID groups based on tensor-parallel size.
+
+    Given ``gpu_ids=[0,1,2,3]`` and ``tp_size=2``, returns ``{0: [0,1], 1: [2,3]}``.
+    """
     if tp_size <= 0:
         return {}
     sorted_gpus = sorted(gpu_ids)

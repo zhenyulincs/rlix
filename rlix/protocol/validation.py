@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List
 
+from rlix.protocol.types import ALL_CLUSTER_NAMES, GENERATION_CLUSTER_NAME, REWARD_CLUSTER_NAME
+
 REQUEST_ID_DELIMITER = ":"
 
 
@@ -44,8 +46,8 @@ def validate_register_pipeline(inp: RegisterValidationInput) -> None:
 
     # The scheduler indexes into ["actor_infer"] without None guards in ~15 places,
     # so every pipeline must declare a generation cluster.
-    if "actor_infer" not in inp.cluster_tp_configs:
-        raise ValueError("actor_infer cluster must be registered")
+    if GENERATION_CLUSTER_NAME not in inp.cluster_tp_configs:
+        raise ValueError(f"{GENERATION_CLUSTER_NAME} cluster must be registered")
 
     # Every cluster needs a GPU mapping entry (empty list is valid for CPU-only clusters like reward).
     if not isinstance(inp.cluster_device_mappings, dict) or not inp.cluster_device_mappings:
@@ -62,6 +64,10 @@ def validate_register_pipeline(inp: RegisterValidationInput) -> None:
 
     # --- Per-cluster checks ---
     for cluster_name, tp_size_raw in inp.cluster_tp_configs.items():
+        if cluster_name not in ALL_CLUSTER_NAMES:
+            raise ValueError(
+                f"Unknown cluster name {cluster_name!r}. Must be one of {sorted(ALL_CLUSTER_NAMES)!r}."
+            )
         # Coerce to int to handle numeric strings; fail fast on non-numeric values.
         try:
             tp_size = int(tp_size_raw)
@@ -73,9 +79,9 @@ def validate_register_pipeline(inp: RegisterValidationInput) -> None:
         device_mapping = list(inp.cluster_device_mappings.get(cluster_name) or [])
 
         # All clusters require GPUs except reward, which is CPU-only.
-        if not device_mapping and cluster_name != "reward":
+        if not device_mapping and cluster_name != REWARD_CLUSTER_NAME:
             raise ValueError(f"device_mapping must be non-empty for cluster {cluster_name!r}")
-        if cluster_name == "reward" and device_mapping:
+        if cluster_name == REWARD_CLUSTER_NAME and device_mapping:
             # TODO: support GPU reward clusters (currently restricted to CPU-only).
             raise ValueError("reward cluster only supports CPU-only mode: reward.device_mapping must be empty")
 

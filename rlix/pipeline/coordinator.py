@@ -15,6 +15,7 @@ from rlix.protocol.validation import validate_pipeline_id
 from rlix.pipeline.utils import parse_env_timeout_s, validate_resize_params
 from rlix.protocol.types import (
     ActionResponse,
+    GPU_CLUSTER_NAMES,
     get_pipeline_namespace,
     PIPELINE_ACTOR_NAME_PREFIX,
     ProgressReport,
@@ -127,7 +128,7 @@ def _validate_offload_nccl(*, pipeline_config: Any) -> None:
     which is the only way to reclaim that memory.
     """
     # Clusters present in an agentic pipeline config.
-    cluster_names = ("actor_train", "actor_infer", "reference", "critic")
+    cluster_names = GPU_CLUSTER_NAMES
     bad_clusters = []
     for name in cluster_names:
         worker_config = getattr(pipeline_config, name, None)

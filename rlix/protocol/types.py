@@ -16,6 +16,14 @@ PIPELINE_ACTOR_NAME_PREFIX: str = "rlix:pipeline:"
 # Name for the ROLL-specific ResourceManager singleton actor (used when RLIX_CONTROL_PLANE=rlix)
 ROLL_RESOURCE_MANAGER_ACTOR_NAME: str = "rlix:roll_resource_manager"
 
+# Cluster name constants.
+# "reward" is CPU-only: valid in registration configs but never appears in cluster_ids
+# or GPU scheduling.
+GENERATION_CLUSTER_NAME: str = "actor_infer"
+REWARD_CLUSTER_NAME: str = "reward"
+ALL_CLUSTER_NAMES: tuple[str, ...] = ("actor_train", GENERATION_CLUSTER_NAME, "critic", "reference", REWARD_CLUSTER_NAME)
+GPU_CLUSTER_NAMES: tuple[str, ...] = ("actor_train", GENERATION_CLUSTER_NAME, "critic", "reference")
+
 
 def get_pipeline_namespace(pipeline_id: str) -> str:
     """Canonical Ray namespace for a per-pipeline coordinator actor."""
