@@ -1,3 +1,25 @@
+"""Fail-fast validation for scheduler execution plans.
+
+Validates an ``ExecutionPlan`` against 11 numbered invariant conditions before the
+scheduler applies any mutations to cluster state.  The conditions fall into four
+categories:
+
+* **GPU accounting** (conditions 4, 8, 9): idle/allocated sets are disjoint, the
+  GPU universe is conserved after simulating the plan, and no GPU is freed twice.
+* **Operation integrity** (conditions 1, 3): each cluster appears in at most one
+  operation type per cycle (allocate vs. remove).
+* **State-transition legality** (conditions 2, 5, 6, 7): DP-rank shrink/expand ops
+  target only generation clusters, operate on valid DP ranks within device-mapping
+  bounds, and respect ``max_dp_workers``.
+* **Overlap prevention** (condition 10): no DP rank or GPU is claimed by two
+  clusters simultaneously.
+* **Referential integrity** (condition 11): clusters scheduled for removal must
+  exist in active allocations.
+
+All checks raise ``ValidationError`` with the condition number so callers can
+programmatically identify the failing invariant.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -16,12 +38,40 @@ from rlix.scheduler.types import (
 
 @dataclass(frozen=True, slots=True)
 class ValidationInputs:
+    """Snapshot of scheduler state needed for plan validation.
+
+    Captures the three pieces of global state that the validator must inspect:
+    the pipeline registry (cluster configs with device mappings and TP sizes),
+    the current GPU allocations, and the set of unassigned GPUs.
+
+    Attributes:
+        pipeline_registry: Pipeline ID -> pipeline config dict.  Each config
+            contains a ``"cluster_configs"`` mapping of cluster name to its
+            ``device_mapping``, ``tp_size``, and optional ``max_dp_workers``.
+        active_allocations: Cluster ID -> live ``ClusterAllocation`` at the
+            start of the scheduling cycle.
+        idle_gpus: GPU device indices not currently assigned to any cluster.
+    """
+
     pipeline_registry: Dict[str, Dict[str, Any]]
     active_allocations: Dict[str, ClusterAllocation]
     idle_gpus: Set[int]
 
 
 def _cluster_config(inputs: ValidationInputs, cluster_id: str) -> Dict[str, Any]:
+    """Look up the cluster config dict for *cluster_id* from the pipeline registry.
+
+    Args:
+        inputs: Current scheduler state snapshot.
+        cluster_id: Composite ``"{pipeline_id}/{cluster_name}"`` identifier.
+
+    Returns:
+        The cluster configuration dict containing ``device_mapping``,
+        ``tp_size``, and optionally ``max_dp_workers``.
+
+    Raises:
+        KeyError: If the pipeline or cluster name is not registered.
+    """
     pipeline_id, cluster_name = parse_cluster_id(cluster_id)
     pipeline = inputs.pipeline_registry.get(pipeline_id)
     if pipeline is None:
@@ -34,6 +84,11 @@ def _cluster_config(inputs: ValidationInputs, cluster_id: str) -> Dict[str, Any]
 
 
 def _cluster_tp_size(inputs: ValidationInputs, cluster_id: str) -> int:
+    """Return the tensor-parallel size for *cluster_id* (defaults to 1).
+
+    Raises:
+        ValueError: If ``tp_size`` is non-positive.
+    """
     tp_size = int(_cluster_config(inputs, cluster_id).get("tp_size", 1))
     if tp_size <= 0:
         raise ValueError(f"Invalid tp_size={tp_size} for cluster_id {cluster_id!r}")
@@ -41,6 +96,11 @@ def _cluster_tp_size(inputs: ValidationInputs, cluster_id: str) -> int:
 
 
 def _cluster_device_mapping(inputs: ValidationInputs, cluster_id: str) -> List[int]:
+    """Return the ordered list of GPU device indices assigned to *cluster_id*.
+
+    Raises:
+        ValueError: If ``device_mapping`` is missing or empty.
+    """
     mapping = list(_cluster_config(inputs, cluster_id).get("device_mapping") or [])
     if not mapping:
         raise ValueError(f"Missing device_mapping for cluster_id {cluster_id!r}")
@@ -48,6 +108,15 @@ def _cluster_device_mapping(inputs: ValidationInputs, cluster_id: str) -> List[i
 
 
 def _max_dp_workers(inputs: ValidationInputs, cluster_id: str) -> int:
+    """Derive the maximum number of data-parallel workers for *cluster_id*.
+
+    If the cluster config provides an explicit ``max_dp_workers``, that value is
+    returned.  Otherwise the cap is inferred as
+    ``len(device_mapping) // tp_size``.
+
+    Returns:
+        Maximum DP worker count (0 when device_mapping is empty).
+    """
     cfg = _cluster_config(inputs, cluster_id)
     tp_size = int(cfg.get("tp_size", 1))
     device_mapping = list(cfg.get("device_mapping") or [])
@@ -80,9 +149,34 @@ def validate_dp_ranks_to_add(*, dp_ranks_to_add: List[int], max_dp_ranks: int) -
 
 
 def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) -> None:
-    """Fail-fast validation for the scheduler execution plan (11 critical conditions).
+    """Validate an execution plan against 11 invariant conditions before it is applied.
 
-    This is intentionally strict and is designed to catch plan/state inconsistencies before execution.
+    The validator simulates the plan's effects (shrinks, removals, allocations,
+    expansions) on a copy of the current state and checks every invariant at
+    each step.  If any condition is violated a ``ValidationError`` is raised
+    with the condition number so the caller can identify the failure
+    programmatically.
+
+    Checked conditions:
+        1. **Operation uniqueness** — each cluster appears at most once per op list.
+        2. **State-transition legality** — shrink/expand ops target generation clusters only.
+        3. **Mutual exclusivity** — a cluster cannot be both allocated and removed.
+        4. **GPU state consistency** — idle and allocated sets stay disjoint throughout.
+        5. **DP-rank activity** — shrinks remove only active ranks; expansions add only inactive ranks.
+        6. **Device-mapping bounds** — allocated GPUs fall within the cluster's device mapping
+           and bundle sizes match ``tp_size``.
+        7. **Capacity limits** — expansions do not exceed ``max_dp_workers``.
+        8. **Conservation** — after simulation, idle + allocated equals the full GPU universe.
+        9. **No double-free** — no GPU is freed more than once within one plan.
+        10. **No overlap** — no GPU or DP rank is claimed by two clusters simultaneously.
+        11. **Existence** — clusters scheduled for removal must exist in active allocations.
+
+    Args:
+        plan: The proposed execution plan to validate.
+        inputs: Scheduler state snapshot (registry, allocations, idle GPUs).
+
+    Raises:
+        ValidationError: On the first condition violation found.
     """
 
     # Condition 4 (GPU state consistency): idle and allocated disjoint at entry.
@@ -94,7 +188,28 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
             context={"overlap": sorted(allocated_gpus & inputs.idle_gpus)},
         )
 
-    # Condition 1 (operation uniqueness): handled by construction for sched_guided_shrink_ops.
+    # Condition 1 (operation uniqueness): each cluster appears in at most one op per list.
+    shrink_cluster_ids = [op.cluster_id for op in plan.sched_guided_shrink_ops]
+    if len(shrink_cluster_ids) != len(set(shrink_cluster_ids)):
+        raise ValidationError(
+            "duplicate cluster_id in sched_guided_shrink_ops",
+            condition=1,
+            context={"cluster_ids": sorted(cid for cid in set(shrink_cluster_ids) if shrink_cluster_ids.count(cid) > 1)},
+        )
+    alloc_cluster_ids = [op.cluster_id for op in plan.sched_guided_allocation_ops]
+    if len(alloc_cluster_ids) != len(set(alloc_cluster_ids)):
+        raise ValidationError(
+            "duplicate cluster_id in sched_guided_allocation_ops",
+            condition=1,
+            context={"cluster_ids": sorted(cid for cid in set(alloc_cluster_ids) if alloc_cluster_ids.count(cid) > 1)},
+        )
+    pending_cluster_ids = [op.cluster_id for op in plan.signal_pending_allocation_ops]
+    if len(pending_cluster_ids) != len(set(pending_cluster_ids)):
+        raise ValidationError(
+            "duplicate cluster_id in signal_pending_allocation_ops",
+            condition=1,
+            context={"cluster_ids": sorted(cid for cid in set(pending_cluster_ids) if pending_cluster_ids.count(cid) > 1)},
+        )
 
     # Condition 3 (mutual exclusivity): cannot both allocate and remove the same cluster in one cycle.
     alloc_targets = {op.cluster_id for op in plan.signal_pending_allocation_ops} | {op.cluster_id for op in plan.sched_guided_allocation_ops}
@@ -133,7 +248,10 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
                 context={"cluster_id": op.cluster_id, "gpus": sorted(set(op.gpus_to_allocate) - device_mapping)},
             )
 
-    # Simulate plan effects to validate global GPU accounting and overlaps.
+    # --- Simulation phase ---
+    # Deep-copy allocations and idle set so mutations during simulation
+    # don't affect the caller's state.  The plan is applied in order:
+    # shrinks -> removals -> pending allocations -> expansions.
     sim_allocations: Dict[str, ClusterAllocation] = {}
     for cid, alloc in inputs.active_allocations.items():
         sim_allocations[cid] = ClusterAllocation(
@@ -151,6 +269,7 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
     freed_gpus: Set[int] = set()
 
     def _free_bundle(cluster_id: str, bundle: Set[int]) -> None:
+        """Return *bundle* GPUs to the idle pool; raise on double-free (condition 9)."""
         nonlocal freed_gpus, sim_idle
         if freed_gpus & bundle:
             raise ValidationError(
@@ -162,6 +281,7 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
         sim_idle |= set(bundle)
 
     def _ensure_dp_rank_mapping(cluster_id: str) -> None:
+        """Lazily build dp_rank_to_gpus for a simulated allocation if missing."""
         alloc = sim_allocations.get(cluster_id)
         if alloc is None:
             return
@@ -176,7 +296,11 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
             continue
         alloc = sim_allocations.get(op.cluster_id)
         if alloc is None:
-            continue
+            raise ValidationError(
+                "shrink op targets unregistered cluster",
+                condition=11,
+                context={"cluster_id": op.cluster_id},
+            )
         if alloc.priority != Priority.GENERATION:
             raise ValidationError("shrink on non-generation allocation", condition=2, context={"cluster_id": op.cluster_id})
         _ensure_dp_rank_mapping(op.cluster_id)
