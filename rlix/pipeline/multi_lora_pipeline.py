@@ -37,7 +37,8 @@ from roll.pipeline.agentic.utils import (
     get_agentic_response_level_mask,
 )
 from rlix.pipeline.full_finetune_pipeline import RollFullFinetunePipeline
-from rlix.pipeline.utils import parse_env_timeout_s, validate_resize_params
+from rlix.pipeline.utils import validate_resize_params
+from rlix.utils.env import parse_env_timeout_s
 from roll.utils.dynamic_batching import dynamic_batching_shard
 from roll.utils.functionals import (
     agg_loss,

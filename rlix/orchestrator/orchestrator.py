@@ -1,7 +1,16 @@
+"""RLix Orchestrator.
+
+Pipeline lifecycle management: allocate IDs, register topology with the scheduler,
+admit pipelines for scheduling, kill pipelines (teardown actors + cleanup), and
+force-shutdown the entire Ray cluster.
+
+Singleton actor name: ``rlix:orchestrator``.
+"""
+
 from __future__ import annotations
 
+import logging
 import os
-import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -16,53 +25,103 @@ from rlix.protocol.types import RLIX_NAMESPACE, SCHEDULER_ACTOR_NAME
 from rlix.protocol.validation import RegisterValidationInput, validate_register_pipeline
 from rlix.scheduler.resource_manager import get_or_create_resource_manager
 from rlix.scheduler.scheduler import scheduler_actor_class
+from rlix.utils.env import parse_env_timeout_s
 from rlix.utils.ray import get_head_node_id
 from rlix.utils.ray import head_node_affinity_strategy
 import ray
 
 # Timeouts for orchestrator operations (seconds).
-_RESOURCE_SNAPSHOT_TIMEOUT_S: float = 10.0
-_RESOURCE_SNAPSHOT_POLL_S: float = 0.2
-_WORKER_STOP_TIMEOUT_S: float = 10.0
-_POST_STOP_SETTLE_S: float = 0.2
-_UNNAMED_ACTOR_CLEANUP_TIMEOUT_S: float = 10.0
-_SCHEDULER_FLUSH_TIMEOUT_S: float = 0.5
+_RESOURCE_SNAPSHOT_TIMEOUT_S: float = parse_env_timeout_s("RLIX_RESOURCE_SNAPSHOT_TIMEOUT_S", 10.0)
+_RESOURCE_SNAPSHOT_POLL_S: float = parse_env_timeout_s("RLIX_RESOURCE_SNAPSHOT_POLL_S", 0.2)
+_WORKER_STOP_TIMEOUT_S: float = parse_env_timeout_s("RLIX_WORKER_STOP_TIMEOUT_S", 10.0)
+_POST_STOP_SETTLE_S: float = parse_env_timeout_s("RLIX_POST_STOP_SETTLE_S", 0.2)
+_UNNAMED_ACTOR_CLEANUP_TIMEOUT_S: float = parse_env_timeout_s("RLIX_UNNAMED_ACTOR_CLEANUP_TIMEOUT_S", 10.0)
+_SCHEDULER_FLUSH_TIMEOUT_S: float = parse_env_timeout_s("RLIX_SCHEDULER_FLUSH_TIMEOUT_S", 0.5)
 # 12 hex chars = 48 bits of entropy; unique enough for any realistic cluster size.
 _PIPELINE_ID_RANDOM_HEX_LEN: int = 12
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class RegisterResponse:
+    """Returned by ``Orchestrator.register_pipeline``."""
+
     pipeline_id: str
 
 
 @dataclass(frozen=True, slots=True)
 class AdmitResponse:
+    """Returned by ``Orchestrator.admit_pipeline``; includes the scheduler handle for direct RPC."""
+
     pipeline_id: str
     scheduler: Any
 
 
 @dataclass(frozen=True, slots=True)
 class PipelineState:
+    """Orchestrator-local bookkeeping for a single pipeline's lifecycle stage."""
+
     pipeline_id: str
     registered: bool
     admitted: bool
 
 
 def _kill_local_ray() -> None:
-    # WARNING: Calling `ray stop --force` via subprocess from inside a Ray actor triggers
-    # a deepcopy bug with Sentinel enum objects (Ray 2.47.1 + Python 3.10).
-    # Use ray.shutdown() instead, which is safe to call from within Ray workers.
-    sys.stderr.write("[rlix][WARN] _kill_local_ray() called from inside Ray actor - using ray.shutdown() instead of 'ray stop --force'\n")
-    sys.stderr.flush()
+    """Shut down the local Ray worker/head process.
+
+    Uses ``ray.shutdown()`` rather than ``ray stop --force`` because subprocess-based
+    stop triggers a deepcopy bug with Sentinel enums (Ray 2.47.1 + Python 3.10).
+    """
+    logger.info("_kill_local_ray() called from inside Ray actor - using ray.shutdown() instead of 'ray stop --force'")
     try:
         ray.shutdown()
     except Exception as e:
-        sys.stderr.write(f"[rlix][WARN] ray.shutdown() failed: {e}\n")
-        sys.stderr.flush()
+        logger.warning("ray.shutdown() failed: %s", e)
+
+def _kill_ray_on_node(node_ip: str):
+    """Spawn a one-shot remote task on ``node_ip`` that calls ``_kill_local_ray()``."""
+
+    @ray.remote(max_retries=0)
+    def _kill_local_ray_task():
+        _kill_local_ray()
+
+    return _kill_local_ray_task.options(resources={f"node:{node_ip}": 0.01}).remote()
+
+
+def _force_stop_cluster_workers_first(*, timeout_s: float = _WORKER_STOP_TIMEOUT_S) -> None:
+    """Shut down every Ray worker node, then the head node.
+
+    Worker nodes are killed first (in parallel via remote tasks) so that
+    in-flight work drains before the head disappears.
+    """
+    head_node_id = get_head_node_id()
+    nodes = ray.nodes()
+    alive_nodes = [n for n in nodes if n.get("Alive")]
+
+    worker_tasks = []
+    for node in alive_nodes:
+        if node.get("NodeID") == head_node_id:
+            continue
+        node_ip = node.get("NodeManagerAddress")
+        if not node_ip:
+            continue
+        worker_tasks.append(_kill_ray_on_node(node_ip))
+
+    if worker_tasks:
+        ray.wait(worker_tasks, timeout=timeout_s, num_returns=len(worker_tasks))
+
+    time.sleep(_POST_STOP_SETTLE_S)
+    _kill_local_ray()
 
 
 def _ensure_scheduler_singleton(env_vars: Optional[Dict[str, str]] = None):
+    """Create (or retrieve) the singleton scheduler actor and initialize it.
+
+    Idempotent: ``get_if_exists=True`` means concurrent callers converge on
+    the same actor.  Initialization seeds the scheduler's GPU topology from
+    the resource manager and starts the central scheduling loop.
+    """
     strategy = head_node_affinity_strategy(soft=False)
     SchedulerActor = scheduler_actor_class()
     # Thread-limiting env vars for the scheduler actor process.
@@ -107,36 +166,19 @@ def _ensure_scheduler_singleton(env_vars: Optional[Dict[str, str]] = None):
     return scheduler
 
 
-def _kill_ray_on_node(node_ip: str):
-    @ray.remote(max_retries=0)
-    def _kill_local_ray_task():
-        _kill_local_ray()
-
-    return _kill_local_ray_task.options(resources={f"node:{node_ip}": 0.01}).remote()
-
-
-def _force_stop_cluster_workers_first(*, timeout_s: float = _WORKER_STOP_TIMEOUT_S) -> None:
-    head_node_id = get_head_node_id()
-    nodes = ray.nodes()
-    alive_nodes = [n for n in nodes if n.get("Alive")]
-
-    worker_tasks = []
-    for node in alive_nodes:
-        if node.get("NodeID") == head_node_id:
-            continue
-        node_ip = node.get("NodeManagerAddress")
-        if not node_ip:
-            continue
-        worker_tasks.append(_kill_ray_on_node(node_ip))
-
-    if worker_tasks:
-        ray.wait(worker_tasks, timeout=timeout_s, num_returns=len(worker_tasks))
-
-    time.sleep(_POST_STOP_SETTLE_S)
-    _kill_local_ray()
 
 
 class Orchestrator:
+    """Central control-plane actor for pipeline lifecycle management.
+
+    Responsibilities:
+      - Allocate globally unique pipeline IDs.
+      - Register pipeline topology with the scheduler.
+      - Admit pipelines so the scheduler begins GPU allocation.
+      - Kill individual pipelines (teardown actors, release ports).
+      - Force-shutdown the entire Ray cluster.
+    """
+
     def __init__(self, env_vars: Optional[Dict[str, str]] = None):
         if env_vars is not None:
             if not isinstance(env_vars, dict):
@@ -171,6 +213,10 @@ class Orchestrator:
         cluster_tp_configs: Dict[str, int],
         cluster_device_mappings: Dict[str, list[int]],
     ) -> RegisterResponse:
+        """Register a pipeline's cluster topology with the scheduler.
+
+        Must be called after ``allocate_pipeline_id`` and before ``admit_pipeline``.
+        """
         validate_register_pipeline(
             RegisterValidationInput(
                 pipeline_id=pipeline_id,
@@ -197,22 +243,44 @@ class Orchestrator:
         return RegisterResponse(pipeline_id=pipeline_id)
 
     def admit_pipeline(self, *, pipeline_id: str) -> AdmitResponse:
+        """Admit a registered pipeline so the scheduler begins allocating GPUs for it."""
         validate_pipeline_id(pipeline_id)
         state = self._pipelines.get(pipeline_id)
         if state is None or not state.registered:
-            raise RuntimeError(f"Pipeline {pipeline_id!r} must be registered before admission")
+            logger.warning("Pipeline %r must be registered before admission", pipeline_id)
+            return AdmitResponse(pipeline_id=pipeline_id, scheduler=None)
         if state.admitted:
             return AdmitResponse(pipeline_id=pipeline_id, scheduler=self._scheduler)
         ray.get(self._scheduler.admit_pipeline.remote(pipeline_id=pipeline_id))
         self._pipelines[pipeline_id] = PipelineState(pipeline_id=pipeline_id, registered=True, admitted=True)
         return AdmitResponse(pipeline_id=pipeline_id, scheduler=self._scheduler)
 
+    def _cleanup_shared_storage(self, shared_storage: Any, pipeline_id: str) -> None:
+        """Best-effort SharedStorage cleanup: release port claims and prefixed keys."""
+        if shared_storage is None:
+            return
+        try:
+            ray.get(shared_storage.delete_port_claims.remote(pipeline_id))
+        except Exception as exc:
+            logger.error("SharedStorage.delete_port_claims failed for pipeline_id=%r: %s", pipeline_id, exc)
+        try:
+            ray.get(shared_storage.delete_prefix.remote(f"{pipeline_id}:"))
+        except Exception as exc:
+            logger.error("SharedStorage.delete_prefix failed for prefix=%r: %s", f"{pipeline_id}:", exc)
+
     def kill_pipeline(self, pipeline_id: str) -> None:
+        """Tear down a pipeline: unregister from scheduler, kill all actors, release ports.
+
+        Cleanup order:
+          1. Resolve SharedStorage handle and pipeline Ray namespace.
+          2. Unregister from scheduler (stops future GPU allocation).
+          3. Kill named actors in the pipeline's Ray namespace.
+          4. Wait for unnamed actors to exit; force-kill via internal APIs as last resort.
+          5. Clean up SharedStorage coordination metadata (port claims, prefixed keys).
+        """
         validate_pipeline_id(pipeline_id)
 
-        # Best-effort SharedStorage cleanup (job-global).
-        # This releases pipeline-owned coordination metadata (e.g., MASTER_ADDR_PORT claims) so ports can be reused
-        # within the same job.
+        # Step 1: Resolve SharedStorage handle and pipeline Ray namespace.
         try:
             shared_storage = ray.get_actor("SHARED_STORAGE_ACTOR", namespace="global_storage_namespace")
         except Exception:
@@ -221,10 +289,12 @@ class Orchestrator:
         try:
             ray_namespace = ray.get(self._scheduler.get_pipeline_namespace.remote(pipeline_id=pipeline_id))
         except Exception as e:
-            raise RuntimeError(f"Failed to resolve ray_namespace for pipeline_id {pipeline_id!r}") from e
+            logger.warning("Failed to resolve ray_namespace for pipeline_id %r: %s", pipeline_id, e)
+            self._cleanup_shared_storage(shared_storage, pipeline_id)
+            self._pipelines.pop(pipeline_id, None)
+            return
 
-        # First, remove scheduler-side state under the scheduler lock so future scheduling cycles ignore this pipeline.
-        # This also unblocks any callers waiting on scheduler events for this pipeline.
+        # Step 2: Unregister from scheduler (stops future GPU allocation, unblocks waiters).
         ray.get(self._scheduler.unregister_pipeline.remote(pipeline_id=pipeline_id))
 
         try:
@@ -250,7 +320,7 @@ class Orchestrator:
                     alive.append(s)
             return alive
 
-        # Kill all named actors in this pipeline namespace.
+        # Step 3: Kill all named actors in this pipeline namespace.
         kill_lookup_failures = 0
         kill_failures = 0
         for s in _list_alive_actors():
@@ -268,12 +338,12 @@ class Orchestrator:
                 kill_failures += 1
                 continue
         if kill_lookup_failures or kill_failures:
-            sys.stderr.write(
-                f"[rlix][WARN] kill_pipeline(namespace={ray_namespace!r}) had {kill_lookup_failures} actor lookup failures "
-                f"and {kill_failures} ray.kill failures for pipeline_id={pipeline_id!r}\n"
+            logger.warning(
+                "kill_pipeline(namespace=%r) had %d actor lookup failures and %d ray.kill failures for pipeline_id=%r",
+                ray_namespace, kill_lookup_failures, kill_failures, pipeline_id,
             )
 
-        # Unnamed actors: assume temporary and wait briefly for natural teardown.
+        # Step 4: Wait for unnamed actors to exit; force-kill via internal APIs as last resort.
         deadline = time.time() + _UNNAMED_ACTOR_CLEANUP_TIMEOUT_S
         while True:
             unnamed_alive = _list_alive_actors(name_filter="")
@@ -293,10 +363,11 @@ class Orchestrator:
                     f"Found {len(unnamed_alive)} unnamed ALIVE actors in namespace {ray_namespace!r} but cannot import ActorID"
                 ) from e
 
-            sys.stderr.write(
-                f"[rlix][ERROR] Found {len(unnamed_alive)} unnamed ALIVE actors in namespace {ray_namespace!r}; "
+            logger.error(
+                "Found %d unnamed ALIVE actors in namespace %r; "
                 "using internal core_worker.get_actor_handle(...) to force kill them. "
-                "These actors should be named (or their handles retained) to avoid relying on Ray internals.\n"
+                "These actors should be named (or their handles retained) to avoid relying on Ray internals.",
+                len(unnamed_alive), ray_namespace,
             )
             for s in unnamed_alive:
                 actor_id_hex = _attr(s, "actor_id")
@@ -310,33 +381,31 @@ class Orchestrator:
                     handle = ray.worker.global_worker.core_worker.get_actor_handle(actor_id_obj)
                     ray.kill(handle, no_restart=True)
                 except Exception as e:
-                    sys.stderr.write(f"[rlix][ERROR] Failed to force-kill unnamed actor_id={actor_id_hex!r}: {e}\n")
+                    logger.error("Failed to force-kill unnamed actor_id=%r: %s", actor_id_hex, e)
 
+        # Step 5: Clean up SharedStorage coordination metadata (port claims, prefixed keys).
         # Placement groups are owned by the RollResourceManager singleton actor;
         # Ray cleans them up automatically when that actor is killed.
-
-        if shared_storage is not None:
-            try:
-                ray.get(shared_storage.delete_port_claims.remote(pipeline_id))
-            except Exception as e:
-                sys.stderr.write(f"[rlix][ERROR] SharedStorage.delete_port_claims failed for pipeline_id={pipeline_id!r}: {e}\n")
-            try:
-                ray.get(shared_storage.delete_prefix.remote(f"{pipeline_id}:"))
-            except Exception as e:
-                sys.stderr.write(f"[rlix][ERROR] SharedStorage.delete_prefix failed for prefix={pipeline_id + ':'!r}: {e}\n")
+        self._cleanup_shared_storage(shared_storage, pipeline_id)
 
         self._pipelines.pop(pipeline_id, None)
 
     def unregister_pipeline(self, pipeline_id: str) -> None:
+        """Remove a pipeline from the scheduler without killing its actors."""
         validate_pipeline_id(pipeline_id)
         ray.get(self._scheduler.unregister_pipeline.remote(pipeline_id=pipeline_id))
         self._pipelines.pop(pipeline_id, None)
 
     def shutdown(self, force: bool = True, reason: Optional[str] = None, source: Optional[str] = None) -> None:
+        """Force-shutdown the entire Ray cluster (workers first, then head).
+
+        Idempotent: subsequent calls after the first are no-ops.
+        """
         import traceback
-        sys.stderr.write(f"[rlix][DEBUG] orchestrator.shutdown called: force={force!r} reason={reason!r} source={source!r}\n")
-        sys.stderr.write("".join(traceback.format_stack()))
-        sys.stderr.flush()
+        logger.info(
+            "orchestrator.shutdown called: force=%r reason=%r source=%r\n%s",
+            force, reason, source, "".join(traceback.format_stack()),
+        )
         if self._shutdown_started:
             return
         self._shutdown_started = True

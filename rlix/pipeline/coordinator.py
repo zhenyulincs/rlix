@@ -11,7 +11,8 @@ import ray
 
 from rlix.protocol.coordinator import Coordinator
 from rlix.protocol.validation import validate_pipeline_id
-from rlix.pipeline.utils import parse_env_timeout_s, validate_resize_params
+from rlix.pipeline.utils import validate_resize_params
+from rlix.utils.env import parse_env_timeout_s
 from rlix.protocol.types import (
     ActionResponse,
     GPU_CLUSTER_NAMES,
