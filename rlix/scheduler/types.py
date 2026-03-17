@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-from rlix.protocol.request_id import validate_pipeline_id
+from rlix.protocol.validation import validate_pipeline_id
 from rlix.protocol.types import Priority
 
 

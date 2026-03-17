@@ -11,7 +11,7 @@ from typing import Any, Dict, Literal, Optional
 # Used as a prefix in pipeline_id for trace readability (e.g., "ft_abc123", "lora_abc123").
 PipelineType = Literal["ft", "lora"]
 
-from rlix.protocol.request_id import validate_pipeline_id
+from rlix.protocol.validation import validate_pipeline_id
 from rlix.protocol.types import ORCHESTRATOR_ACTOR_NAME, RLIX_NAMESPACE, SCHEDULER_ACTOR_NAME
 from rlix.protocol.validation import RegisterValidationInput, validate_register_pipeline
 from rlix.scheduler.resource_manager import get_or_create_resource_manager

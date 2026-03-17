@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Set
 import ray
 
 from rlix.protocol.coordinator import Coordinator
-from rlix.protocol.request_id import validate_pipeline_id
+from rlix.protocol.validation import validate_pipeline_id
 from rlix.pipeline.utils import parse_env_timeout_s, validate_resize_params
 from rlix.protocol.types import (
     ActionResponse,

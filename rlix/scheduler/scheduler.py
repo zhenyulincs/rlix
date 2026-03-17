@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 
 import ray
 
-from rlix.protocol.request_id import validate_pipeline_id
+from rlix.protocol.validation import validate_pipeline_id
 from rlix.protocol.types import (
     COORDINATOR_ACTOR_NAME_PREFIX,
     ORCHESTRATOR_ACTOR_NAME,
