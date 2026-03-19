@@ -234,6 +234,8 @@ class PipelineCoordinator(Coordinator):
         self._resource_manager_node0_pg = self._resource_manager_proxy.node2pg.get(0)
 
         self._pipeline_actor = None
+        # Lazily resolved on first sync_lora_weights call; created by the pipeline actor during init.
+        self._model_update_service = None
         # Serializes resize_infer and sync_lora_weights: prevents a weight sync from
         # racing with a concurrent shrink/expand triggered by the central scheduler.
         self._resize_sync_lock = threading.Lock()
@@ -330,10 +332,10 @@ class PipelineCoordinator(Coordinator):
                 f"ProgressReport from pipeline {report.pipeline_id!r} contains wire-level 'remaining'; "
                 "send 'collected' instead (hard cutover)"
             )
-        mode = str(metrics.get("mode", "train"))
+        mode = str(metrics["mode"])
         adapter_id = metrics.get("adapter_id")
         scheduler_key = f"{mode}:{adapter_id if adapter_id is not None else '__fft__'}"
-        is_new_batch = bool(metrics.get("new_batch", False))
+        is_new_batch = bool(metrics["new_batch"])
 
         with self._progress_lock:
             # Last-write-wins: same key from a newer step overwrites the stale entry naturally.
@@ -396,7 +398,7 @@ class PipelineCoordinator(Coordinator):
         for rpt in self._scheduler_reports.values():
             rpt_metrics = rpt.metrics if isinstance(rpt.metrics, dict) else {}
             step_target = float(max(int(rpt.step_target_trajectories), 1))
-            collected_raw = max(0.0, float(rpt_metrics.get("collected", 0)))
+            collected_raw = max(0.0, float(rpt_metrics["collected"]))
             completed_clamped = min(collected_raw, step_target)
             total_required += step_target
             total_completed += completed_clamped
@@ -446,16 +448,11 @@ class PipelineCoordinator(Coordinator):
                 raise RuntimeError(f"Expected system_envs to be dict, got {type(system_envs).__name__}")
             system_envs.update(envs)
 
-        # Worker clusters
-        _update_system_envs(getattr(config, "actor_train", None))
-        _update_system_envs(getattr(config, "actor_infer", None))
-        _update_system_envs(getattr(config, "reference", None))
-        _update_system_envs(getattr(config, "critic", None))
-        _update_system_envs(getattr(config, "reward", None))
-
-        # Env managers (spawn env actors/workers)
-        _update_system_envs(getattr(config, "train_env_manager", None))
-        _update_system_envs(getattr(config, "val_env_manager", None))
+        # All clusters that spawn Ray actors need pipeline env vars:
+        # GPU clusters + CPU-only clusters (reward, env managers).
+        all_cluster_names = GPU_CLUSTER_NAMES + ("reward", "train_env_manager", "val_env_manager")
+        for cluster_name in all_cluster_names:
+            _update_system_envs(getattr(config, cluster_name, None))
 
         return config
 
@@ -468,21 +465,33 @@ class PipelineCoordinator(Coordinator):
         If all infer workers are sleeping (preempted by concurrent pipelines), sync is
         skipped — sleeping workers receive the updated LoRA via expand_worker on wake.
         """
-        with self._resize_sync_lock:
+        acquired = self._resize_sync_lock.acquire(timeout=_RESIZE_LOCK_TIMEOUT_S)
+        if not acquired:
+            raise RuntimeError(
+                f"sync_lora_weights timed out waiting for _resize_sync_lock after {_RESIZE_LOCK_TIMEOUT_S}s "
+                f"(likely blocked by a long-running resize_infer). "
+                f"pipeline_id={self._pipeline_id!r}"
+            )
+        try:
             # Use locally bookkept active dp ranks (updated by resize_infer under same lock).
             active_ranks = sorted(self._active_infer_dp_ranks)
             if not active_ranks:
                 # All infer workers preempted/sleeping; expand_worker syncs on next wake.
                 return
-            model_update_service_name = f"{self._pipeline_id}_model_update_service"
-            model_update_service = get_actor_or_raise(
-                model_update_service_name, self._ray_namespace,
-                error_context=f"ModelUpdateService required for pipeline_id={self._pipeline_id!r}.",
-            )
+            # Created by the pipeline actor during init; lazy-resolve here.
+            if self._model_update_service is None:
+                model_update_service_name = f"{self._pipeline_id}_model_update_service"
+                self._model_update_service = get_actor_or_raise(
+                    model_update_service_name, self._ray_namespace,
+                    error_context=f"ModelUpdateService required for pipeline_id={self._pipeline_id!r}.",
+                )
+            model_update_service = self._model_update_service
             ray.get(model_update_service.sync_selected_workers.remote(
                 active_ranks, adapters_to_sync=list(loras_to_sync),
                 verify=self._verify_model_after_sync,
             ))
+        finally:
+            self._resize_sync_lock.release()
 
     def resize_infer(self, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]) -> ActionResponse:
         """Pipeline-scoped resize for actor_infer.
@@ -511,13 +520,11 @@ class PipelineCoordinator(Coordinator):
         try:
             # NOTE: coordinator does not coordinate train/val request schedulers directly; it delegates to the
             # per-pipeline pipeline actor (single serialization boundary owned by pipeline runtime).
-            resize_actor_name = f"{PIPELINE_ACTOR_NAME_PREFIX}{self._pipeline_id}"
-            resize_actor = get_actor_or_raise(
-                resize_actor_name, self._ray_namespace,
-                error_context=f"Pipeline actor required for resize_infer, pipeline_id={self._pipeline_id!r}.",
-            )
-
-            ref = resize_actor.resize_infer.remote(
+            if self._pipeline_actor is None:
+                raise RuntimeError(
+                    f"Pipeline actor not created yet for resize_infer, pipeline_id={self._pipeline_id!r}."
+                )
+            ref = self._pipeline_actor.resize_infer.remote(
                 dp_ranks_to_remove=list(dp_ranks_to_remove),
                 dp_ranks_to_add=list(dp_ranks_to_add),
             )
