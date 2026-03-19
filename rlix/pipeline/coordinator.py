@@ -268,16 +268,23 @@ class PipelineCoordinator(Coordinator):
         if self._pipeline_actor is not None:
             return self._pipeline_actor
 
-        adapters = getattr(getattr(pipeline_config, "actor_train", None), "model_args", None)
-        adapters = getattr(adapters, "adapters", None) if adapters is not None else None
-        if adapters:
-            from rlix.pipeline.multi_lora_pipeline import RollMultiLoraPipeline
-            PipelineClass = RollMultiLoraPipeline
-        else:
-            from rlix.pipeline.full_finetune_pipeline import RollFullFinetunePipeline
-            PipelineClass = RollFullFinetunePipeline
+        pipeline_cls_path = getattr(pipeline_config, "pipeline_cls", None)
+        if not pipeline_cls_path:
+            raise RuntimeError(
+                "pipeline_cls is required in the pipeline YAML config. "
+                "Example: 'pipeline_cls: rlix.pipeline.full_finetune_pipeline.RollFullFinetunePipeline'"
+            )
+        import importlib
+        module_path, class_name = pipeline_cls_path.rsplit(".", 1)
+        try:
+            module = importlib.import_module(module_path)
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(f"pipeline_cls module '{module_path}' not found: {exc}") from exc
+        pipeline_class = getattr(module, class_name, None)
+        if pipeline_class is None:
+            raise RuntimeError(f"pipeline_cls class '{class_name}' not found in module '{module_path}'.")
 
-        PipelineActor = ray.remote(PipelineClass)
+        PipelineActor = ray.remote(pipeline_class)
         # Safety: always inject env vars before constructing the pipeline actor, so callers can't
         # accidentally create a pipeline with missing system_envs.
         # Deep copy to prevent env var leaks when same config object is reused across pipelines.
