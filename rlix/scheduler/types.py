@@ -122,14 +122,13 @@ class PendingRequest:
 class PendingPlannedReleaseRequest:
     """A planned GPU release awaiting execution by the scheduler loop.
 
-    The caller awaits ``event``; the scheduler sets ``result_released_gpu_ids``
-    or ``error`` before signaling.
+    The caller awaits ``event``; the scheduler sets ``error`` before signaling
+    on failure.
     """
     cluster_id: str
     dp_ranks_to_remove: List[int]
     event: asyncio.Event
     global_step: Optional[int] = None
-    result_released_gpu_ids: List[int] = field(default_factory=list)
     error: Optional[str] = None
 
 

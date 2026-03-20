@@ -495,24 +495,20 @@ class RollFullFinetunePipeline(AgenticPipeline):
             raise RuntimeError(f"rlix:scheduler allocated empty GPU list for cluster_id={request_cluster_id!r}")
         return allocated
 
-    def _await_release_actor_infer(self, *, global_step: int) -> List[int]:
-        """Block until the scheduler decides which actor_infer dp-ranks to release. Returns released ranks."""
+    def _await_release_actor_infer(self, *, global_step: int) -> None:
+        """Block until the scheduler commits the actor_infer shrink for this pipeline."""
         timeout_s = parse_env_timeout_s("RLIX_NOTIFY_READY_TIMEOUT_S", 300.0)
 
-        released = ray.get(
+        ray.get(
             self._rlix_scheduler.await_release_gpus.remote(
                 cluster_id=self._actor_infer_cluster_id,
                 global_step=global_step,
                 timeout_s=timeout_s,
             )
         )
-        if not isinstance(released, list):
-            raise RuntimeError(f"await_release_gpus returned non-list: {type(released).__name__}")
-        released = [int(x) for x in released]
         logger.info(
-            f"[rlix][{self._pipeline_id}] await_release_gpus done: step={global_step} released={sorted(released)}"
+            f"[rlix][{self._pipeline_id}] await_release_gpus done: step={global_step}"
         )
-        return released
 
 
     def val(self, global_step):

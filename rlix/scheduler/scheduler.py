@@ -76,8 +76,6 @@ _PRIORITY_SHORT = {
     Priority.GENERATION: "GEN",
 }
 
-# Queue tracing: max slice tracks before disabling new queue slice creation.
-_QUEUE_TRACK_CAP: int = 1000
 # Gap-ratio generation planning iteration limits (safety bounds).
 _MAX_GAP_ITERATIONS: int = 10_000
 _MAX_GAP_ACTIVATIONS: int = 1_000
@@ -243,7 +241,7 @@ class SchedulerImpl:
 
         initialize  ->  register_pipeline  ->  admit_pipeline
                                                     |
-                        request_gpus / release_gpus / release_then_request_gpus
+                        request_gpus / notify_release_gpus / notify_release_then_request_gpus
                                                     |
                         unregister_pipeline  ->  shutdown
 
@@ -279,9 +277,6 @@ class SchedulerImpl:
     _queue_counter_tracks: Dict[str, "CounterTrack"] = field(
         init=False, default_factory=dict
     )  # priority_key -> counter track
-    _queue_track_count: int = field(
-        init=False, default=0
-    )  # Total slice tracks created (for cap enforcement)
     # Queue Tracing: Maps priority short-key (e.g. "TRN") to its Perfetto queue sub-group wrapper
     _queue_groups: Dict[str, _QueueSubGroup] = field(init=False, default_factory=dict)
     # Active GPU counter track for utilization visualization
@@ -530,20 +525,8 @@ class SchedulerImpl:
     ) -> Optional["NormalTrack"]:
         """Create a per-cluster slice track for queue visualization.
 
-        Returns None on failure OR if track cap exceeded.
-        When cap is exceeded, counter tracks still work but slice tracks are skipped.
+        Returns None on failure.
         """
-        # Check cap BEFORE creating
-        if self._queue_track_count >= _QUEUE_TRACK_CAP:
-            # Log once when cap first hit
-            if self._queue_track_count == _QUEUE_TRACK_CAP:
-                logging.getLogger(__name__).warning(
-                    f"Queue slice track cap ({_QUEUE_TRACK_CAP}) reached. "
-                    "Subsequent queue slices will not be traced (counters continue)."
-                )
-            self._queue_track_count += 1  # Increment to avoid repeated warnings
-            return None
-
         queue_group = self._get_or_create_queue_group(priority)
         if queue_group is None:
             return None
@@ -560,13 +543,10 @@ class SchedulerImpl:
             track_name = f"[{key}] {safe_pid}"
 
         # create_track is a method on _QueueSubGroup (our wrapper) — always exists
-        track = self._safe_trace_get(
+        return self._safe_trace_get(
             queue_group.create_track,
             track_name,
         )
-        if track is not None:
-            self._queue_track_count += 1
-        return track
 
     def _trace_queue_enqueue(self, cluster_id: str, priority: Priority, lora_name: Optional[str] = None) -> None:
         """Start queue slice and increment counter when request is enqueued.
@@ -781,7 +761,7 @@ class SchedulerImpl:
         )
 
     def _trace_release_marker(self, cluster_id: str, gpus_released: List[int]) -> None:
-        """Record an instant marker when GPUs are released via release_gpus()."""
+        """Record an instant marker when GPUs are released via notify_release_gpus()."""
         if not self._enable_gpu_tracing or self._release_marker_track is None:
             return
         self._safe_trace(
@@ -1384,7 +1364,7 @@ class SchedulerImpl:
             raise RuntimeError(pending.error)
         return list(pending.result)
 
-    async def release_gpus(self, *, cluster_id: str, global_step: Optional[int] = None) -> None:
+    async def notify_release_gpus(self, *, cluster_id: str, global_step: Optional[int] = None) -> None:
         """Release all GPUs held by ``cluster_id`` back to the idle pool."""
         await self._wait_topology_ready()
         async with self._lock:
@@ -1399,7 +1379,7 @@ class SchedulerImpl:
             self._trace_release_marker(cluster_id, alloc.gpu_ids)
             self._wakeup_event.set()
 
-    async def release_then_request_gpus(
+    async def notify_release_then_request_gpus(
         self,
         *,
         release_cluster_id: str,
@@ -1465,7 +1445,7 @@ class SchedulerImpl:
             self._wakeup_event.set()
         await event.wait()
         if pending is None:
-            raise RuntimeError("release_then_request_gpus internal error: pending request not created")
+            raise RuntimeError("notify_release_then_request_gpus internal error: pending request not created")
         if pending.error is not None:
             raise RuntimeError(pending.error)
         return list(pending.result)
@@ -1688,11 +1668,10 @@ class SchedulerImpl:
                         continue
                     alloc = self._state.active_allocations.get(cluster_id)
                     if alloc is None:
-                        raise RuntimeError(f"notify_ready_to_release for unknown cluster_id {cluster_id!r}")
+                        raise RuntimeError(f"await_release_gpus for unknown cluster_id {cluster_id!r}")
                     if alloc.priority != Priority.GENERATION:
-                        raise RuntimeError(f"notify_ready_to_release is only supported for GENERATION clusters, got {cluster_id!r}")
+                        raise RuntimeError(f"await_release_gpus is only supported for GENERATION clusters, got {cluster_id!r}")
                     if not req.dp_ranks_to_remove:
-                        req.result_released_gpu_ids = []
                         req.event.set()
                         self._state.pending_planned_release_requests.pop(cluster_id, None)
                         continue
@@ -1819,7 +1798,7 @@ class SchedulerImpl:
                 # Unblock pending generation requests when any generation worker is active.
                 # Previously this required ALL workers to be active, which caused a deadlock:
                 # when another pipeline held a GPU needed by a dp worker, the GEN request
-                # was never signaled, blocking the pipeline at release_then_request_gpus.
+                # was never signaled, blocking the pipeline at notify_release_then_request_gpus.
                 pending_gen = list(self._state.pending_bucket(Priority.GENERATION))
                 for pending in pending_gen:
                     cluster_id = pending.request.cluster_id
@@ -2359,8 +2338,8 @@ class SchedulerImpl:
                         continue
                     donor_plan.extend(picked)
 
-                # Score prefers: (1) free idle GPUs over donor shrinks, (2) donors with least
-                # remaining work (least harmful to shrink), (3) lower dp_rank for determinism.
+                # Score prefers: (1) free idle GPUs over donor shrinks, (2) donors with most
+                # remaining work (protects near-completion pipelines), (3) lower dp_rank for determinism.
                 needs_shrink = 0 if not donor_plan else 1
                 donor_percents = sorted([percent_remaining_by_pipeline_id[donor_worker.pipeline_id] for _, donor_worker, _ in donor_plan])
                 score = (needs_shrink, tuple([-p for p in donor_percents]), inactive.dp_rank)
@@ -2662,14 +2641,14 @@ class SchedulerImpl:
         # Pipeline still registered but no pending found - actual error
         raise RuntimeError(f"No pending request found for cluster_id={cluster_id!r} priority={priority!r}")
 
-    async def notify_ready_to_release(
+    async def await_release_gpus(
         self,
         *,
         pipeline_id: Optional[str] = None,
         cluster_id: Optional[str] = None,
         global_step: Optional[int] = None,
         timeout_s: Optional[float] = None,
-    ) -> List[int]:
+    ) -> None:
         """Blocking planned release API (RLix checklist).
 
         Phase 2 implementation is state-only: scheduler selects dp_ranks_to_remove for the generation cluster from
@@ -2691,9 +2670,9 @@ class SchedulerImpl:
             if alloc is None:
                 raise RuntimeError(f"cluster_id {cluster_id!r} not found in active_allocations")
             if alloc.priority != Priority.GENERATION:
-                raise RuntimeError(f"notify_ready_to_release only supports GENERATION clusters, got {cluster_id!r}")
+                raise RuntimeError(f"await_release_gpus only supports GENERATION clusters, got {cluster_id!r}")
             if not alloc.active_dp_ranks:
-                return []
+                return
 
             # Idempotency: if already pending, wait on the existing request.
             existing = self._state.pending_planned_release_requests.get(cluster_id)
@@ -2703,23 +2682,9 @@ class SchedulerImpl:
             else:
                 pipeline_id, cluster_name = parse_cluster_id(cluster_id)
                 if cluster_name != "actor_infer":
-                    raise RuntimeError(f"notify_ready_to_release only supports actor_infer generation clusters, got {cluster_id!r}")
-                infer_cfg = self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"]
-                tp_size = int(infer_cfg.get("tp_size", 1))
-                if tp_size <= 0:
-                    raise RuntimeError(f"Invalid tp_size={tp_size} for cluster_id {cluster_id!r}")
-                device_mapping = list(infer_cfg.get("device_mapping") or [])
-                if not device_mapping:
-                    raise RuntimeError(f"Missing device_mapping for cluster_id {cluster_id!r}")
+                    raise RuntimeError(f"await_release_gpus only supports actor_infer generation clusters, got {cluster_id!r}")
 
                 dp_ranks_to_remove = sorted(alloc.active_dp_ranks)
-                released_gpu_ids: List[int] = []
-                for dp_rank in sorted(alloc.active_dp_ranks):
-                    bundle = alloc.dp_rank_to_gpus.get(dp_rank)
-                    if bundle is None:
-                        start = dp_rank * tp_size
-                        bundle = device_mapping[start : start + tp_size]
-                    released_gpu_ids.extend(list(bundle or []))
 
                 req = PendingPlannedReleaseRequest(
                     cluster_id=cluster_id,
@@ -2727,7 +2692,6 @@ class SchedulerImpl:
                     event=event,
                     global_step=global_step,
                 )
-                req.result_released_gpu_ids = sorted(set(released_gpu_ids))
                 self._state.pending_planned_release_requests[cluster_id] = req
                 self._wakeup_event.set()
 
@@ -2737,12 +2701,10 @@ class SchedulerImpl:
             else:
                 await asyncio.wait_for(event.wait(), timeout=float(timeout_s))
         except asyncio.TimeoutError:
-            await self._fail_fast_shutdown(reason=f"notify_ready_to_release_timeout: cluster_id={cluster_id!r}")
+            await self._fail_fast_shutdown(reason=f"await_release_gpus_timeout: cluster_id={cluster_id!r}")
             raise
         if req.error is not None:
             raise RuntimeError(req.error)
-
-        return list(req.result_released_gpu_ids)
 
 
 def scheduler_actor_class():
