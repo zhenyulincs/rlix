@@ -405,8 +405,11 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
         # ============================================================
         # Kick off initial get_batch for all active tags (mirrors agentic_multi_lora_pipeline.py:532-545).
         # ============================================================
-        # Track in-flight refs as a single FIFO queue to keep fair wait order.
+        # Track in-flight refs as a FIFO deque for round-robin fairness.
         # Each item is (tag, get_batch_ref); tags are unique in the queue.
+        # When multiple batches are ready simultaneously, the tag closest to the
+        # deque front is selected. Consumed tags re-enter at the tail (via append),
+        # so each LoRA gets equal priority over successive ticks.
         in_flight: deque[tuple[str, Any]] = deque()
         for tag in tags:
             lora = self._tag_to_lora[tag]
@@ -489,17 +492,37 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
                     )
 
                 try:
-                    # Build wait inputs using queue order (head first) to avoid fixed tag-order bias.
+                    # Round-robin fairness: when multiple batches are ready simultaneously,
+                    # pick the one closest to the deque front instead of letting ray.wait
+                    # pick arbitrarily (which biases toward faster adapters).
                     active_refs = [ref for _, ref in in_flight]
-                    assert active_refs, f"no in-flight get_batch refs; lora_step={lora_step}"
-                    ready, _ = ray.wait(active_refs, num_returns=1, timeout=rollout_get_batch_timeout_s)
-                    if not ready:
-                        raise RuntimeError(
-                            f"get_batch timed out ({rollout_get_batch_timeout_s}s) "
-                            f"in_flight={sorted(tag for tag, _ in in_flight)}"
-                        )
-                    ready_ref = ready[0]
-                    ready_tag = next(tag for tag, ref in in_flight if ref == ready_ref)
+                    if not active_refs:
+                        raise RuntimeError(f"no in-flight get_batch refs; lora_step={lora_step}")
+                    # Probe: which refs are already done? (non-blocking)
+                    ready_now, _ = ray.wait(active_refs, num_returns=len(active_refs), timeout=0)
+                    if ready_now:
+                        # Multiple ready: deque-front wins (round-robin fairness).
+                        ready_ids = {id(ref) for ref in ready_now}
+                        ready_ref = None
+                        ready_tag = None
+                        for tag, ref in in_flight:
+                            if id(ref) in ready_ids:
+                                ready_ref = ref
+                                ready_tag = tag
+                                break
+                        # Defensive: ready_now was non-empty so we must find a match.
+                        if ready_ref is None:
+                            raise RuntimeError("ray.wait returned ready refs but none matched in_flight")
+                    else:
+                        # Nothing ready yet: block until one completes.
+                        ready, _ = ray.wait(active_refs, num_returns=1, timeout=rollout_get_batch_timeout_s)
+                        if not ready:
+                            raise RuntimeError(
+                                f"get_batch timed out ({rollout_get_batch_timeout_s}s) "
+                                f"in_flight={sorted(tag for tag, _ in in_flight)}"
+                            )
+                        ready_ref = ready[0]
+                        ready_tag = next(tag for tag, ref in in_flight if ref == ready_ref)
                     # Compute rollout wait time (pattern from agentic_multi_lora_pipeline.py:680-683).
                     wait_s = time.monotonic() - submitted_at_mono.pop(ready_tag)
 

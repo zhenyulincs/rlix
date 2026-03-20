@@ -82,7 +82,7 @@ def _kill_local_ray() -> None:
 def _kill_ray_on_node(node_ip: str):
     """Spawn a one-shot remote task on ``node_ip`` that calls ``_kill_local_ray()``."""
 
-    @ray.remote(max_retries=0)
+    @ray.remote(max_retries=0, max_task_retries=0)
     def _kill_local_ray_task():
         _kill_local_ray()
 

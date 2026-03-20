@@ -464,6 +464,24 @@ class PipelineCoordinator(Coordinator):
         query and use.
         If all infer workers are sleeping (preempted by concurrent pipelines), sync is
         skipped — sleeping workers receive the updated LoRA via expand_worker on wake.
+
+        Design tradeoff — lock held across NCCL broadcast (G11-RULE-48.2):
+        _resize_sync_lock is intentionally held for the entire sync_selected_workers RPC
+        (NCCL all-gather, seconds to minutes). This serializes weight sync with resize_infer
+        so the active_dp_ranks set cannot change mid-broadcast (which would corrupt the
+        collective). The cost is that scheduler-initiated shrink/expand is blocked during
+        the broadcast window. Mitigations:
+          - resize_infer acquires the lock with _RESIZE_LOCK_TIMEOUT_S (default 180s),
+            so the scheduler is never blocked indefinitely.
+          - sync only targets already-active ranks; if all workers are sleeping, the lock
+            is released immediately (early return below).
+          - On NCCL hang, the lock timeout on the resize_infer side surfaces the failure
+            as a RuntimeError rather than a silent deadlock.
+        Alternatives considered and rejected:
+          - Releasing the lock before sync and re-checking ranks after: risks sending
+            weights to a worker that was shrunk mid-broadcast (NCCL rank mismatch → crash).
+          - Adding a per-sync timeout: NCCL collectives are not cancellable; a timeout
+            would leave the communicator in a broken state.
         """
         acquired = self._resize_sync_lock.acquire(timeout=_RESIZE_LOCK_TIMEOUT_S)
         if not acquired:
