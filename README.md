@@ -2,7 +2,7 @@
 
 <img src="assets/rlix-logo-text-horizontal.svg" width="40%" alt="RLix Logo">
 
-<h3>Run more LLM RL experiments, wait less for GPUs</h3>
+<h3>Run more RL experiments. Wait less for GPUs.</h3>
 
 <p>
   <a href="https://github.com/rlops/rlix/blob/main/LICENSE">
@@ -24,16 +24,16 @@
 
 </div>
 
-RL research often means running many experiments: testing new ideas, comparing configurations, and running ablations. But GPU clusters have limited capacity, so promising jobs can spend too much time waiting to start. This is especially frustrating in agentic RL, where a small number of slow multi-turn rollouts can delay the whole job while most GPUs sit idle.
+RL research often means running lots of experiments: trying new ideas, comparing settings, and running ablations. But when GPU capacity is tight, promising jobs can spend too long waiting to start. In long-horizon agentic RL, such as coding and computer-use agents, a few slow rollouts can hold everything up while many GPUs sit idle.
 
-RLix is a GPU cluster manager that lets multiple RL jobs share GPU capacity. When one job has spare capacity, RLix gives it to other jobs and takes it back when needed. More experiments can run at the same time, wait time drops, and GPU utilization goes up. RLix changes how GPU capacity is shared, not how each pipeline trains.
+RLix helps you get more out of the GPUs you already have. It lets multiple RL jobs share GPU capacity more effectively, so you can run more experiments at once, spend less time waiting for GPUs, and improve GPU utilization without changing how each pipeline trains.
 
 ## Features
 
-- **Support on-policy and off-policy pipelines**: RLix works with both, while preserving each pipeline's training behavior within its own staleness bounds.
+- **Support on-policy and off-policy pipelines**: RLix works with both, while keeping each pipeline within its own staleness bounds.
 - **Share GPU capacity across jobs**: Full-finetune pipelines can use idle GPU capacity from other jobs instead of waiting for dedicated resources.
-- **Share one base model across LoRA adapters**: Multi-LoRA pipelines can further share one base model across multiple adapters within a pipeline.
-- **Grow and shrink rollouts automatically**: Rollout workers expand and shrink based on current rollout demand and available GPU capacity.
+- **Share one base model across LoRA adapters**: Multi-LoRA pipelines train multiple adapters on one shared base model, reducing GPU and memory overhead within a pipeline.
+- **Grow and shrink rollouts automatically**: Rollout workers expand when demand grows and shrink when GPUs are needed elsewhere.
 
 ## Installation
 
@@ -45,14 +45,14 @@ pip install -e .
 
 ## Quick Start
 
-The example below shows a minimal RLix setup for starting one pipeline under RLix management.
+The example below shows the smallest RLix setup for launching one pipeline.
 
 Workflow overview:
 
-1. Initialize RLix and get the orchestrator.
-2. Allocate a pipeline ID.
-3. Register the pipeline's GPU layout and namespace.
-4. Admit the pipeline so RLix can schedule it.
+1. Start RLix.
+2. Create a pipeline ID.
+3. Tell RLix which GPUs and namespace the pipeline will use.
+4. Let RLix manage GPU allocation for the pipeline.
 5. Create the pipeline coordinator.
 6. Create the pipeline actor and run it.
 
@@ -109,23 +109,23 @@ RLix currently supports two built-in pipeline types:
 
 ### Full Finetune Pipeline (`RollFullFinetunePipeline`)
 
-Full-parameter training with elastic GPU expand and shrink. Each job trains all model weights while allowing idle GPU capacity to be used by other jobs.
-Use this when you want to maximize model performance and have enough GPUs and memory for full finetuning, while still sharing spare GPU capacity across jobs.
+Full-parameter training with elastic GPU expand and shrink. Each job trains all model weights, while idle GPU capacity can still be shared with other jobs.
+Choose this when you want the best model quality and have enough GPUs and memory for full finetuning, but still want to share spare GPU capacity across jobs.
 
 ### Multi-LoRA Pipeline (`RollMultiLoraPipeline`)
 
 Concurrent training of multiple LoRA adapters on a shared base model, with a separate optimizer for each adapter. Jobs share the base model in GPU memory while keeping adapter weights and optimizer states independent.
-Use this when you want much lower GPU and memory usage than full finetuning, or when you want to train multiple adapters on the same base model and further increase sharing within one pipeline.
+Choose this when you want lower GPU and memory usage than full finetuning, or when you want to train multiple adapters on the same base model and increase sharing within one pipeline.
 
 RLix also supports custom pipelines and integrations that follow the RLix interface.
 
 ## Architecture
 
-RLix has one shared cluster management layer and one coordinator for each pipeline. The shared layer manages GPU allocation across jobs, while each pipeline keeps its own training logic.
+RLix has one shared layer that coordinates GPU allocation across jobs and one coordinator for each pipeline. Each pipeline keeps its own training logic.
 
 ```text
 ┌───────────────────────────────────────────────────────────┐
-│                RLix Shared Cluster Management Layer       │
+│                 RLix Shared Job Management Layer          │
 ├──────────────────┬──────────────────┬─────────────────────┤
 │   Orchestrator   │    Scheduler     │  Resource Manager   │
 │   (job lifecycle)│ (priorities +    │ (cluster resources) │
@@ -148,7 +148,7 @@ RLix has one shared cluster management layer and one coordinator for each pipeli
 
 RLix gives GPUs to higher-priority stages first. Most stages keep their GPUs until they finish. Rollout is the flexible stage: it can use spare GPU capacity when available and give it back when higher-priority work needs it.
 
-Rollout has the lowest priority and is always preemptable. When multiple jobs are rolling out at the same time, RLix divides the available GPU capacity based on how much rollout work each job still has to do, while respecting placement constraints. To keep rollout workers lightweight, RLix loads inference weights only when they are active and releases them again when they shrink.
+Rollout has the lowest priority and is always preemptable, meaning it can give GPUs back when higher-priority work needs them. When multiple jobs are rolling out at the same time, RLix divides the available GPU capacity based on how much rollout work each job still has to do, while still respecting placement constraints. To keep rollout workers lightweight, RLix loads inference weights only while a worker is active and releases them again when the worker shrinks.
 
 From highest to lowest priority:
 
@@ -158,7 +158,7 @@ From highest to lowest priority:
 * **3 Old-Policy Log Probs**: Log-probability computation under the previous policy.
 * **4 Reference-Model Log Probs**: Log-probability computation under the reference model.
 * **5 Value Compute**: Value estimation for advantage calculation.
-* **6 Rollout**: Trajectory sampling; always preemptable.
+* **6 Rollout**: Trajectory sampling; can give GPUs back when needed.
 
 ## Acknowledgements
 
