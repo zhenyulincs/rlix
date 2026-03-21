@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, List
+from typing import Any, List, Optional
 
 from rlix.protocol.types import ActionResponse, ProgressReport
 
@@ -26,6 +26,21 @@ class Coordinator(ABC):
     @abstractmethod
     def report_progress_from_scheduler(self, report: ProgressReport) -> None:
         """Receive a per-scheduler progress snapshot and forward aggregated progress to the rlix scheduler."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def clear_progress_stream(self, *, mode: str, adapter_id: Optional[str]) -> None:
+        """Remove a scheduler stream from progress tracking.
+
+        Called by GroupQueueManager after get_batch() returns to indicate this
+        stream no longer contributes demand. The coordinator removes the stream
+        from its local aggregation and, if no streams remain, forwards a clear
+        to the rlix scheduler.
+
+        Args:
+            mode: Stream mode ("train" or "val").
+            adapter_id: LoRA adapter ID, or None for full-finetune.
+        """
         raise NotImplementedError
 
     @abstractmethod

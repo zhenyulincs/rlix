@@ -1,7 +1,29 @@
+"""Fail-fast validation for scheduler execution plans.
+
+Validates an ``ExecutionPlan`` against 11 numbered invariant conditions before the
+scheduler applies any mutations to cluster state.  The conditions fall into four
+categories:
+
+* **GPU accounting** (conditions 4, 8, 9): idle/allocated sets are disjoint, the
+  GPU universe is conserved after simulating the plan, and no GPU is freed twice.
+* **Operation integrity** (conditions 1, 3): each cluster appears in at most one
+  operation type per cycle (allocate vs. remove).
+* **State-transition legality** (conditions 2, 5, 6, 7): DP-rank shrink/expand ops
+  target only generation clusters, operate on valid DP ranks within device-mapping
+  bounds, and respect ``max_dp_workers``.
+* **Overlap prevention** (condition 10): no DP rank or GPU is claimed by two
+  clusters simultaneously.
+* **Referential integrity** (condition 11): clusters scheduled for removal must
+  exist in active allocations.
+
+All checks raise ``ValidationError`` with the condition number so callers can
+programmatically identify the failing invariant.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 
 from rlix.protocol.types import Priority
 from rlix.scheduler.types import (
@@ -16,24 +38,58 @@ from rlix.scheduler.types import (
 
 @dataclass(frozen=True, slots=True)
 class ValidationInputs:
+    """Snapshot of scheduler state needed for plan validation.
+
+    Captures the three pieces of global state that the validator must inspect:
+    the pipeline registry (cluster configs with device mappings and TP sizes),
+    the current GPU allocations, and the set of unassigned GPUs.
+
+    Attributes:
+        pipeline_registry: Pipeline ID -> pipeline config dict.  Each config
+            contains a ``"cluster_configs"`` mapping of cluster name to its
+            ``device_mapping``, ``tp_size``, and optional ``max_dp_workers``.
+        active_allocations: Cluster ID -> live ``ClusterAllocation`` at the
+            start of the scheduling cycle.
+        idle_gpus: GPU device indices not currently assigned to any cluster.
+    """
+
     pipeline_registry: Dict[str, Dict[str, Any]]
     active_allocations: Dict[str, ClusterAllocation]
     idle_gpus: Set[int]
 
 
 def _cluster_config(inputs: ValidationInputs, cluster_id: str) -> Dict[str, Any]:
+    """Look up the cluster config dict for *cluster_id* from the pipeline registry.
+
+    Args:
+        inputs: Current scheduler state snapshot.
+        cluster_id: Composite ``"{pipeline_id}/{cluster_name}"`` identifier.
+
+    Returns:
+        The cluster configuration dict containing ``device_mapping``,
+        ``tp_size``, and optionally ``max_dp_workers``.
+
+    Raises:
+        KeyError: If the pipeline or cluster name is not registered.
+    """
     pipeline_id, cluster_name = parse_cluster_id(cluster_id)
     pipeline = inputs.pipeline_registry.get(pipeline_id)
     if pipeline is None:
         raise KeyError(f"pipeline_id {pipeline_id!r} not registered")
     cluster_configs = pipeline.get("cluster_configs") or {}
-    config = cluster_configs.get(cluster_name)
+    config: Any = cluster_configs.get(cluster_name)
     if config is None:
         raise KeyError(f"cluster_name {cluster_name!r} not registered for pipeline_id {pipeline_id!r}")
-    return config
+    result: Dict[str, Any] = config
+    return result
 
 
 def _cluster_tp_size(inputs: ValidationInputs, cluster_id: str) -> int:
+    """Return the tensor-parallel size for *cluster_id* (defaults to 1).
+
+    Raises:
+        ValueError: If ``tp_size`` is non-positive.
+    """
     tp_size = int(_cluster_config(inputs, cluster_id).get("tp_size", 1))
     if tp_size <= 0:
         raise ValueError(f"Invalid tp_size={tp_size} for cluster_id {cluster_id!r}")
@@ -41,6 +97,11 @@ def _cluster_tp_size(inputs: ValidationInputs, cluster_id: str) -> int:
 
 
 def _cluster_device_mapping(inputs: ValidationInputs, cluster_id: str) -> List[int]:
+    """Return the ordered list of GPU device indices assigned to *cluster_id*.
+
+    Raises:
+        ValueError: If ``device_mapping`` is missing or empty.
+    """
     mapping = list(_cluster_config(inputs, cluster_id).get("device_mapping") or [])
     if not mapping:
         raise ValueError(f"Missing device_mapping for cluster_id {cluster_id!r}")
@@ -48,6 +109,15 @@ def _cluster_device_mapping(inputs: ValidationInputs, cluster_id: str) -> List[i
 
 
 def _max_dp_workers(inputs: ValidationInputs, cluster_id: str) -> int:
+    """Derive the maximum number of data-parallel workers for *cluster_id*.
+
+    If the cluster config provides an explicit ``max_dp_workers``, that value is
+    returned.  Otherwise the cap is inferred as
+    ``len(device_mapping) // tp_size``.
+
+    Returns:
+        Maximum DP worker count (0 when device_mapping is empty).
+    """
     cfg = _cluster_config(inputs, cluster_id)
     tp_size = int(cfg.get("tp_size", 1))
     device_mapping = list(cfg.get("device_mapping") or [])
@@ -80,9 +150,34 @@ def validate_dp_ranks_to_add(*, dp_ranks_to_add: List[int], max_dp_ranks: int) -
 
 
 def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) -> None:
-    """Fail-fast validation for the scheduler execution plan (11 critical conditions).
+    """Validate an execution plan against 11 invariant conditions before it is applied.
 
-    This is intentionally strict and is designed to catch plan/state inconsistencies before execution.
+    The validator simulates the plan's effects (shrinks, removals, allocations,
+    expansions) on a copy of the current state and checks every invariant at
+    each step.  If any condition is violated a ``ValidationError`` is raised
+    with the condition number so the caller can identify the failure
+    programmatically.
+
+    Checked conditions:
+        1. **Operation uniqueness** — each cluster appears at most once per op list.
+        2. **State-transition legality** — shrink/expand ops target generation clusters only.
+        3. **Mutual exclusivity** — a cluster cannot be both allocated and removed.
+        4. **GPU state consistency** — idle and allocated sets stay disjoint throughout.
+        5. **DP-rank activity** — shrinks remove only active ranks; expansions add only inactive ranks.
+        6. **Device-mapping bounds** — allocated GPUs fall within the cluster's device mapping
+           and bundle sizes match ``tp_size``.
+        7. **Capacity limits** — expansions do not exceed ``max_dp_workers``.
+        8. **Conservation** — after simulation, idle + allocated equals the full GPU universe.
+        9. **No double-free** — no GPU is freed more than once within one plan.
+        10. **No overlap** — no GPU or DP rank is claimed by two clusters simultaneously.
+        11. **Existence** — clusters scheduled for removal must exist in active allocations.
+
+    Args:
+        plan: The proposed execution plan to validate.
+        inputs: Scheduler state snapshot (registry, allocations, idle GPUs).
+
+    Raises:
+        ValidationError: On the first condition violation found.
     """
 
     # Condition 4 (GPU state consistency): idle and allocated disjoint at entry.
@@ -94,10 +189,37 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
             context={"overlap": sorted(allocated_gpus & inputs.idle_gpus)},
         )
 
-    # Condition 1 (operation uniqueness): handled by construction for sched_guided_shrink_ops.
+    # Condition 1 (operation uniqueness): each cluster appears in at most one op per list.
+    shrink_cluster_ids = [op.cluster_id for op in plan.sched_guided_shrink_ops]
+    if len(shrink_cluster_ids) != len(set(shrink_cluster_ids)):
+        raise ValidationError(
+            "duplicate cluster_id in sched_guided_shrink_ops",
+            condition=1,
+            context={
+                "cluster_ids": sorted(cid for cid in set(shrink_cluster_ids) if shrink_cluster_ids.count(cid) > 1)
+            },
+        )
+    alloc_cluster_ids = [op.cluster_id for op in plan.sched_guided_allocation_ops]
+    if len(alloc_cluster_ids) != len(set(alloc_cluster_ids)):
+        raise ValidationError(
+            "duplicate cluster_id in sched_guided_allocation_ops",
+            condition=1,
+            context={"cluster_ids": sorted(cid for cid in set(alloc_cluster_ids) if alloc_cluster_ids.count(cid) > 1)},
+        )
+    pending_cluster_ids = [op.cluster_id for op in plan.signal_pending_allocation_ops]
+    if len(pending_cluster_ids) != len(set(pending_cluster_ids)):
+        raise ValidationError(
+            "duplicate cluster_id in signal_pending_allocation_ops",
+            condition=1,
+            context={
+                "cluster_ids": sorted(cid for cid in set(pending_cluster_ids) if pending_cluster_ids.count(cid) > 1)
+            },
+        )
 
     # Condition 3 (mutual exclusivity): cannot both allocate and remove the same cluster in one cycle.
-    alloc_targets = {op.cluster_id for op in plan.signal_pending_allocation_ops} | {op.cluster_id for op in plan.sched_guided_allocation_ops}
+    alloc_targets = {op.cluster_id for op in plan.signal_pending_allocation_ops} | {
+        op.cluster_id for op in plan.sched_guided_allocation_ops
+    }
     alloc_remove_overlap = alloc_targets & set(plan.clusters_to_remove)
     if alloc_remove_overlap:
         raise ValidationError(
@@ -107,33 +229,45 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
         )
 
     # Condition 2 (state transitions): non-generation clusters must not be shrunk/expanded via DP-rank ops.
-    for op in list(plan.sched_guided_shrink_ops):
-        if not is_generation_cluster(op.cluster_id):
-            raise ValidationError("shrink op applied to non-generation cluster", condition=2, context={"cluster_id": op.cluster_id})
-    for op in plan.sched_guided_allocation_ops:
-        if not is_generation_cluster(op.cluster_id):
+    for shrink_op in list(plan.sched_guided_shrink_ops):
+        if not is_generation_cluster(shrink_op.cluster_id):
+            raise ValidationError(
+                "shrink op applied to non-generation cluster",
+                condition=2,
+                context={"cluster_id": shrink_op.cluster_id},
+            )
+    for alloc_op_c2 in plan.sched_guided_allocation_ops:
+        if not is_generation_cluster(alloc_op_c2.cluster_id):
             raise ValidationError(
                 "generation allocation op applied to non-generation cluster",
                 condition=2,
-                context={"cluster_id": op.cluster_id},
+                context={"cluster_id": alloc_op_c2.cluster_id},
             )
 
     # Condition 11 (consistency): clusters_to_remove must only contain clusters that exist.
     missing = [cid for cid in plan.clusters_to_remove if cid not in inputs.active_allocations]
     if missing:
-        raise ValidationError("clusters_to_remove contains unknown cluster_id", condition=11, context={"cluster_ids": missing})
+        raise ValidationError(
+            "clusters_to_remove contains unknown cluster_id", condition=11, context={"cluster_ids": missing}
+        )
 
     # Condition 6 (device mapping boundaries) and Condition 7 (capacity limits) and Condition 5 (dp-rank activity).
-    for op in plan.signal_pending_allocation_ops:
-        device_mapping = set(_cluster_device_mapping(inputs, op.cluster_id))
-        if not set(op.gpus_to_allocate).issubset(device_mapping):
+    for signal_op_c6 in plan.signal_pending_allocation_ops:
+        device_mapping = set(_cluster_device_mapping(inputs, signal_op_c6.cluster_id))
+        if not set(signal_op_c6.gpus_to_allocate).issubset(device_mapping):
             raise ValidationError(
                 "allocation uses GPU IDs outside device_mapping",
                 condition=6,
-                context={"cluster_id": op.cluster_id, "gpus": sorted(set(op.gpus_to_allocate) - device_mapping)},
+                context={
+                    "cluster_id": signal_op_c6.cluster_id,
+                    "gpus": sorted(set(signal_op_c6.gpus_to_allocate) - device_mapping),
+                },
             )
 
-    # Simulate plan effects to validate global GPU accounting and overlaps.
+    # --- Simulation phase ---
+    # Deep-copy allocations and idle set so mutations during simulation
+    # don't affect the caller's state.  The plan is applied in order:
+    # shrinks -> removals -> pending allocations -> expansions.
     sim_allocations: Dict[str, ClusterAllocation] = {}
     for cid, alloc in inputs.active_allocations.items():
         sim_allocations[cid] = ClusterAllocation(
@@ -151,6 +285,7 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
     freed_gpus: Set[int] = set()
 
     def _free_bundle(cluster_id: str, bundle: Set[int]) -> None:
+        """Return *bundle* GPUs to the idle pool; raise on double-free (condition 9)."""
         nonlocal freed_gpus, sim_idle
         if freed_gpus & bundle:
             raise ValidationError(
@@ -162,6 +297,7 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
         sim_idle |= set(bundle)
 
     def _ensure_dp_rank_mapping(cluster_id: str) -> None:
+        """Lazily build dp_rank_to_gpus for a simulated allocation if missing."""
         alloc = sim_allocations.get(cluster_id)
         if alloc is None:
             return
@@ -171,132 +307,161 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
         alloc.dp_rank_to_gpus = build_dp_rank_mapping(alloc.gpu_ids, tp_size)
 
     # Apply shrinks.
-    for op in plan.sched_guided_shrink_ops:
-        if not op.dp_ranks_to_remove:
+    for sim_shrink_op in plan.sched_guided_shrink_ops:
+        if not sim_shrink_op.dp_ranks_to_remove:
             continue
-        alloc = sim_allocations.get(op.cluster_id)
-        if alloc is None:
-            continue
-        if alloc.priority != Priority.GENERATION:
-            raise ValidationError("shrink on non-generation allocation", condition=2, context={"cluster_id": op.cluster_id})
-        _ensure_dp_rank_mapping(op.cluster_id)
-        active = set(alloc.active_dp_ranks)
-        if not set(op.dp_ranks_to_remove).issubset(active):
+        sim_shrink_alloc = sim_allocations.get(sim_shrink_op.cluster_id)
+        if sim_shrink_alloc is None:
+            raise ValidationError(
+                "shrink op targets unregistered cluster",
+                condition=11,
+                context={"cluster_id": sim_shrink_op.cluster_id},
+            )
+        if sim_shrink_alloc.priority != Priority.GENERATION:
+            raise ValidationError(
+                "shrink on non-generation allocation",
+                condition=2,
+                context={"cluster_id": sim_shrink_op.cluster_id},
+            )
+        _ensure_dp_rank_mapping(sim_shrink_op.cluster_id)
+        active = set(sim_shrink_alloc.active_dp_ranks)
+        if not set(sim_shrink_op.dp_ranks_to_remove).issubset(active):
             raise ValidationError(
                 "shrink removes inactive dp ranks",
                 condition=5,
-                context={"cluster_id": op.cluster_id, "active": sorted(active), "remove": op.dp_ranks_to_remove},
+                context={
+                    "cluster_id": sim_shrink_op.cluster_id,
+                    "active": sorted(active),
+                    "remove": sim_shrink_op.dp_ranks_to_remove,
+                },
             )
-        for dp_rank in op.dp_ranks_to_remove:
-            bundle = set(alloc.dp_rank_to_gpus.get(dp_rank) or [])
+        for dp_rank in sim_shrink_op.dp_ranks_to_remove:
+            bundle = set(sim_shrink_alloc.dp_rank_to_gpus.get(dp_rank) or [])
             if not bundle:
                 raise ValidationError(
                     "missing dp_rank_to_gpus bundle for dp_rank",
                     condition=6,
-                    context={"cluster_id": op.cluster_id, "dp_rank": dp_rank},
+                    context={"cluster_id": sim_shrink_op.cluster_id, "dp_rank": dp_rank},
                 )
-            _free_bundle(op.cluster_id, bundle)
-            alloc.active_dp_ranks.discard(dp_rank)
-            alloc.dp_rank_to_gpus.pop(dp_rank, None)
-            alloc.gpu_ids = [g for g in alloc.gpu_ids if g not in bundle]
+            _free_bundle(sim_shrink_op.cluster_id, bundle)
+            sim_shrink_alloc.active_dp_ranks.discard(dp_rank)
+            sim_shrink_alloc.dp_rank_to_gpus.pop(dp_rank, None)
+            sim_shrink_alloc.gpu_ids = [g for g in sim_shrink_alloc.gpu_ids if g not in bundle]
 
     # Apply clusters_to_remove (any remaining GPUs are freed).
-    for cluster_id in sorted(plan.clusters_to_remove):
-        alloc = sim_allocations.pop(cluster_id, None)
-        if alloc is None:
+    for remove_cluster_id in sorted(plan.clusters_to_remove):
+        remove_alloc = sim_allocations.pop(remove_cluster_id, None)
+        if remove_alloc is None:
             continue
-        _free_bundle(cluster_id, set(alloc.gpu_ids))
+        _free_bundle(remove_cluster_id, set(remove_alloc.gpu_ids))
 
     # Apply pending allocations (initial allocations).
-    for op in plan.signal_pending_allocation_ops:
-        if not op.gpus_to_allocate:
+    for sim_signal_op in plan.signal_pending_allocation_ops:
+        if not sim_signal_op.gpus_to_allocate:
             continue
-        needed = set(op.gpus_to_allocate)
+        needed = set(sim_signal_op.gpus_to_allocate)
         if not needed.issubset(sim_idle):
             raise ValidationError(
                 "allocation consumes non-idle GPUs",
                 condition=4,
-                context={"cluster_id": op.cluster_id, "gpus": sorted(needed - sim_idle)},
+                context={"cluster_id": sim_signal_op.cluster_id, "gpus": sorted(needed - sim_idle)},
             )
         sim_idle -= needed
-        tp_size = _cluster_tp_size(inputs, op.cluster_id)
+        tp_size = _cluster_tp_size(inputs, sim_signal_op.cluster_id)
         dp_rank_to_gpus = build_dp_rank_mapping(sorted(needed), tp_size)
-        active_dp_ranks = set(dp_rank_to_gpus.keys()) if is_generation_cluster(op.cluster_id) else set()
-        sim_allocations[op.cluster_id] = ClusterAllocation(
-            cluster_id=op.cluster_id,
+        active_dp_ranks = set(dp_rank_to_gpus.keys()) if is_generation_cluster(sim_signal_op.cluster_id) else set()
+        sim_allocations[sim_signal_op.cluster_id] = ClusterAllocation(
+            cluster_id=sim_signal_op.cluster_id,
             gpu_ids=sorted(needed),
-            priority=Priority(op.priority) if op.priority is not None else Priority.GENERATION,
+            priority=Priority(sim_signal_op.priority) if sim_signal_op.priority is not None else Priority.GENERATION,
             active_dp_ranks=active_dp_ranks,
             dp_rank_to_gpus=dp_rank_to_gpus,
         )
 
     # Apply expansions (generation dp-rank add).
-    for op in plan.sched_guided_allocation_ops:
-        tp_size = _cluster_tp_size(inputs, op.cluster_id)
-        if len(op.gpus_to_allocate) % tp_size != 0:
+    for sim_alloc_op in plan.sched_guided_allocation_ops:
+        tp_size = _cluster_tp_size(inputs, sim_alloc_op.cluster_id)
+        if any(len(gpus) != tp_size for gpus in sim_alloc_op.dp_rank_to_gpus_to_add.values()):
             raise ValidationError(
-                "expansion gpus_to_allocate not divisible by tp_size",
+                "expansion bundle size does not match tp_size",
                 condition=6,
-                context={"cluster_id": op.cluster_id, "tp_size": tp_size, "len": len(op.gpus_to_allocate)},
+                context={
+                    "cluster_id": sim_alloc_op.cluster_id,
+                    "tp_size": tp_size,
+                },
             )
-        needed = set(op.gpus_to_allocate)
+
+        # Intra-op duplicate-GPU check: no GPU may appear in two bundles within one op.
+        seen_in_op: Set[int] = set()
+        for dp_rank, gpu_bundle in sim_alloc_op.dp_rank_to_gpus_to_add.items():
+            overlap = seen_in_op & set(gpu_bundle)
+            if overlap:
+                raise ValidationError(
+                    "duplicate GPU within expansion op",
+                    condition=6,
+                    context={"cluster_id": sim_alloc_op.cluster_id, "dp_rank": dp_rank, "gpus": sorted(overlap)},
+                )
+            seen_in_op |= set(gpu_bundle)
+
+        needed = {gpu_id for gpus in sim_alloc_op.dp_rank_to_gpus_to_add.values() for gpu_id in gpus}
         if not needed.issubset(sim_idle):
             raise ValidationError(
                 "expansion consumes non-idle GPUs",
                 condition=4,
-                context={"cluster_id": op.cluster_id, "gpus": sorted(needed - sim_idle)},
+                context={"cluster_id": sim_alloc_op.cluster_id, "gpus": sorted(needed - sim_idle)},
             )
         sim_idle -= needed
 
-        alloc = sim_allocations.get(op.cluster_id)
-        if alloc is None:
-            alloc = ClusterAllocation(
-                cluster_id=op.cluster_id,
+        sim_expand_alloc = sim_allocations.get(sim_alloc_op.cluster_id)
+        if sim_expand_alloc is None:
+            sim_expand_alloc = ClusterAllocation(
+                cluster_id=sim_alloc_op.cluster_id,
                 gpu_ids=[],
                 priority=Priority.GENERATION,
                 active_dp_ranks=set(),
                 dp_rank_to_gpus={},
             )
-            sim_allocations[op.cluster_id] = alloc
+            sim_allocations[sim_alloc_op.cluster_id] = sim_expand_alloc
 
-        max_dp = _max_dp_workers(inputs, op.cluster_id)
-        validate_dp_ranks_to_add(dp_ranks_to_add=op.dp_ranks_to_add, max_dp_ranks=max_dp)
-        if len(set(alloc.active_dp_ranks) | set(op.dp_ranks_to_add)) > max_dp:
+        max_dp = _max_dp_workers(inputs, sim_alloc_op.cluster_id)
+        dp_ranks_to_add = list(sim_alloc_op.dp_rank_to_gpus_to_add.keys())
+        validate_dp_ranks_to_add(dp_ranks_to_add=dp_ranks_to_add, max_dp_ranks=max_dp)
+        if len(set(sim_expand_alloc.active_dp_ranks) | sim_alloc_op.dp_rank_to_gpus_to_add.keys()) > max_dp:
             raise ValidationError(
                 "expansion exceeds max_dp_workers",
                 condition=7,
-                context={"cluster_id": op.cluster_id, "max_dp_workers": max_dp, "add": op.dp_ranks_to_add},
+                context={
+                    "cluster_id": sim_alloc_op.cluster_id,
+                    "max_dp_workers": max_dp,
+                    "add": sorted(sim_alloc_op.dp_rank_to_gpus_to_add.keys()),
+                },
             )
-        if set(op.dp_ranks_to_add) & set(alloc.active_dp_ranks):
+        if sim_alloc_op.dp_rank_to_gpus_to_add.keys() & sim_expand_alloc.active_dp_ranks:
             raise ValidationError(
                 "expansion adds already-active dp ranks",
                 condition=5,
-                context={"cluster_id": op.cluster_id, "active": sorted(alloc.active_dp_ranks), "add": op.dp_ranks_to_add},
+                context={
+                    "cluster_id": sim_alloc_op.cluster_id,
+                    "active": sorted(sim_expand_alloc.active_dp_ranks),
+                    "add": sorted(sim_alloc_op.dp_rank_to_gpus_to_add.keys()),
+                },
             )
 
         # Condition 10: DP-rank overlap within a cluster.
-        for dp_rank in op.dp_ranks_to_add:
-            if dp_rank in alloc.dp_rank_to_gpus:
+        for dp_rank in sim_alloc_op.dp_rank_to_gpus_to_add:
+            if dp_rank in sim_expand_alloc.dp_rank_to_gpus:
                 raise ValidationError(
                     "dp_rank already exists in dp_rank_to_gpus",
                     condition=10,
-                    context={"cluster_id": op.cluster_id, "dp_rank": dp_rank},
+                    context={"cluster_id": sim_alloc_op.cluster_id, "dp_rank": dp_rank},
                 )
 
-        # Assign bundles by deterministic sort: dp_ranks_to_add order must match provided gpus_to_allocate bundles.
-        sorted_needed = sorted(needed)
-        if len(sorted_needed) != len(op.dp_ranks_to_add) * tp_size:
-            raise ValidationError(
-                "expansion bundle size mismatch",
-                condition=6,
-                context={"cluster_id": op.cluster_id},
-            )
-        for i, dp_rank in enumerate(sorted(op.dp_ranks_to_add)):
-            bundle = sorted_needed[i * tp_size : (i + 1) * tp_size]
-            alloc.dp_rank_to_gpus[dp_rank] = list(bundle)
-            alloc.active_dp_ranks.add(dp_rank)
-            alloc.gpu_ids.extend(bundle)
-        alloc.gpu_ids = sorted(set(alloc.gpu_ids))
+        # Apply expansion: rank→GPU mapping is explicit in the op.
+        for dp_rank, gpu_bundle in sim_alloc_op.dp_rank_to_gpus_to_add.items():
+            sim_expand_alloc.dp_rank_to_gpus[dp_rank] = list(gpu_bundle)
+            sim_expand_alloc.active_dp_ranks.add(dp_rank)
+            sim_expand_alloc.gpu_ids.extend(gpu_bundle)
+        sim_expand_alloc.gpu_ids = sorted(set(sim_expand_alloc.gpu_ids))
 
     # Condition 8 (conservation): idle + allocated cover a consistent GPU universe.
     # Universe is derived from all device_mappings across registered clusters.
@@ -339,10 +504,3 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
                     context={"gpu_id": gpu, "cluster_a": prev, "cluster_b": cid},
                 )
             owners[gpu] = cid
-
-
-def normalize_progress_oldest_ts(oldest_unfinished_creation_ts: Optional[float], fifo_timestamp: Optional[float]) -> Optional[float]:
-    if oldest_unfinished_creation_ts is not None:
-        return oldest_unfinished_creation_ts
-    return fifo_timestamp
-

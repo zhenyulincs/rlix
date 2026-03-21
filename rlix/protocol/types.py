@@ -16,6 +16,28 @@ PIPELINE_ACTOR_NAME_PREFIX: str = "rlix:pipeline:"
 # Name for the ROLL-specific ResourceManager singleton actor (used when RLIX_CONTROL_PLANE=rlix)
 ROLL_RESOURCE_MANAGER_ACTOR_NAME: str = "rlix:roll_resource_manager"
 
+# Cluster name constants.
+# "reward" is CPU-only: valid in registration configs but never appears in cluster_ids
+# or GPU scheduling.
+ACTOR_TRAIN_CLUSTER_NAME: str = "actor_train"
+GENERATION_CLUSTER_NAME: str = "actor_infer"
+CRITIC_CLUSTER_NAME: str = "critic"
+REFERENCE_CLUSTER_NAME: str = "reference"
+REWARD_CLUSTER_NAME: str = "reward"
+ALL_CLUSTER_NAMES: tuple[str, ...] = (
+    ACTOR_TRAIN_CLUSTER_NAME,
+    GENERATION_CLUSTER_NAME,
+    CRITIC_CLUSTER_NAME,
+    REFERENCE_CLUSTER_NAME,
+    REWARD_CLUSTER_NAME,
+)
+GPU_CLUSTER_NAMES: tuple[str, ...] = (
+    ACTOR_TRAIN_CLUSTER_NAME,
+    GENERATION_CLUSTER_NAME,
+    CRITIC_CLUSTER_NAME,
+    REFERENCE_CLUSTER_NAME,
+)
+
 
 def get_pipeline_namespace(pipeline_id: str) -> str:
     """Canonical Ray namespace for a per-pipeline coordinator actor."""
@@ -25,7 +47,6 @@ def get_pipeline_namespace(pipeline_id: str) -> str:
 @dataclass(frozen=True, slots=True)
 class ActionResponse:
     success: bool
-    error: Optional[str] = None
 
 
 class Priority(enum.IntEnum):
@@ -43,11 +64,6 @@ class Priority(enum.IntEnum):
 @dataclass(frozen=True, slots=True)
 class ProgressReport:
     pipeline_id: str
-    queued_trajectories: int
-    inflight_trajectories: int
     step_target_trajectories: int
-    percent_completed: float = 0.0
-    oldest_unfinished_creation_ts: Optional[float] = None
-    active_base_version: int = 0
     fifo_timestamp: Optional[float] = None
     metrics: Optional[Dict[str, Any]] = None

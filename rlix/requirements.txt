@@ -1,8 +1,7 @@
 # Runtime dependencies for the rlix package
 # tg4perfetto: GPU/scheduler timeline tracing via Perfetto UI
 # Requires ==0.0.6 for Group.create_group() support (used by queue sub-group tracing)
-tg4perfetto==0.0.6
-protobuf<3.21.0
+tg4perfetto @ git+https://github.com/rlops/tg4perfetto.git
 
 # ROLL framework - core RL infrastructure dependency
 roll @ git+https://github.com/rlops/ROLL.git

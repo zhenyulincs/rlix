@@ -12,7 +12,7 @@ __all__ = [
 
 __version__ = "0.1.0"
 
-from rlix.init import init  # noqa: E402
+from rlix.client.client import connect as init  # noqa: E402
 
 
 # Lazy imports to avoid circular dependency: rlix.pipeline imports roll.pipeline
@@ -20,6 +20,7 @@ from rlix.init import init  # noqa: E402
 def __getattr__(name: str) -> object:
     if name in ("PipelineCoordinator", "RollFullFinetunePipeline", "RollMultiLoraPipeline"):
         from rlix.pipeline import PipelineCoordinator, RollFullFinetunePipeline, RollMultiLoraPipeline
+
         _lazy_exports = {
             "PipelineCoordinator": PipelineCoordinator,
             "RollFullFinetunePipeline": RollFullFinetunePipeline,
