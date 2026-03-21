@@ -37,10 +37,13 @@ RLix helps you get more out of the GPUs you already have. It lets multiple RL jo
 
 ## Installation
 
+`setup_env.sh` is for Linux machines with working NVIDIA GPUs and drivers already installed. It installs Miniconda if needed, creates the `rlix` Conda environment, installs Python 3.10 and CUDA 12.4 build dependencies, and installs ROLL and RLix into that environment.
+
 ```bash
 git clone https://github.com/rlops/rlix.git
 cd rlix
-pip install -e .
+bash setup_env.sh
+conda activate rlix
 ```
 
 ## Quick Start
@@ -101,7 +104,22 @@ pipeline_actor = ray.get(
 ray.get(pipeline_actor.run.remote())
 ```
 
-See [examples/](examples/) for complete multi-pipeline examples and full configuration options.
+## Examples
+
+You can also run the example pipelines in [examples/](examples/) directly:
+
+```bash
+# Run a single full-finetune pipeline
+conda run -n rlix --no-capture-output python examples/start_multi_pipeline_test.py --config_name full_finetune_pipeline1
+
+# Run two full-finetune pipelines concurrently
+conda run -n rlix --no-capture-output python examples/start_multi_pipeline_test.py --config_name full_finetune_pipeline1,full_finetune_pipeline2
+
+# Run one full-finetune pipeline and one multi-LoRA pipeline concurrently
+conda run -n rlix --no-capture-output python examples/start_multi_pipeline_test.py --config_name full_finetune_pipeline1,multi_lora_pipeline2
+```
+
+See [examples/](examples/) for more multi-pipeline examples and full configuration options.
 
 ## Pipeline Types
 
