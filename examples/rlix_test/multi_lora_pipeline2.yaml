@@ -6,7 +6,7 @@ hydra:
     dir: .
   output_subdir: null
 
-# pipeline_cls: roll.pipeline.agentic.agentic_multi_lora_pipeline.AgenticMultiLoraPipeline
+pipeline_cls: rlix.pipeline.multi_lora_pipeline.RollMultiLoraPipeline
 # track_with: wandb
 # tracker_kwargs:
 #   entity: "khd6t7hdhn-university-of-pennsylvania"
@@ -38,7 +38,7 @@ system_envs:
   OMP_NUM_THREADS: "1"
   MKL_NUM_THREADS: "1"
   OPENBLAS_NUM_THREADS: "1"
-  RAY_grpc_server_thread_pool_size: "4"
+  RAY_num_server_call_thread: "4"
   TORCHINDUCTOR_COMPILE_THREADS: "1"
   TORCHINDUCTOR_MAX_AUTOTUNE: "0"
 

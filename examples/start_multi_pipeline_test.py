@@ -113,9 +113,9 @@ def main() -> None:
         raise ValueError("--config_name must be non-empty")
 
     # Initialize a local Ray runtime if one is not already running.
-    _grpc_pool = os.environ.get("RAY_grpc_server_thread_pool_size", "4")
+    _grpc_pool = os.environ.get("RAY_num_server_call_thread", "4")
     _omp = os.environ.get("OMP_NUM_THREADS", "1")
-    print(f"[ENV] RAY_grpc_server_thread_pool_size={_grpc_pool}")
+    print(f"[ENV] RAY_num_server_call_thread={_grpc_pool}")
     print(f"[ENV] OMP_NUM_THREADS={_omp}")
     if not ray.is_initialized():
         # Pass thread-limiting vars as the Ray-side global default runtime_env.
@@ -127,7 +127,7 @@ def main() -> None:
                 "OMP_NUM_THREADS": _omp,
                 "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
                 "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
-                "RAY_grpc_server_thread_pool_size": _grpc_pool,
+                "RAY_num_server_call_thread": _grpc_pool,
             }},
         )
 
@@ -210,7 +210,7 @@ def main() -> None:
                     "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
                     "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
                     "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
-                    "RAY_grpc_server_thread_pool_size": os.environ.get("RAY_grpc_server_thread_pool_size", "4"),
+                    "RAY_num_server_call_thread": os.environ.get("RAY_num_server_call_thread", "4"),
                 }
             },
         ).remote(

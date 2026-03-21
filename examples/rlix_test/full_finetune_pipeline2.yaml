@@ -6,6 +6,8 @@ hydra:
     dir: .
   output_subdir: null
 
+pipeline_cls: rlix.pipeline.full_finetune_pipeline.RollFullFinetunePipeline
+
 exp_name: "ft_pipeline2_sokoban_grpo"
 seed: 42
 logging_dir: ./output/ft_pipeline2/logs
@@ -34,7 +36,7 @@ system_envs:
   OMP_NUM_THREADS: "1"
   MKL_NUM_THREADS: "1"
   OPENBLAS_NUM_THREADS: "1"
-  RAY_grpc_server_thread_pool_size: "4"
+  RAY_num_server_call_thread: "4"
   TORCHINDUCTOR_COMPILE_THREADS: "1"
   TORCHINDUCTOR_MAX_AUTOTUNE: "0"
 
