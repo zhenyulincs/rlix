@@ -125,6 +125,194 @@ def test_single_pipeline_idle_gpus_activated(monkeypatch: pytest.MonkeyPatch) ->
     assert len(plan.sched_guided_shrink_ops) == 0
 
 
+def test_pending_request_uses_step_target_estimate_without_progress_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pending GENERATION request can bootstrap demand from its explicit estimate."""
+    gap_ratio_mod, scheduler_types, protocol_types = _load_gap_ratio_modules(monkeypatch)
+
+    ExecutionPlan = scheduler_types.ExecutionPlan
+    Priority = protocol_types.Priority
+    Request = scheduler_types.Request
+    PendingRequest = scheduler_types.PendingRequest
+
+    plan = ExecutionPlan()
+    pipeline_id = "ft_222222222222"
+    cluster_id = f"{pipeline_id}_actor_infer"
+
+    _GapRatioDPWorker = gap_ratio_mod._GapRatioDPWorker
+    active_dp_workers = {pipeline_id: []}
+    inactive_dp_workers = {
+        pipeline_id: [
+            _GapRatioDPWorker(pipeline_id=pipeline_id, dp_rank=0, gpu_ids=[0]),
+            _GapRatioDPWorker(pipeline_id=pipeline_id, dp_rank=1, gpu_ids=[1]),
+        ]
+    }
+    pipeline_registry = {
+        pipeline_id: {
+            "cluster_configs": {
+                "actor_infer": {
+                    "tp_size": 1,
+                    "is_generation": True,
+                    "device_mapping": [0, 1],
+                    "max_dp_workers": 2,
+                },
+            },
+            "admitted": True,
+        }
+    }
+    pending_bucket_gen = [
+        PendingRequest(
+            request=Request(cluster_id=cluster_id, priority=Priority.GENERATION, timestamp=0.0),
+            event=asyncio.Event(),
+            step_target_estimate=4,
+        )
+    ]
+
+    def progress_totals_fn(*, pipeline_id):
+        return (0.0, 0.0)
+
+    remaining_idle = gap_ratio_mod.plan_generation_gap_ratio(
+        plan,
+        active_dp_workers=active_dp_workers,
+        inactive_dp_workers=inactive_dp_workers,
+        non_gen_reserved_gpus=set(),
+        idle_gpus={0, 1},
+        pipeline_registry=pipeline_registry,
+        active_allocations={},
+        pending_bucket_gen=pending_bucket_gen,
+        progress_totals_fn=progress_totals_fn,
+    )
+
+    assert len(plan.sched_guided_allocation_ops) == 1
+    op = plan.sched_guided_allocation_ops[0]
+    assert op.cluster_id == cluster_id
+    assert set(op.gpus_to_allocate)
+    assert set(op.gpus_to_allocate).issubset({0, 1})
+    assert set(op.dp_ranks_to_add)
+    assert remaining_idle != {0, 1}
+
+
+def test_pending_request_without_progress_or_estimate_does_not_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No progress snapshot and no estimate means no synthetic demand is invented."""
+    gap_ratio_mod, scheduler_types, protocol_types = _load_gap_ratio_modules(monkeypatch)
+
+    ExecutionPlan = scheduler_types.ExecutionPlan
+    Priority = protocol_types.Priority
+    Request = scheduler_types.Request
+    PendingRequest = scheduler_types.PendingRequest
+
+    plan = ExecutionPlan()
+    pipeline_id = "ft_333333333333"
+    cluster_id = f"{pipeline_id}_actor_infer"
+
+    _GapRatioDPWorker = gap_ratio_mod._GapRatioDPWorker
+    active_dp_workers = {pipeline_id: []}
+    inactive_dp_workers = {
+        pipeline_id: [
+            _GapRatioDPWorker(pipeline_id=pipeline_id, dp_rank=0, gpu_ids=[0]),
+            _GapRatioDPWorker(pipeline_id=pipeline_id, dp_rank=1, gpu_ids=[1]),
+        ]
+    }
+    pipeline_registry = {
+        pipeline_id: {
+            "cluster_configs": {
+                "actor_infer": {
+                    "tp_size": 1,
+                    "is_generation": True,
+                    "device_mapping": [0, 1],
+                    "max_dp_workers": 2,
+                },
+            },
+            "admitted": True,
+        }
+    }
+    pending_bucket_gen = [
+        PendingRequest(
+            request=Request(cluster_id=cluster_id, priority=Priority.GENERATION, timestamp=0.0),
+            event=asyncio.Event(),
+        )
+    ]
+
+    def progress_totals_fn(*, pipeline_id):
+        return (0.0, 0.0)
+
+    remaining_idle = gap_ratio_mod.plan_generation_gap_ratio(
+        plan,
+        active_dp_workers=active_dp_workers,
+        inactive_dp_workers=inactive_dp_workers,
+        non_gen_reserved_gpus=set(),
+        idle_gpus={0, 1},
+        pipeline_registry=pipeline_registry,
+        active_allocations={},
+        pending_bucket_gen=pending_bucket_gen,
+        progress_totals_fn=progress_totals_fn,
+    )
+
+    assert plan.sched_guided_allocation_ops == []
+    assert remaining_idle == {0, 1}
+
+
+def test_real_progress_overrides_pending_estimate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reported progress, when present, takes precedence over request-carried estimates."""
+    gap_ratio_mod, scheduler_types, protocol_types = _load_gap_ratio_modules(monkeypatch)
+
+    ExecutionPlan = scheduler_types.ExecutionPlan
+    Priority = protocol_types.Priority
+    Request = scheduler_types.Request
+    PendingRequest = scheduler_types.PendingRequest
+
+    plan = ExecutionPlan()
+    pipeline_id = "ft_444444444444"
+    cluster_id = f"{pipeline_id}_actor_infer"
+
+    _GapRatioDPWorker = gap_ratio_mod._GapRatioDPWorker
+    active_dp_workers = {pipeline_id: []}
+    inactive_dp_workers = {
+        pipeline_id: [
+            _GapRatioDPWorker(pipeline_id=pipeline_id, dp_rank=0, gpu_ids=[0]),
+            _GapRatioDPWorker(pipeline_id=pipeline_id, dp_rank=1, gpu_ids=[1]),
+        ]
+    }
+    pipeline_registry = {
+        pipeline_id: {
+            "cluster_configs": {
+                "actor_infer": {
+                    "tp_size": 1,
+                    "is_generation": True,
+                    "device_mapping": [0, 1],
+                    "max_dp_workers": 2,
+                },
+            },
+            "admitted": True,
+        }
+    }
+    pending_bucket_gen = [
+        PendingRequest(
+            request=Request(cluster_id=cluster_id, priority=Priority.GENERATION, timestamp=0.0),
+            event=asyncio.Event(),
+            step_target_estimate=1000,
+        )
+    ]
+
+    def progress_totals_fn(*, pipeline_id):
+        return (5.0, 10.0)
+
+    gap_ratio_mod.plan_generation_gap_ratio(
+        plan,
+        active_dp_workers=active_dp_workers,
+        inactive_dp_workers=inactive_dp_workers,
+        non_gen_reserved_gpus=set(),
+        idle_gpus={0, 1},
+        pipeline_registry=pipeline_registry,
+        active_allocations={},
+        pending_bucket_gen=pending_bucket_gen,
+        progress_totals_fn=progress_totals_fn,
+    )
+
+    assert len(plan.sched_guided_allocation_ops) == 1
+    op = plan.sched_guided_allocation_ops[0]
+    assert set(op.gpus_to_allocate) == {0, 1}
+
+
 def test_two_pipelines_donor_shrink(monkeypatch: pytest.MonkeyPatch) -> None:
     """Over-provisioned pipeline donates GPUs to under-provisioned pipeline."""
     gap_ratio_mod, scheduler_types, protocol_types = _load_gap_ratio_modules(monkeypatch)

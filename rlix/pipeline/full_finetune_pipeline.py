@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -51,6 +51,13 @@ from rlix.utils.env import parse_env_timeout_s
 from rlix.utils.ray import get_actor_or_raise
 
 logger = get_logger()
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+if TYPE_CHECKING:
+    def no_grad(func: _F) -> _F: ...
+else:
+    no_grad = torch.no_grad()
 
 
 class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
@@ -389,12 +396,14 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
             # RequestScheduler.expand_workers() in Rlix mode to sync selected dp ranks after load.
             from rlix.pipeline.model_update_service import ModelUpdateService
 
+            from rlix.utils.env import pipeline_identity_env_vars
             runtime_env = {
                 "env_vars": {
                     "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
-                    "PIPELINE_ID": os.environ.get("PIPELINE_ID", self._pipeline_id),
-                    "ROLL_RAY_NAMESPACE": ray_namespace,
-                    "RLIX_CONTROL_PLANE": os.environ.get("RLIX_CONTROL_PLANE", "rlix"),
+                    **pipeline_identity_env_vars(
+                        pipeline_id=os.environ.get("PIPELINE_ID", self._pipeline_id),
+                        ray_namespace=ray_namespace,
+                    ),
                 }
             }
             svc = ModelUpdateService.options(  # type: ignore[attr-defined]
@@ -460,7 +469,13 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                 raise RuntimeError(f"initialize_pipeline failed: {resp}")
 
     def _request_cluster_gpus(
-        self, *, cluster_id: str, priority: Any, global_step: int, lora_name: Optional[str] = None
+        self,
+        *,
+        cluster_id: str,
+        priority: Any,
+        global_step: int,
+        step_target_estimate: Optional[int] = None,
+        lora_name: Optional[str] = None,
     ) -> List[int]:
         """Block until the scheduler allocates GPUs for a cluster. Returns allocated GPU IDs."""
         allocated = ray.get(
@@ -468,6 +483,7 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                 cluster_id=str(cluster_id),
                 priority=priority,
                 global_step=global_step,
+                step_target_estimate=step_target_estimate,
                 lora_name=lora_name,  # GPU tracing: pass LoRA name for training clusters
             )
         )
@@ -490,6 +506,7 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
         request_cluster_id: str,
         request_priority: Any,
         request_global_step: int,
+        request_step_target_estimate: Optional[int] = None,
         request_lora_name: Optional[str] = None,
     ) -> List[int]:
         """Atomically release one cluster's GPUs and block until another cluster is allocated."""
@@ -500,6 +517,7 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                 request_cluster_id=str(request_cluster_id),
                 request_priority=request_priority,
                 request_global_step=int(request_global_step),
+                request_step_target_estimate=request_step_target_estimate,
                 request_lora_name=request_lora_name,  # GPU tracing: pass LoRA name for training clusters
             )
         )
@@ -511,6 +529,22 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
         if not allocated:
             raise RuntimeError(f"rlix:scheduler allocated empty GPU list for cluster_id={request_cluster_id!r}")
         return allocated
+
+    def _generation_num_return_sequences(self) -> int:
+        """Return the rollout scheduler's effective num_return_sequences."""
+        raw = getattr(self.pipeline_config.actor_infer.generating_args, "num_return_sequences", None)
+        n = 1 if raw is None else int(raw)
+        if n <= 0:
+            raise RuntimeError(f"Invalid num_return_sequences={raw!r}; expected > 0")
+        return n
+
+    def _estimate_generation_step_target(self, *, train_batch_size: int, include_val: bool) -> int:
+        """Estimate total trajectory demand for a held GENERATION allocation."""
+        num_return_sequences = self._generation_num_return_sequences()
+        total = int(train_batch_size) * num_return_sequences
+        if include_val:
+            total += int(self.pipeline_config.val_batch_size) * num_return_sequences
+        return total
 
     def _await_release_actor_infer(self, *, global_step: int) -> None:
         """Block until the scheduler commits the actor_infer shrink for this pipeline."""
@@ -574,7 +608,7 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
 
         return metrics
 
-    @torch.no_grad()
+    @no_grad
     def run(self) -> None:
         """RLix-controlled training loop aligned with agentic pipeline.
 
@@ -612,7 +646,7 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
         rollout_get_batch_timeout_s = parse_env_timeout_s("ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S", default_s=None)
         self._rollout_get_batch_timeout_s = rollout_get_batch_timeout_s
 
-        tps_timer = _Timer(window_size=5)  # type: ignore[no-untyped-call]
+        tps_timer = _Timer(window_size=5)
 
         ran_any_step = False
         last_train_cluster_allocated = None
@@ -644,6 +678,13 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                     actor_infer_num_gpus = len(getattr(self.actor_infer.worker_config, "device_mapping", []))
                     assert actor_infer_num_gpus > 0
                     expected_gpus = list(self.actor_infer.worker_config.device_mapping)
+                    eval_this_step = (
+                        self.pipeline_config.eval_steps > 0 and global_step % self.pipeline_config.eval_steps == 0
+                    )
+                    generation_step_target_estimate = self._estimate_generation_step_target(
+                        train_batch_size=self.pipeline_config.rollout_batch_size,
+                        include_val=bool(eval_this_step),
+                    )
                     # Release actor_train from the previous step only if it was a non-warmup step
                     # (which leaves actor_train allocated with ACTOR_TRAINING). Warmup steps release
                     # all train clusters in Phase 15, so there is nothing to release — use plain request.
@@ -658,12 +699,14 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                             request_cluster_id=self._actor_infer_cluster_id,
                             request_priority=Priority.GENERATION,
                             request_global_step=global_step,
+                            request_step_target_estimate=generation_step_target_estimate,
                         )
                     else:
                         allocated_actor_infer_gpus = self._request_cluster_gpus(
                             cluster_id=self._actor_infer_cluster_id,
                             priority=Priority.GENERATION,
                             global_step=global_step,
+                            step_target_estimate=generation_step_target_estimate,
                         )
                     assert len(allocated_actor_infer_gpus) > 0
                     is_partial_allocation = len(allocated_actor_infer_gpus) < len(expected_gpus)
@@ -692,7 +735,7 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                     val_future = None
                     val_metrics = {}
                     with Timer(name="val", logger=None) as val_timer:
-                        if self.pipeline_config.eval_steps > 0 and global_step % self.pipeline_config.eval_steps == 0:
+                        if eval_this_step:
                             val_future = self.executor.submit(self.val, global_step)
 
                         # Train rollout runs immediately on the same held actor_infer allocation
@@ -969,6 +1012,9 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                             ]
                         )
 
+                        if self.pipeline_config.is_actor_infer_colocated:
+                            self.actor_train.offload_states(blocking=True)
+
                         # actor_train (ACTOR_TRAINING) remains allocated; released at next step's Phase 4.5.
                         last_train_cluster_allocated = self._actor_train_cluster_id
                     else:
@@ -977,7 +1023,7 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                         last_train_cluster_allocated = None
 
                 # Unconditional — runs even during critic warmup
-                tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())  # type: ignore[no-untyped-call]
+                tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
 
                 with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer:
                     data_metrics = compute_train_data_metrics(batch=batch)

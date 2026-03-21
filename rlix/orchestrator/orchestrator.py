@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, cast
 
 import ray
 
@@ -81,12 +81,8 @@ def _kill_local_ray() -> None:
 
 def _kill_ray_on_node(node_ip: str) -> ray.ObjectRef[None]:
     """Spawn a one-shot remote task on ``node_ip`` that calls ``_kill_local_ray()``."""
-
-    @ray.remote(max_retries=0, max_task_retries=0)
-    def _kill_local_ray_task() -> None:
-        _kill_local_ray()
-
-    return _kill_local_ray_task.options(resources={f"node:{node_ip}": 0.01}).remote()
+    kill_local_ray_task = cast(Any, ray.remote(max_retries=0, max_task_retries=0)(_kill_local_ray))
+    return kill_local_ray_task.options(resources={f"node:{node_ip}": 0.01}).remote()
 
 
 def _force_stop_cluster_workers_first(*, timeout_s: Optional[float] = _WORKER_STOP_TIMEOUT_S) -> None:
@@ -365,7 +361,7 @@ class Orchestrator:
         if unnamed_alive:
             # Nuclear option: use internal Ray APIs to kill by ActorID.
             try:
-                from ray._raylet import ActorID
+                import ray._raylet as raylet
             except Exception as e:
                 raise RuntimeError(
                     f"Found {len(unnamed_alive)} unnamed ALIVE actors in namespace {ray_namespace!r} but cannot import ActorID"
@@ -386,7 +382,8 @@ class Orchestrator:
                     # `ray.worker.global_worker.core_worker.get_actor_handle(...)`, which are
                     # internal, brittle APIs and may break across Ray versions. Prefer naming
                     # actors or retaining actor handles so this code path is never required.
-                    actor_id_obj = ActorID.from_hex(actor_id_hex)
+                    actor_id_cls = cast(Any, getattr(raylet, "ActorID"))
+                    actor_id_obj = actor_id_cls.from_hex(actor_id_hex)
                     handle = ray.worker.global_worker.core_worker.get_actor_handle(actor_id_obj)
                     ray.kill(handle, no_restart=True)
                 except Exception as e:

@@ -17,7 +17,7 @@ import os
 import time
 from collections import deque
 from dataclasses import replace
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, TypeVar
 
 import numpy as np
 import ray
@@ -55,6 +55,13 @@ from rlix.protocol.types import ActionResponse, Priority
 from rlix.utils.env import parse_env_timeout_s
 
 logger = get_logger()
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+if TYPE_CHECKING:
+    def no_grad(func: _F) -> _F: ...
+else:
+    no_grad = torch.no_grad()
 
 
 class RollMultiLoraPipeline(RollFullFinetunePipeline):
@@ -340,7 +347,20 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
         metrics.update({f"val/{tag}/{k}": v for k, v in eval_metrics.items()})
         return metrics
 
-    @torch.no_grad()
+    def _active_rollout_tags(self, *, tags: List[str], lora_step: Dict[str, int], max_steps_per_lora: int) -> List[str]:
+        """Return tags whose LoRA still needs rollout work."""
+        active_tags: List[str] = []
+        for tag in tags:
+            lora = self._tag_to_lora[tag]
+            if lora_step[lora] < max_steps_per_lora:
+                active_tags.append(tag)
+        return active_tags
+
+    def _estimate_generation_step_target_for_tags(self, *, active_tags: List[str]) -> int:
+        """Estimate concurrent rollout demand for the current multi-LoRA tick."""
+        return int(len(active_tags) * self.pipeline_config.rollout_batch_size * self._generation_num_return_sequences())
+
+    @no_grad
     def run(self) -> None:
         """Multi-LoRA training loop.
 
@@ -388,7 +408,7 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
         any_tick_completed: bool = False
         prev_trained_step: int = 0
         # Tokens-per-second throughput tracker.
-        tps_timer = _Timer(window_size=5)  # type: ignore[no-untyped-call]
+        tps_timer = _Timer(window_size=5)
         # Track submission time per tag for rollout wait_s computation
         # (pattern from agentic_multi_lora_pipeline.py:680-683).
         submitted_at_mono: Dict[str, float] = {}
@@ -401,23 +421,12 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
             logger.info(f"Resumed deferred val from checkpoint: {pending_val_info}")
 
         # ============================================================
-        # Kick off initial get_batch for all active tags (mirrors agentic_multi_lora_pipeline.py:532-545).
-        # ============================================================
         # Track in-flight refs as a FIFO deque for round-robin fairness.
         # Each item is (tag, get_batch_ref); tags are unique in the queue.
         # When multiple batches are ready simultaneously, the tag closest to the
         # deque front is selected. Consumed tags re-enter at the tail (via append),
         # so each LoRA gets equal priority over successive ticks.
         in_flight: deque[tuple[str, Any]] = deque()
-        for tag in tags:
-            lora = self._tag_to_lora[tag]
-            if lora_step[lora] < max_steps_per_lora:
-                ref = self.rollout_schedulers[tag].get_batch.remote(
-                    DataProto(meta_info={"global_step": lora_step[lora]}),
-                    self.pipeline_config.rollout_batch_size,
-                )
-                in_flight.append((tag, ref))
-                submitted_at_mono[tag] = time.monotonic()
 
         while any(lora_step[name] < max_steps_per_lora for name in loras):
             metrics: Dict[str, Any] = {}
@@ -435,6 +444,12 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
                 # the re-request resolves as a scheduler wake-only no-op: the existing
                 # allocation is returned as-is without replanning.
                 # ============================================================
+                active_rollout_tags = self._active_rollout_tags(
+                    tags=tags, lora_step=lora_step, max_steps_per_lora=max_steps_per_lora
+                )
+                generation_step_target_estimate = self._estimate_generation_step_target_for_tags(
+                    active_tags=active_rollout_tags
+                )
                 expected_gpus = list(self.actor_infer.worker_config.device_mapping)
                 assert len(expected_gpus) > 0
                 if any_tick_completed:
@@ -446,12 +461,14 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
                         request_cluster_id=self._actor_infer_cluster_id,
                         request_priority=Priority.GENERATION,
                         request_global_step=prev_trained_step + 1,
+                        request_step_target_estimate=generation_step_target_estimate,
                     )
                 else:
                     allocated_actor_infer_gpus = self._request_cluster_gpus(
                         cluster_id=self._actor_infer_cluster_id,
                         priority=Priority.GENERATION,
                         global_step=prev_trained_step,
+                        step_target_estimate=generation_step_target_estimate,
                     )
                 assert len(allocated_actor_infer_gpus) > 0
                 is_partial_allocation = len(allocated_actor_infer_gpus) < len(expected_gpus)
@@ -466,7 +483,7 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
                 # Fill any gaps for active tags, then wait for the first ready ref.
                 # Pattern copied from agentic_multi_lora_pipeline.py:556-639.
                 # ============================================================
-                for tag in tags:
+                for tag in active_rollout_tags:
                     lora = self._tag_to_lora[tag]
                     # Keep at most one in-flight request per tag.
                     if lora_step[lora] < max_steps_per_lora and all(t != tag for t, _ in in_flight):
@@ -752,7 +769,7 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
                     actor_train_metrics = DataProto.materialize_concat(data_refs=actor_train_metrics_refs)
                     metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
                 metrics["time/step_train"] = actor_train_timer.last
-                tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())  # type: ignore[no-untyped-call]
+                tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
                 metrics["system/tps"] = tps_timer.mean_throughput
 
                 # (b) Extract trained loras from lora_name; fail fast if missing or unknown.

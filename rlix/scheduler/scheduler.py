@@ -586,6 +586,7 @@ class SchedulerImpl:
         cluster_id: str,
         priority: Priority,
         global_step: Optional[int] = None,
+        step_target_estimate: Optional[int] = None,
         lora_name: Optional[str] = None,  # GPU Tracing: LoRA name for non-generation clusters
     ) -> List[int]:
         """Block until GPUs are allocated for ``cluster_id`` at ``priority``.
@@ -624,6 +625,7 @@ class SchedulerImpl:
                 request=Request(cluster_id=cluster_id, priority=priority, timestamp=float(self._request_seq)),
                 event=event,
                 global_step=global_step,
+                step_target_estimate=step_target_estimate,
                 lora_name=lora_name,  # GPU Tracing: pass lora_name to pending request
             )
             self._state.pending_bucket(priority).append(pending)
@@ -664,6 +666,7 @@ class SchedulerImpl:
         request_cluster_id: str,
         request_priority: Priority,
         request_global_step: Optional[int] = None,
+        request_step_target_estimate: Optional[int] = None,
         request_lora_name: Optional[str] = None,  # GPU Tracing: LoRA name for non-generation clusters
     ) -> List[int]:
         """Atomically release one cluster's GPUs and enqueue a request for another.
@@ -714,6 +717,7 @@ class SchedulerImpl:
                 ),
                 event=event,
                 global_step=request_global_step,
+                step_target_estimate=request_step_target_estimate,
                 lora_name=request_lora_name,  # GPU Tracing: pass lora_name to pending request
             )
             self._state.pending_bucket(request_priority).append(pending)

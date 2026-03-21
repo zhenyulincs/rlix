@@ -17,7 +17,7 @@ def get_head_node_id() -> str:
     nodes = list_nodes(filters=[("is_head_node", "=", "True")])
     if not nodes:
         raise RuntimeError("Could not identify head node via ray.util.state.list_nodes")
-    node_id: Any = nodes[0].get("node_id")  # type: ignore[no-untyped-call]
+    node_id: Any = nodes[0].get("node_id")
     if not node_id:
         raise RuntimeError(f"Head node record missing node_id: {nodes[0]!r}")
     return str(node_id)

@@ -71,6 +71,24 @@ def has_pending_generation_request(
     return any(p.request.cluster_id == cluster_id for p in pending_bucket_gen)
 
 
+def get_pending_generation_step_target_estimate(
+    pending_bucket_gen: List[PendingRequest],
+    cluster_id: str,
+) -> Optional[float]:
+    """Return the pending GENERATION request's estimated step target, if any."""
+    for pending in pending_bucket_gen:
+        if pending.request.cluster_id != cluster_id:
+            continue
+        estimate = pending.step_target_estimate
+        if estimate is None:
+            return None
+        estimate_int = int(estimate)
+        if estimate_int <= 0:
+            return None
+        return float(estimate_int)
+    return None
+
+
 def snapshot_generation_dp_workers(
     *,
     plan: ExecutionPlan,
@@ -201,14 +219,20 @@ def plan_generation_gap_ratio(
         if tp_size <= 0:
             raise ValueError(f"pipeline_id={pipeline_id!r} has invalid actor_infer tp_size={tp_size}")
 
+        has_pending = has_pending_generation_request(pending_bucket_gen, cluster_id)
         # Derive remaining from completed metric; same derivation path as
         # background rebalance to keep demand semantics consistent.
         remaining, step_target = progress_totals_fn(pipeline_id=pipeline_id)
         if step_target <= 0.0:
-            continue
-        percent_remaining = 0.0 if step_target <= 0 else remaining / step_target
+            step_target_estimate = get_pending_generation_step_target_estimate(pending_bucket_gen, cluster_id)
+            if step_target_estimate is None:
+                continue
+            remaining = float(step_target_estimate)
+            step_target = float(step_target_estimate)
+            percent_remaining = 1.0
+        else:
+            percent_remaining = remaining / step_target if step_target > 0 else 0.0
 
-        has_pending = has_pending_generation_request(pending_bucket_gen, cluster_id)
         if has_pending:
             # Inflate demand so a pipeline that hasn't started generating yet (remaining == 0)
             # still receives a non-zero weight and gets allocated at least one DP worker.

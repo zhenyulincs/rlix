@@ -117,6 +117,7 @@ class PendingRequest:
     request: Request
     event: asyncio.Event
     global_step: Optional[int] = None
+    step_target_estimate: Optional[int] = None
     lora_name: Optional[str] = None  # GPU tracing: LoRA name for non-generation clusters
     result: List[int] = field(default_factory=list)
     error: Optional[str] = None
