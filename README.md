@@ -5,10 +5,11 @@
 <h3>Run more RL experiments. Wait less for GPUs.</h3>
 
 <p>
-  <a href="https://github.com/rlops/rlix/blob/main/LICENSE">
-    <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License">
-  </a>
 
+  <a href="https://deepwiki.com/rlops/rlix" target="_blank">
+    <img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki">
+  </a>
+  
   <a href="https://github.com/rlops/rlix/stargazers">
     <img src="https://img.shields.io/github/stars/rlops/rlix?style=social" alt="Repo stars">
   </a>
@@ -17,9 +18,10 @@
     <img src="https://img.shields.io/github/issues/rlops/rlix" alt="GitHub issues">
   </a>
 
-  <a href="https://deepwiki.com/rlops/rlix" target="_blank">
-    <img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki">
+  <a href="https://github.com/rlops/rlix/blob/main/LICENSE">
+    <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License">
   </a>
+
 </p>
 
 </div>
