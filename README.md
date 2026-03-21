@@ -24,7 +24,7 @@
 
 </div>
 
-RL research often means running lots of experiments: trying new ideas, comparing settings, and running ablations. But when GPU capacity is tight, promising jobs can spend too long waiting to start. In long-horizon agentic RL, such as coding and computer-use agents, a few slow rollouts can hold everything up while many GPUs sit idle.
+RL research often means running lots of experiments: trying new ideas, comparing settings, and running ablations. When GPU capacity is tight, promising jobs can spend too long waiting to start. Even worse, in long-horizon agentic RL, such as coding and computer-use agents, a few slow rollouts can hold everything up while many GPUs sit idle.
 
 RLix helps you get more out of the GPUs you already have. It lets multiple RL jobs share GPU capacity more effectively, so you can run more experiments at once, spend less time waiting for GPUs, and improve GPU utilization without changing how each pipeline trains.
 
