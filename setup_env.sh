@@ -149,6 +149,8 @@ fi
 # --- Install Python dependencies ---
 cd "${ROLL_DIR}"
 
+# gym_sokoban imports pkg_resources at runtime but doesn't declare setuptools as a dependency
+uv pip install setuptools
 uv pip install -r requirements_torch260_vllm.txt
 if python -c "import transformer_engine" >/dev/null 2>&1; then
   echo "transformer-engine is already installed, skipping reinstall."
