@@ -101,6 +101,9 @@ actor_train:
         reduce_scatter: true
         reduce_bucket_size: 5.0e+8
         contiguous_gradients: true
+        offload_optimizer:
+          device: cpu
+          pin_memory: true
   use_dynamic_batching_in_train: false
   device_mapping: "[2, 3, ]"
   infer_batch_size: 1
