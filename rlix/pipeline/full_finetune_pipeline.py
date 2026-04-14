@@ -1011,13 +1011,20 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                         metrics["time/train_step"] = actor_train_timer.last
 
                         # Promote trained weights so expand_sampler can rehydrate infer workers on the next step.
+                        # Megatron-only: DeepSpeed strategies do not implement promote_active_checkpoint.
                         checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
-                        ray.get(
-                            [
-                                worker.promote_active_checkpoint.remote(checkpoint_version)
-                                for worker in self.actor_train.workers
-                            ]
-                        )
+                        try:
+                            ray.get(
+                                [
+                                    worker.promote_active_checkpoint.remote(checkpoint_version)
+                                    for worker in self.actor_train.workers
+                                ]
+                            )
+                        except RuntimeError as e:
+                            if "does not support" in str(e):
+                                logger.info("[train][%s] skipping promote_active_checkpoint: %s", self._pipeline_id, e)
+                            else:
+                                raise
 
                         if self.pipeline_config.is_actor_infer_colocated:
                             self.actor_train.offload_states(blocking=True)
