@@ -44,7 +44,7 @@ checkpoint_config:
 
 num_gpus_per_node: 2
 model_download_type: HUGGINGFACE_HUB
-offload_nccl: true
+offload_nccl: false
 max_steps: 3
 model_update_buffer_size_mb: 100
 model_update_transport: cpu_serialize

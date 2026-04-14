@@ -153,6 +153,11 @@ def _validate_offload_nccl(*, pipeline_config: Any) -> None:
         device_mapping = getattr(worker_config, "device_mapping", None)
         if not device_mapping:
             continue
+        # DeepSpeed strategies manage their own process groups and are incompatible with
+        # ROLL's ReloadableProcessGroup monkey-patch. Skip enforcement for deepspeed clusters.
+        strategy_name = getattr(getattr(worker_config, "strategy_args", None), "strategy_name", "")
+        if strategy_name.startswith("deepspeed"):
+            continue
         offload_nccl = getattr(worker_config, "offload_nccl", None)
         if offload_nccl is None:
             worker_config.offload_nccl = True
