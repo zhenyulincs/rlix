@@ -459,13 +459,17 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
         """Pipeline-local expand helper.
 
         Train scheduler does weight load + routing; val scheduler does routing-only.
+        DeepSpeed strategies do not implement the bucket-cache weight sync, so
+        skip_load=True is used to avoid crashing on expand.
         """
         if not isinstance(dp_ranks_to_add, list) or not dp_ranks_to_add:
             raise ValueError("dp_ranks_to_add must be a non-empty list[int]")
+        train_strategy = getattr(
+            getattr(self.pipeline_config.actor_train, "strategy_args", None), "strategy_name", ""
+        )
+        skip_load = train_strategy.startswith("deepspeed")
         with self._infer_resize_lock:
-            # Train: load model states + routing update.
-            result = ray.get(self.train_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=False))
-            # Val: routing-only (skip_load=True) — shared infer cluster, already loaded by train.
+            result = ray.get(self.train_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=skip_load))
             ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
             return cast(Dict[str, Any], result)
 
