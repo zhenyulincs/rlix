@@ -129,14 +129,14 @@ SCENARIO_CONFIGS = {
         "description": "FT pipeline (GPUs 0-1) + LoRA pipeline (GPUs 2-3) sharing infer GPUs 0-3",
     },
     "E": {
-        "label": "LFM2.5-350M Single FT",
-        "config_names": "lfm_finetune_pipeline1",
-        "description": "1 LFM2.5-350M FT pipeline (deepspeed_train) on GPUs 0-1, infer GPUs 0-3",
+        "label": "Qwen2.5-0.5B Single FT (Megatron)",
+        "config_names": "full_finetune_pipeline1",
+        "description": "1 Qwen2.5-0.5B FT pipeline (megatron_train) on GPUs 0-1, infer GPUs 0-3",
     },
     "F": {
-        "label": "LFM2.5-350M Dual FT",
-        "config_names": "lfm_finetune_pipeline1,lfm_finetune_pipeline2",
-        "description": "2 LFM2.5-350M pipelines: P1 GPUs 0-1, P2 GPUs 2-3, infer shared 0-3",
+        "label": "Qwen2.5-0.5B Dual FT (Megatron)",
+        "config_names": "full_finetune_pipeline1,full_finetune_pipeline2",
+        "description": "2 Qwen2.5-0.5B pipelines: P1 train 0-1, P2 train 2-3; infer shared 0-3",
     },
 }
 
