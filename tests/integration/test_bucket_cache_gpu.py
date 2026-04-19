@@ -91,11 +91,15 @@ def _load_tiny_model() -> tuple[torch.nn.Module, Dict[str, torch.Tensor]]:
 
 
 def _model_to_cpu_cache(model: torch.nn.Module) -> CPUBucketCache:
-    """Copy all model parameters into a CPUBucketCache (shard_id=0 for all)."""
+    """Copy all model parameters into a CPUBucketCache (shard_id=0 for all).
+
+    Uses state_dict() instead of named_parameters() so that tied weights
+    (e.g. lm_head.weight == embed_tokens.weight in Qwen) are included.
+    """
     cache = CPUBucketCache()
     with torch.no_grad():
-        for name, param in model.named_parameters():
-            cache.store(name, shard_id=0, tensor=param.detach().cpu().contiguous())
+        for name, tensor in model.state_dict().items():
+            cache.store(name, shard_id=0, tensor=tensor.detach().cpu().contiguous())
     return cache
 
 
