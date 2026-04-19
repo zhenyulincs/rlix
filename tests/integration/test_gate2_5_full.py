@@ -327,18 +327,16 @@ def main() -> None:
         dist.destroy_process_group()
         return
 
-    # Warm up NCCL before creating subgroups — required on PyTorch 2.5+ so that
-    # the internal NCCL all_reduce used by new_group doesn't hang on first use
-    dist.barrier(device_ids=[local_rank])
-
-    # Create per-pipeline gloo groups (ALL ranks must call new_group even if not members)
+    # Create per-pipeline gloo groups (ALL ranks must call new_group even if not members).
+    # new_group uses the default NCCL pg internally for coordination — this is the first
+    # NCCL op and initializes the communicator, so NO explicit warmup barrier needed here.
     gloo_a = dist.new_group(ranks=[PIPELINE_A_RANK] + INFER_RANKS, backend="gloo")
     gloo_b = dist.new_group(ranks=[PIPELINE_B_RANK] + INFER_RANKS, backend="gloo")
     log0("Process groups ready: gloo_a=[0,2,3]  gloo_b=[1,2,3]")
 
     log0(f"Loading {MODEL_NAME} on training ranks...")
     model = load_model(local_rank)
-    dist.barrier(device_ids=[local_rank])
+    dist.barrier()   # plain barrier (no device_ids) matches Part 3 pattern
     log0("Models loaded.")
 
     for step in range(1, N_STEPS + 1):
