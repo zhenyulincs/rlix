@@ -203,82 +203,85 @@ def selective_sync(
 ) -> Dict[str, torch.Tensor]:
     """
     Broadcast all dirty buckets from rank 0 to all ranks via world group.
-    Inference ranks (2, 3) collect and return received weights.
-    Training rank 1 participates but discards received data.
+    Uses 3 NCCL broadcasts total (metadata header, names, concatenated data)
+    to avoid per-bucket overhead that causes hangs on SYS-topology PCIe.
 
-    Protocol: all tensors use bfloat16 (avoids NCCL int64/uint8 bugs on
-    PCIe-SYS topology with P2P disabled). World group used (not sub-group)
-    because NCCL new_group([0,2,3]) hangs on SYS-topology GPUs with P2P off.
+    Inference ranks (2, 3) collect received weights; rank 1 discards.
     """
     received: Dict[str, torch.Tensor] = {}
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    MAX_PARAMS = 400  # upper bound on parameter count
+    ROW = 216          # 200 name bytes + 16 hash chars per param
 
     if R() == SENDER_RANK and cache is not None:
         buckets = cache.get_dirty_buckets()
+        n = len(buckets)
 
-        # Broadcast bucket count as bfloat16 scalar (count < 65504, exact)
-        count_t = torch.tensor([float(len(buckets))], dtype=torch.bfloat16, device="cuda")
-        dist.broadcast(count_t, src=SENDER_RANK)
+        cpu_tensors = [b.tensor.to(dtype=torch.bfloat16).contiguous() for b in buckets]
+        names = [b.param_name for b in buckets]
+        n_elems = [t.numel() for t in cpu_tensors]
+        elem_hashes = [tensor_hash(t) for t in cpu_tensors]
 
-        for bucket in buckets:
-            # Stage CPU tensor to GPU as bfloat16
-            gpu_t = bucket.tensor.to(device="cuda", dtype=torch.bfloat16).contiguous()
-            n_elem = gpu_t.numel()
+        # Broadcast #1: fixed-size header [n_buckets, hi_0, lo_0, hi_1, lo_1, ...]
+        # Each n_elem encoded as (hi << 16 | lo), hi/lo in [0, 65535] — exact bfloat16
+        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.bfloat16, device="cuda")
+        header[0] = float(n)
+        for i, ne in enumerate(n_elems):
+            header[1 + 2 * i] = float(ne >> 16)
+            header[2 + 2 * i] = float(ne & 0xFFFF)
+        dist.broadcast(header, src=SENDER_RANK)
 
-            # Encode n_elem as 4 base-256 bytes (each 0-255, exact in bfloat16)
-            b3 = (n_elem >> 24) & 0xFF
-            b2 = (n_elem >> 16) & 0xFF
-            b1 = (n_elem >> 8) & 0xFF
-            b0 = n_elem & 0xFF
+        # Broadcast #2: fixed MAX_PARAMS × ROW name/hash matrix
+        meta_mat = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16, device="cuda")
+        for i, (name, h) in enumerate(zip(names, elem_hashes)):
+            nb = name.encode()
+            row_start = i * ROW
+            for j, b in enumerate(nb):
+                meta_mat[row_start + j] = float(b)
+            for j, c in enumerate(h):
+                meta_mat[row_start + 200 + j] = float(ord(c))
+        dist.broadcast(meta_mat, src=SENDER_RANK)
 
-            # Hash chars are ASCII 48-102, all < 128, exact in bfloat16
-            name_bytes = bucket.param_name.encode()
-            h = tensor_hash(gpu_t.cpu())  # 16-char hex hash
-            hash_floats = [float(ord(c)) for c in h]
-
-            # meta: [name_len, b3, b2, b1, b0, hash×16] = 21 bfloat16 values
-            meta = torch.tensor(
-                [float(len(name_bytes)), float(b3), float(b2), float(b1), float(b0)]
-                + hash_floats,
-                dtype=torch.bfloat16, device="cuda",
-            )
-            dist.broadcast(meta, src=SENDER_RANK)
-
-            # Name bytes: each < 128, exact in bfloat16
-            name_buf = torch.zeros(200, dtype=torch.bfloat16, device="cuda")
-            for i, b in enumerate(name_bytes):
-                name_buf[i] = float(b)
-            dist.broadcast(name_buf, src=SENDER_RANK)
-
-            # Tensor data
-            dist.broadcast(gpu_t, src=SENDER_RANK)
+        # Broadcast #3: all tensors concatenated as one large bfloat16 tensor
+        flat = torch.cat([t.view(-1) for t in cpu_tensors], dim=0).cuda()
+        dist.broadcast(flat, src=SENDER_RANK)
 
     else:
-        # Receive bucket count
-        count_t = torch.zeros(1, dtype=torch.bfloat16, device="cuda")
-        dist.broadcast(count_t, src=SENDER_RANK)
-        n_buckets = int(count_t.item())
+        # Receive #1: fixed-size header
+        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.bfloat16, device="cuda")
+        dist.broadcast(header, src=SENDER_RANK)
+        n = int(header[0].item())
+        n_elems = []
+        for i in range(n):
+            hi = int(header[1 + 2 * i].item())
+            lo = int(header[2 + 2 * i].item())
+            n_elems.append((hi << 16) | lo)
 
-        for _ in range(n_buckets):
-            meta = torch.zeros(21, dtype=torch.bfloat16, device="cuda")
-            dist.broadcast(meta, src=SENDER_RANK)
-            name_len = int(meta[0].item())
-            # Decode n_elements from base-256 bytes
-            b3, b2, b1, b0 = (int(meta[i].item()) for i in range(1, 5))
-            n_elements = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
-            expected_hash = "".join(chr(int(meta[i].item())) for i in range(5, 21))
+        # Receive #2: fixed name/hash matrix
+        meta_mat = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16, device="cuda")
+        dist.broadcast(meta_mat, src=SENDER_RANK)
+        names: list[str] = []
+        exp_hashes: list[str] = []
+        for i in range(n):
+            row = meta_mat[i * ROW: i * ROW + ROW].cpu()
+            name_len = next((j for j in range(200) if row[j] == 0), 200)
+            raw = row[:name_len].to(torch.int32).numpy().tolist()
+            names.append(bytes(raw).decode())
+            exp_hashes.append("".join(chr(int(row[200 + j].item())) for j in range(16)))
 
-            name_buf = torch.zeros(200, dtype=torch.bfloat16, device="cuda")
-            dist.broadcast(name_buf, src=SENDER_RANK)
-            raw_bytes = name_buf[:name_len].cpu().to(torch.int32).numpy().tolist()
-            param_name = bytes(raw_bytes).decode()
+        # Receive #3: flat concatenated data tensor
+        total_elems = sum(n_elems)
+        flat = torch.zeros(total_elems, dtype=torch.bfloat16, device="cuda")
+        dist.broadcast(flat, src=SENDER_RANK)
 
-            buf = torch.zeros(n_elements, dtype=torch.bfloat16, device="cuda")
-            dist.broadcast(buf, src=SENDER_RANK)
+        if R() in INFER_RANKS:
+            offset = 0
+            for name, ne, eh in zip(names, n_elems, exp_hashes):
+                received[name] = (flat[offset: offset + ne].clone(), eh)
+                offset += ne
 
-            if R() in INFER_RANKS:
-                received[param_name] = (buf, expected_hash)
-
-    dist.barrier(device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
+    dist.barrier(device_ids=[local_rank])
     return received
 
 
