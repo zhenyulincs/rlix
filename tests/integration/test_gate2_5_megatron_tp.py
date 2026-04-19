@@ -332,10 +332,13 @@ def apply_received_shard(
 
 def init_megatron() -> None:
     from megatron.core import parallel_state as mpu
+    from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
     mpu.initialize_model_parallel(
         tensor_model_parallel_size=TP_SIZE,
         pipeline_model_parallel_size=1,
     )
+    # ColumnParallelLinear requires the model-parallel RNG tracker to be seeded
+    model_parallel_cuda_manual_seed(42)
 
 def destroy_megatron() -> None:
     from megatron.core import parallel_state as mpu
