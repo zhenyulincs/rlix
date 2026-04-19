@@ -29,6 +29,10 @@ import hashlib
 import os
 import sys
 import uuid
+
+# Use cached model only — avoids HF Hub network check hanging when P2P/SHM is disabled
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 from pathlib import Path
 from typing import Dict, Optional
 

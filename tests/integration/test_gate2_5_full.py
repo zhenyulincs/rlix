@@ -39,6 +39,10 @@ import gc
 import hashlib
 import os
 import sys
+
+# Use cached model only — avoids HF Hub network check hanging when P2P/SHM is disabled
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -314,10 +318,10 @@ def verify_divergence(
 def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(
-        backend="nccl",
-        device_id=torch.device(f"cuda:{local_rank}"),
-    )
+    # Use gloo as default backend: this test's only collectives are barriers and gloo
+    # broadcasts — no NCCL needed.  On PCIe-only hardware (no P2P/SHM), NCCL with
+    # device_id triggers an eager communicator init that takes >10 min to time out.
+    dist.init_process_group(backend="gloo")
 
     world_size = dist.get_world_size()
     log0(f"world_size={world_size}, GPU={torch.cuda.get_device_name(local_rank)}")
@@ -327,14 +331,10 @@ def main() -> None:
         dist.destroy_process_group()
         return
 
-    # Single world-wide gloo group for all weight broadcasts.
-    # Subset groups ([0,2,3] and [1,2,3]) hang on this hardware because their creation
-    # requires an NCCL all_reduce before NCCL is warmed up, and NCCL has no P2P/SHM.
-    # Using the full-world gloo group avoids this (optimised path, no NCCL needed).
-    # In production the two pipelines would use independent groups for true parallelism;
-    # here all ranks participate in each phase but only inference ranks act on the data.
-    gloo_world = dist.new_group(ranks=list(range(world_size)), backend="gloo")
-    log0("Process groups ready: gloo_world=[0,1,2,3]")
+    # The default group is already gloo — use it for all broadcasts and barriers.
+    # None == default group in all PyTorch distributed APIs.
+    gloo_world = None
+    log0("Process groups ready: default gloo group")
 
     log0(f"Loading {MODEL_NAME} on training ranks...")
     model = load_model(local_rank)
