@@ -202,75 +202,69 @@ def selective_sync(
     step: int,
 ) -> Dict[str, torch.Tensor]:
     """
-    Broadcast all dirty buckets from rank 0 to ranks 2 and 3.
-    Returns received state dict on receiver ranks, empty dict on others.
+    Broadcast all dirty buckets from rank 0 to all ranks via world group.
+    Inference ranks (2, 3) collect and return received weights.
+    Training rank 1 participates but discards received data.
+
+    Note: We use the world group (not a sub-group) because NCCL sub-group
+    creation across SYS-topology GPUs (different PCIe root complexes) hangs
+    when P2P is disabled. The world group was already initialized and works.
+    This still validates the full CPU-bucket-cache → GPU-broadcast pipeline.
     """
-    all_ranks = TRAIN_RANKS + INFER_RANKS  # [0, 1, 2, 3]
-
-    # Create a group that includes sender + all inference ranks
-    sync_group = dist.new_group(ranks=[SENDER_RANK] + INFER_RANKS, backend="nccl")
-
     received: Dict[str, torch.Tensor] = {}
 
     if R() == SENDER_RANK and cache is not None:
         buckets = cache.get_dirty_buckets()
 
-        # Broadcast bucket count
+        # Broadcast bucket count to all
         count_t = torch.tensor([len(buckets)], device="cuda")
-        dist.broadcast(count_t, src=SENDER_RANK, group=sync_group)
+        dist.broadcast(count_t, src=SENDER_RANK)
 
         for bucket in buckets:
-            # Stage to GPU
+            # Stage CPU tensor to GPU
             gpu_t = bucket.tensor.cuda()
 
-            # Broadcast name length + encoded bytes
+            # Broadcast metadata: [name_len, *shape] padded to 202 int64
             name_bytes = bucket.param_name.encode()
-            name_meta = torch.tensor(
-                [len(name_bytes)] + list(gpu_t.shape),
-                dtype=torch.int64, device="cuda"
-            )
-            # Pad name_meta to fixed size (max param name 200 chars + ndim=1)
             padded = torch.zeros(202, dtype=torch.int64, device="cuda")
-            padded[:len(name_meta)] = name_meta
-            dist.broadcast(padded, src=SENDER_RANK, group=sync_group)
+            padded[0] = len(name_bytes)
+            for i, v in enumerate(gpu_t.shape):
+                padded[1 + i] = v
+            dist.broadcast(padded, src=SENDER_RANK)
 
-            # Broadcast name string as uint8
-            name_t = torch.frombuffer(name_bytes, dtype=torch.uint8).cuda()
-            # Pad to fixed size
+            # Broadcast name bytes padded to 200 uint8
+            name_t = torch.frombuffer(bytearray(name_bytes), dtype=torch.uint8).cuda()
             name_buf = torch.zeros(200, dtype=torch.uint8, device="cuda")
             name_buf[:len(name_t)] = name_t
-            dist.broadcast(name_buf, src=SENDER_RANK, group=sync_group)
+            dist.broadcast(name_buf, src=SENDER_RANK)
 
             # Broadcast tensor data
-            dist.broadcast(gpu_t.contiguous(), src=SENDER_RANK, group=sync_group)
+            dist.broadcast(gpu_t.contiguous(), src=SENDER_RANK)
 
-    elif R() in INFER_RANKS:
+    else:
+        # Receive bucket count
         count_t = torch.zeros(1, dtype=torch.int64, device="cuda")
-        dist.broadcast(count_t, src=SENDER_RANK, group=sync_group)
+        dist.broadcast(count_t, src=SENDER_RANK)
         n_buckets = int(count_t.item())
 
         for _ in range(n_buckets):
             padded = torch.zeros(202, dtype=torch.int64, device="cuda")
-            dist.broadcast(padded, src=SENDER_RANK, group=sync_group)
+            dist.broadcast(padded, src=SENDER_RANK)
             name_len = int(padded[0].item())
-            shape_vals = padded[1:].tolist()
-            # Find shape — nonzero after name_len tells us ndim
-            # We encoded [name_len, *shape] into padded, shape is 1D for simplicity
-            ndim = 1  # our fake params are all 1D (named_parameters flattened in store)
+            n_elements = int(padded[1].item())  # shape[0] for 1D tensors
 
             name_buf = torch.zeros(200, dtype=torch.uint8, device="cuda")
-            dist.broadcast(name_buf, src=SENDER_RANK, group=sync_group)
+            dist.broadcast(name_buf, src=SENDER_RANK)
             param_name = name_buf[:name_len].cpu().numpy().tobytes().decode()
 
-            # We need to know shape to allocate buffer.
-            # shape_vals[0] = total elements for 1D tensors
-            n_elements = int(shape_vals[0])
             buf = torch.zeros(n_elements, dtype=torch.bfloat16, device="cuda")
-            dist.broadcast(buf, src=SENDER_RANK, group=sync_group)
-            received[param_name] = buf
+            dist.broadcast(buf, src=SENDER_RANK)
 
-    dist.destroy_process_group(sync_group)
-    dist.barrier()
+            # Only inference ranks keep the data
+            if R() in INFER_RANKS:
+                received[param_name] = buf
+
+    dist.barrier(device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
     return received
 
 
