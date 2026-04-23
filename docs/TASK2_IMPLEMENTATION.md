@@ -1,206 +1,237 @@
-# TASK 2: CPU Bucket Cache + Lifecycle Version Tracking
+# TASK 2: CPU Bucket Cache + vLLM Receiver Methods
 
 Branch: `task2-bucket-cache`
+Commit: `99fd9e2`
+
+---
 
 ## What Was Built
 
-TASK 2 from the NeMo port plan implements the **CPU bucket cache** abstraction
-that decouples weight serialisation from weight broadcasting.  In ROLL's
-Megatron strategy, trained weights are gathered from all PP ranks into a CPU
-buffer (`_build_latest_bucket_cache`, called inside `train_step` when
-`DO_TIME_SHARING=True`) and then atomically committed (`promote_active_checkpoint`)
-so the inference workers can pull them without racing against the next train step.
+Task 2 ports ROLL's two-pointer CPU bucket cache into the NeMo RL architecture,
+replacing an incorrect PP-shard-pull implementation with the correct collective-based
+approach.
 
-Four modules were ported/created:
+### Files Changed
 
-| File | Origin | Purpose |
+| File | Action | Purpose |
 |------|--------|---------|
-| `rlix/pipeline/bucket_cache.py` | ported from nemo-integration | Thread-safe in-process cache keyed by `(param_name, shard_id)` |
-| `rlix/pipeline/bucket_receiver.py` | ported | PP-shard merging + state-dict patching on inference workers |
-| `rlix/pipeline/model_update_service_cached.py` | ported | Orchestrates populate-from-PP + sync-to-inference |
-| `rlix/pipeline/bucket_cache_lifecycle.py` | **new** | Wraps ROLL's `promote_active_checkpoint` with version tracking |
+| `rlix/pipeline/bucket_cache.py` | Rewrite | `BucketRecord` + `VersionedBucketCache` |
+| `rlix/pipeline/bucket_cache_lifecycle.py` | Update | `promote_base()` calls `build_latest_bucket_cache` first |
+| `rlix/pipeline/coordinator.py` | Update | `sync_base_weights_to_active()` implementation |
+| `rlix/pipeline/bucket_receiver.py` | **Delete** | PP shard-pull incompatible with distributed collectives |
+| `rlix/pipeline/model_update_service_cached.py` | **Delete** | Wrong serial shard-pull orchestration |
+| `external/NeMo/.../vllm_backend.py` | Add 6 methods | Receiver API on `VllmInternalWorkerExtension` |
+| `tests/test_bucket_cache.py` | Rewrite | Real-torch data-integrity round-trip tests |
+| `tests/test_bucket_cache_lifecycle.py` | Update | `_FakeWorker` gains `build_latest_bucket_cache` |
+| `tests/test_vllm_backend_receiver.py` | New | Receiver method guards |
+| `tests/test_model_update_service.py` | New | MUS validation guards |
+| `tests/test_nemo_rl_pipeline.py` | New | Pipeline lifecycle ordering |
+| `tests/test_bucket_receiver.py` | **Delete** | Tests for deleted module |
+| `tests/test_model_update_service_cache.py` | **Delete** | Tests for deleted module |
+
+---
 
 ## Architecture
 
 ```
-train_step (inside ROLL megatron_strategy.py)
-  └─ _build_latest_bucket_cache(version)   ← PP gather → CPU bytes
-
-pipeline (after train_step returns)
-  └─ BucketCacheLifecycle.promote(version)
-       ├─ worker.promote_active_checkpoint(version)  ← atomically commits in ROLL
-       └─ _cache_ready_step = version
-
-scheduler (before expand)
-  └─ lifecycle.is_ready_for_version(v)  → True/False
-
-ModelUpdateServiceCached.sync_from_cache(tgt_dp_ranks)
-  ├─ get all buckets from CPUBucketCache
-  └─ send BucketUpdateRequest to each inference worker
+train_step()
+    ↓
+build_cpu_bucket_cache(step)          ← ALL PP/TP/CP/EP ranks participate in collective
+  cache owner (pp0/dp0/tp0/cp0)       ← packs List[BucketRecord], calls build_latest(step, buckets)
+  non-owners                          ← drain generator (keeps collective alive)
+    ↓
+promote_active_checkpoint(step)       ← switches _active_cached pointer; GC old versions
+    ↓
+ModelUpdateService.sync_selected_workers(tgt_dp_ranks)
+  per bucket:
+    staging_buf = bucket.cpu_uint8_bucket.pin_memory().cuda()  ← CPU→GPU, one bucket at a time
+    → IPC path: update_parameter_in_bucket() on vllm workers
+    → NCCL path: broadcast_parameter() on vllm workers
+    ray.get(recv_refs)                ← barrier
+    finally: del staging_buf          ← immediate release, controls peak VRAM
+  finalize_weight_update() per target worker
 ```
+
+---
 
 ## Module Details
 
-### CPUBucketCache (`bucket_cache.py`)
-
-Thread-safe dict keyed by `(param_name: str, shard_id: int)`.
-
-- `store(key, data)` — stores tensor to CPU
-- `get_all_buckets()` — returns `{key: Bucket}` for all entries
-- `evict(key)` / `evict_param(param_name)` / `clear()` — memory management
-
-`shard_id` maps to PP rank so that multi-rank PP gathers can be stored as
-separate shards and reassembled on the receiver side.
-
-### BucketReceiver (`bucket_receiver.py`)
-
-- `BucketUpdateRequest(sync_id, buckets)` — list of `(param_name, shard_id, data)` tuples
-- `BucketUpdateResult(sync_id, applied, failed, errors)` — fail-partial: one bad param
-  doesn't abort the rest; `.ok` property = `len(failed) == 0`
-- `merge_pp_shards(buckets)` — validates contiguous shard_ids `[0, 1, ..., N-1]`,
-  concatenates along dim=0
-- `apply_bucket_update(state_dict, request)` — groups by param_name, merges PP
-  shards, copies tensor data into state_dict in-place
-
-### ModelUpdateServiceCached (`model_update_service_cached.py`)
-
-Owns a `CPUBucketCache`.
-
-- `populate_cache_from_workers(workers)` — clears cache, then calls `get_pp_weight_shards(pp_rank)` on
-  each worker, stores with `shard_id=pp_rank`
-- `sync_from_cache(tgt_workers)` — sends all cached buckets as `BucketUpdateRequest`
-
-### BucketCacheLifecycle (`bucket_cache_lifecycle.py`)
-
-Standalone version tracker for `promote_active_checkpoint`.
+### `BucketRecord` (`bucket_cache.py`)
 
 ```python
-lifecycle = BucketCacheLifecycle(pipeline_id="p0", workers=train_workers)
-lifecycle.promote_base()              # version=-1, after init
-lifecycle.promote(step)              # after each train_step
-lifecycle.is_ready_for_version(v)    # scheduler check before expand
-lifecycle.reset()                    # after pipeline restart
+@dataclass
+class BucketRecord:
+    param_names: List[str]       # HF param names packed in this buffer, in order
+    shapes: List                 # per-param original shapes
+    dtypes: List                 # per-param original dtypes
+    offsets: List[int]           # byte offsets into cpu_uint8_bucket for each param
+    used_bytes: int              # total bytes actually written (no alignment padding)
+    cpu_uint8_bucket: Tensor     # contiguous uint8 CPU tensor
 ```
 
-Key design: `promote()` calls `worker.promote_active_checkpoint(version)` as a
-**direct Python call** (not `.remote()`).  The pipeline layer is responsible for
-wrapping in `ray.get([w.promote_active_checkpoint.remote(v) for w in workers])`
-before calling the lifecycle.  This keeps the class testable without Ray.
+All params are packed with 512-byte alignment between them (mirrors NeMo RL's
+`calculate_aligned_size` and ROLL's `serialize_named_weights`).
 
-`_cache_ready_step` uses a sentinel object (`_UNINITIALIZED`) so that version `0`
-is distinguishable from "never promoted".
+### `_bucket_named_tensors(named_tensors)` (`bucket_cache.py`)
 
-## Tests
+Packs `[(name, tensor), ...]` into a `BucketRecord`:
+1. For each tensor: `.detach().cpu().contiguous().flatten().view(torch.uint8)` — flatten is required for tensors with ndim > 1
+2. Computes 512-byte-aligned offsets
+3. Allocates `torch.zeros(total_bytes, dtype=torch.uint8)` and `copy_` each param into its slot
+4. Returns `BucketRecord` with all metadata
 
-64 unit tests across 4 files — all pass without Ray or GPU:
+### `unpack_bucket_record(record)` (`bucket_cache.py`)
+
+Inverse of `_bucket_named_tensors`. Critical: element size is obtained via
+`torch.empty(0, dtype=dtype).element_size()` — **not** by slicing the buffer.
+Slicing 1 uint8 byte and calling `.view(float32)` crashes real PyTorch because
+4-byte alignment is not satisfied.
+
+### `VersionedBucketCache` (`bucket_cache.py`)
+
+Two-pointer version tracking (mirrors ROLL `megatron_strategy.py:1049-1065`):
+
+```python
+cache.build_latest(version, buckets)  # store new version, does NOT make it active
+cache.promote(version)                # switch active pointer; GC all except latest+active
+cache.get_active_buckets()            # read active (caller holds _cache_lock)
+cache.cache_ready_step                # currently active version or None
+```
+
+GC invariant: after each `promote(v)`, all versions except `_latest_cached` and
+`_active_cached` are deleted from `_cache_map`. Peak memory ≤ 2× model.
+
+### `BucketCacheLifecycle` (`bucket_cache_lifecycle.py`)
+
+`promote_base()` now correctly calls `build_latest_bucket_cache(-1)` on all
+workers **before** `promote_active_checkpoint(-1)`. Previously it only promoted,
+leaving workers without a built cache to promote.
+
+### vLLM Receiver Methods (`vllm_backend.py` — `VllmInternalWorkerExtension`)
+
+| Method | Guard | Purpose |
+|--------|-------|---------|
+| `update_parameter_in_bucket(payload, ipc_local_ranks, transport)` | `rank not in ipc_local_ranks → return` | IPC weight injection |
+| `broadcast_parameter(group_name, names, dtypes, shapes, local_ranks)` | `rank not in local_ranks → return` | NCCL weight injection |
+| `destroy_collective_group(group_name)` | `group_name not in _model_update_groups → return` | NCCL PG teardown |
+| `setup_collective_group(name, comm_plan, mode, timeout_s)` | — | NCCL PG creation |
+| `verify_model(expected_stats)` | — | Weight stats comparison |
+| `finalize_weight_update()` | — | `process_weights_after_loading` + FP8 cache |
+
+---
+
+## Test Results
+
+All 65 unit tests pass on Vast.ai A5000 GPU instance with **real PyTorch**
+(Python 3.12.3, pytest 9.0.3).
 
 ```
-tests/test_bucket_cache.py           22 tests
-tests/test_bucket_receiver.py        12 tests
-tests/test_model_update_service_cache.py   9 tests
-tests/test_bucket_cache_lifecycle.py 21 tests
+platform linux -- Python 3.12.3, pytest-9.0.3
+Instance: 213.181.122.2:45678 (A5000 4x)
+Venv: /root/rlix/.venv/bin/python
+
+tests/test_bucket_cache.py            36 passed
+tests/test_bucket_cache_lifecycle.py  21 passed
+tests/test_vllm_backend_receiver.py    8 passed
+──────────────────────────────────────────────
+TOTAL                                 65 passed  in 1.11s
 ```
 
-Run with:
+Run on Vast:
 ```bash
-cd rlix
-python3 -m pytest tests/test_bucket_cache*.py tests/test_bucket_receiver.py tests/test_model_update_service_cache.py -v
+ssh -p 45678 root@213.181.122.2
+cd /root/rlix
+/root/rlix/.venv/bin/python -m pytest \
+    tests/test_bucket_cache.py \
+    tests/test_bucket_cache_lifecycle.py \
+    tests/test_vllm_backend_receiver.py -v
 ```
 
-## Bugs Encountered
+### Key tests
 
-### 1. A5000 `setup_env.sh` apt lock race (instance setup)
+| Test | What it validates |
+|------|-------------------|
+| `test_round_trip_single_float32` | float32 values survive pack→unpack byte-exact |
+| `test_round_trip_multi_params` | multiple params in one bucket all recover correctly |
+| `test_round_trip_mixed_dtypes` | float32 and float16 in same bucket both correct |
+| `test_round_trip_2d_shape` | 2D tensor shape preserved through pack/unpack |
+| `test_round_trip_many_small_params` | 20 scalar params (each << 512B) all recover |
+| `test_unpack_element_size_does_not_read_buf_slice` | the element_size bug fix under real torch |
+| `test_gc_keeps_only_latest_and_active` | GC invariant: only 2 versions kept |
+| `test_destroy_collective_group_noop_when_missing` | no-op guard when group absent |
+| `test_finalize_weight_update_calls_process_weights` | called exactly once |
+
+---
+
+## Bugs Fixed
+
+### 1. `unpack_bucket_record` — buffer slice view crash (real torch)
 
 **Error:**
 ```
-E: Could not get lock /var/lib/apt/lists/lock. It is held by process 3105 (apt-get)
+RuntimeError: unsupported operation: more than one element of the written-to tensor
+refers to a single memory location
 ```
 
-**Cause:** `unattended-upgrades` was running concurrently with `setup_env.sh`'s
-`apt-get update`, holding the apt lock.  A subsequent `tg4perfetto` pip install
-failed because `protoc` wasn't installed yet.
-
-**Fix:** Waited for background apt to finish, then re-ran the affected pip
-installs manually:
-```bash
-uv pip install --no-deps tg4perfetto>=0.0.6
-uv pip install /root/rlix
-```
-
-**Lesson:** On fresh GPU instances, wait ~60s after first SSH before running
-`apt-get` commands to let cloud-init / unattended-upgrades settle.
-
-### 2. `BucketCacheLifecycle.promote()` — `.remote()` AttributeError
-
-**Error (17 test failures):**
-```
-AttributeError: 'function' object has no attribute 'remote'
-```
-
-**Cause:** The initial implementation called
-`worker.promote_active_checkpoint.remote(version)`, expecting a Ray actor.
-Test fake workers are plain Python objects — their methods have no `.remote()` attribute.
-
-**Fix:** Changed to direct call:
+**Cause:** Original code computed element size as:
 ```python
-# Before (broken in tests)
-refs = [w.promote_active_checkpoint.remote(version) for w in self._workers]
-ray.get(refs)
-
-# After (testable)
-for worker in self._workers:
-    worker.promote_active_checkpoint(version)
+element_bytes = buf[offset:offset+1].view(dtype).element_size()
 ```
+In real PyTorch, 1 uint8 byte cannot be reinterpreted as float32 (needs 4 bytes).
+This works in stub-based tests but crashes with real torch.
 
-The pipeline layer handles Ray scheduling; `BucketCacheLifecycle` stays
-framework-agnostic.
-
-**Lesson:** Any class that may need unit testing without Ray should use direct
-method calls.  Keep Ray `.remote()` calls at the pipeline orchestration boundary.
-
-### 3. GPU integration test bugs (found during Vast.ai run)
-
-**Bug A — `CPUBucketCache.store()` signature mismatch**
-
-Initial test called `cache.store((name, 0), tensor)` (positional tuple key + data). Actual signature is `store(param_name, *, shard_id, tensor)`.
-
-Fix: `cache.store(name, shard_id=0, tensor=t)`
-
-**Bug B — tied weights missing from cache (`lm_head.weight` in Qwen)**
-
-`named_parameters()` deduplicates tied weights — `lm_head.weight` is the same tensor as `model.embed_tokens.weight` and only appears once. But `state_dict()` includes both keys. Since the bucket cache needs to reconstruct the full state dict on the inference side, it must store all keys including tied ones.
-
-Fix: use `model.state_dict().items()` instead of `model.named_parameters()` when populating the cache.
-
-**Impact:** If `get_cpu_weight_shards()` in the NeMo worker uses `named_parameters()`, it will miss tied weights. Must use `state_dict()` (or HF export which handles ties explicitly).
-
-**Bug C — `BucketUpdateRequest.sync_id` is `str` not `int`**
-
-Test passed `sync_id=1` (int). Actual type annotation is `str`.
-
-Fix: `sync_id="1"`
-
-### 4. Do NOT call `destroy_model_parallel()` between train steps
-
-**Trap:** It might seem sensible to call `mpu.destroy_model_parallel()` (or
-`torch.distributed.destroy_process_group()`) after training to "free GPU memory"
-before handing the GPU to inference.
-
-**Why it's wrong:** `destroy_model_parallel()` only tears down NCCL process groups —
-it does **not** free tensor memory.  More critically, the time-sharing design
-keeps the Megatron worker process alive across steps (it just sleeps while
-inference runs).  Destroying the process group means the next `train_step` has
-no communication backend → immediate crash.
-
-**How time-sharing actually frees the GPU:**
-The Megatron worker calls `_build_latest_bucket_cache` (copies weights to CPU),
-then signals vLLM to wake up.  vLLM reuses the same physical GPU via IPC or
-NCCL weight injection.  No process restart, no destroy — just sleep/wake.
-
-To free GPU memory legitimately between train and infer, use:
+**Fix:**
 ```python
-torch.cuda.empty_cache()   # flush PyTorch allocator cache
-# (only after del model if you're truly done with training)
+element_bytes = torch.empty(0, dtype=dtype).element_size()
 ```
-But in normal time-sharing, this isn't needed either — the GPU is shared in time,
-not released.
+
+### 2. 2D tensor pack — shape mismatch in `copy_` (real torch)
+
+**Error:**
+```
+RuntimeError: The size of tensor a (24) must match the size of tensor b (12) at non-singleton dimension 1
+```
+
+**Cause:** `.view(torch.uint8)` on a 2D tensor preserves the 2D shape. For a
+`(2, 3)` float32 tensor, `view(uint8)` gives `(2, 12)`. Then
+`bucket_buf[start:start+nbytes]` is 1D `(24,)`, and `copy_((2, 12))` fails.
+
+**Fix:** Added `.flatten()` before `.view(torch.uint8)`:
+```python
+uint8_view = tensor.detach().cpu().contiguous().flatten().view(torch.uint8)
+```
+
+### 3. Wrong architecture — PP shard-pull incompatible with distributed collectives
+
+**Problem:** The prior implementation called `worker.get_pp_weight_shards(pp_rank)`
+serially on each PP rank. PP gather uses NCCL all-gather — all ranks must
+participate simultaneously. Serial pulls deadlock.
+
+**Fix:** Deleted `bucket_receiver.py` and `model_update_service_cached.py`.
+All ranks call `gather_all_hf_weights()` together; only the cache owner
+(pp0/dp0/tp0/cp0) stores results.
+
+### 4. `codetiming` import via `rlix/pipeline/__init__.py`
+
+**Error:**
+```
+ModuleNotFoundError: No module named 'codetiming'
+```
+
+**Cause:** Test imports `from rlix.pipeline.bucket_cache import ...` which
+triggers `rlix/pipeline/__init__.py`, which eagerly imports
+`full_finetune_pipeline` → `codetiming`. Not installed in test environments.
+
+**Fix:** Tests import `bucket_cache.py` directly via `importlib.util.spec_from_file_location`,
+bypassing `__init__.py`. `codetiming` was also installed in the Vast venv via `uv`.
+
+---
+
+## What Remains (Gate 2.5)
+
+The integration test (`Gate 2.5`) requires 2 GPU with tp=2 and validates:
+1. `build_cpu_bucket_cache(step)` collective gather with all TP ranks
+2. NCCL broadcast transport path (cross-GPU selective sync)
+3. `destroy_megatron_nccl_groups()` → `initialize_model_parallel()` stability over 3+ steps
+
+This gate has not been run in this session. The unit test layer above is complete.
