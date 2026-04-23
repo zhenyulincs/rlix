@@ -394,6 +394,8 @@ def test_sync_selected_workers_calls_finalize_weight_update(monkeypatch):
     svc._master_addr_by_src_rank = {}
     svc._timeout_s = None
     svc._pg_timeout_s = None
+    svc.model_update_transport = "cpu_serialize"
+    svc.bucket_size_bytes = None
     svc._get_master_addr = MagicMock(return_value="127.0.0.1")
     svc._build_comm_plan_for_sender = MagicMock(
         return_value=(
@@ -413,3 +415,179 @@ def test_sync_selected_workers_calls_finalize_weight_update(monkeypatch):
     assert sorted(finalize_called_ranks) == [0, 1], (
         f"Expected finalize on ranks [0, 1], got {finalize_called_ranks}"
     )
+
+
+# ---------------------------------------------------------------------------
+# model_update_transport — validation and wiring
+# ---------------------------------------------------------------------------
+
+
+def test_model_update_transport_invalid_value_raises(monkeypatch):
+    """Invalid transport name must raise ValueError at construction time."""
+    mod, _ = _load_mus(monkeypatch)
+
+    src_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 0, "rank": 0}]},
+    )
+    tgt_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 1, "rank": 0}]},
+    )
+    with pytest.raises(ValueError, match="model_update_transport"):
+        mod.ModelUpdateService(
+            pipeline_id="p",
+            src_cluster=src_cluster,
+            tgt_cluster=tgt_cluster,
+            model_update_transport="nccl_only",  # not a valid value
+        )
+
+
+def test_model_update_transport_defaults_to_cpu_serialize(monkeypatch):
+    """Default transport must be 'cpu_serialize'."""
+    mod, _ = _load_mus(monkeypatch)
+
+    src_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 0, "rank": 0}]},
+    )
+    tgt_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 1, "rank": 0}]},
+    )
+    svc = mod.ModelUpdateService(
+        pipeline_id="p",
+        src_cluster=src_cluster,
+        tgt_cluster=tgt_cluster,
+    )
+    assert svc.model_update_transport == "cpu_serialize"
+
+
+def test_model_update_transport_cuda_ipc_accepted(monkeypatch):
+    """'cuda_ipc' is a valid transport value."""
+    mod, _ = _load_mus(monkeypatch)
+
+    src_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 0, "rank": 0}]},
+    )
+    tgt_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 1, "rank": 0}]},
+    )
+    svc = mod.ModelUpdateService(
+        pipeline_id="p",
+        src_cluster=src_cluster,
+        tgt_cluster=tgt_cluster,
+        model_update_transport="cuda_ipc",
+    )
+    assert svc.model_update_transport == "cuda_ipc"
+
+
+# ---------------------------------------------------------------------------
+# bucket_size_bytes — validation and RAM guard
+# ---------------------------------------------------------------------------
+
+
+def test_bucket_size_bytes_none_skips_guard(monkeypatch):
+    """bucket_size_bytes=None must not raise even without psutil."""
+    mod, _ = _load_mus(monkeypatch)
+
+    src_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 0, "rank": 0}]},
+    )
+    tgt_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 1, "rank": 0}]},
+    )
+    # Should not raise regardless of psutil availability
+    svc = mod.ModelUpdateService(
+        pipeline_id="p",
+        src_cluster=src_cluster,
+        tgt_cluster=tgt_cluster,
+        bucket_size_bytes=None,
+    )
+    assert svc.bucket_size_bytes is None
+
+
+def test_bucket_size_bytes_negative_raises(monkeypatch):
+    """Negative bucket_size_bytes must raise ValueError."""
+    mod, _ = _load_mus(monkeypatch)
+
+    src_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 0, "rank": 0}]},
+    )
+    tgt_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 1, "rank": 0}]},
+    )
+    with pytest.raises(ValueError, match="bucket_size_bytes"):
+        mod.ModelUpdateService(
+            pipeline_id="p",
+            src_cluster=src_cluster,
+            tgt_cluster=tgt_cluster,
+            bucket_size_bytes=-1,
+        )
+
+
+def test_bucket_size_bytes_ram_guard_triggers(monkeypatch):
+    """bucket_size_bytes exceeding 40% of available RAM must raise RuntimeError."""
+    mod, _ = _load_mus(monkeypatch)
+
+    # Patch psutil to report tiny available RAM
+    psutil_stub = types.ModuleType("psutil")
+
+    class _FakeVMem:
+        available = 100 * 1024 * 1024  # 100 MB
+
+    psutil_stub.virtual_memory = lambda: _FakeVMem()
+    monkeypatch.setitem(sys.modules, "psutil", psutil_stub)
+
+    src_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 0, "rank": 0}]},
+    )
+    tgt_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 1, "rank": 0}]},
+    )
+    # 2 × 90 MB > 80% × 100 MB (= 80 MB) → should fail fast
+    with pytest.raises(RuntimeError, match="Host RAM budget exceeded"):
+        mod.ModelUpdateService(
+            pipeline_id="p",
+            src_cluster=src_cluster,
+            tgt_cluster=tgt_cluster,
+            bucket_size_bytes=90 * 1024 * 1024,
+        )
+
+
+def test_bucket_size_bytes_ram_guard_passes(monkeypatch):
+    """bucket_size_bytes within RAM budget must not raise."""
+    mod, _ = _load_mus(monkeypatch)
+
+    psutil_stub = types.ModuleType("psutil")
+
+    class _FakeVMem:
+        available = 10 * 1024 * 1024 * 1024  # 10 GB
+
+    psutil_stub.virtual_memory = lambda: _FakeVMem()
+    monkeypatch.setitem(sys.modules, "psutil", psutil_stub)
+
+    src_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 0, "rank": 0}]},
+    )
+    tgt_cluster = FakeCluster(
+        [MagicMock()], [FakeWorkerRankInfo()],
+        {0: [{"node_rank": 0, "gpu_rank": 1, "rank": 0}]},
+    )
+    # 2 × 1 GB < 80% × 10 GB (= 8 GB) → should pass
+    svc = mod.ModelUpdateService(
+        pipeline_id="p",
+        src_cluster=src_cluster,
+        tgt_cluster=tgt_cluster,
+        bucket_size_bytes=1 * 1024 * 1024 * 1024,
+    )
+    assert svc.bucket_size_bytes == 1 * 1024 * 1024 * 1024

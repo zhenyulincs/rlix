@@ -97,6 +97,8 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
         self._lifecycle: Any = None  # BucketCacheLifecycle, set during initialize_pipeline
         # Version of the last committed base-model checkpoint (= _lifecycle.cache_ready_step).
         self._current_weight_version: Optional[int] = None
+        # ModelUpdateService Ray actor handle (Feature 6), set during initialize_pipeline.
+        self._model_update_service: Any = None
 
     def _get_coordinator_handle(self) -> Any:
         """Resolve and cache the per-pipeline PipelineCoordinator actor handle.
@@ -429,9 +431,12 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                 pipeline_id=self._pipeline_id,
                 src_cluster=self.actor_train,
                 tgt_cluster=self.actor_infer,
+                model_update_transport=os.environ.get("RLIX_MODEL_UPDATE_TRANSPORT", "cpu_serialize"),
+                bucket_size_bytes=int(os.environ["RLIX_BUCKET_SIZE_BYTES"]) if os.environ.get("RLIX_BUCKET_SIZE_BYTES") else None,
             )
             # Block until actor init completes.
             ray.get(svc.__ray_ready__.remote())
+            self._model_update_service = svc
             # Start from a well-defined state:
             # - disable routing until we request GPUs from RLix.
             # NOTE: avoid local suspend()/resume() state transitions; shrink-to-zero is the single
@@ -474,18 +479,31 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
     def _expand_workers(self, *, dp_ranks_to_add: List[int]) -> Dict[str, Any]:
         """Pipeline-local expand helper.
 
-        Train scheduler does weight load + routing; val scheduler does routing-only.
-        After expand, publishes _current_weight_version so newly-woken workers are
-        consistent with active workers (same cache_ready_step, no version bump).
+        Atomic expand sequence (spec: nemorl-port-plan.md lines 589-609):
+          1. Wake overlap ranks (skip_load=True — weights come from CPU bucket cache, not ROLL load).
+          2. Sync weights from CPU bucket cache via ModelUpdateService (Feature 6 path).
+          3. Val scheduler routing update (skip_load=True always).
+          4. Publish _current_weight_version so newly-woken workers are consistent.
         """
         if not isinstance(dp_ranks_to_add, list) or not dp_ranks_to_add:
             raise ValueError("dp_ranks_to_add must be a non-empty list[int]")
         with self._infer_resize_lock:
-            # Train: load model states + routing update.
-            result = ray.get(self.train_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=False))
+            # Step 1: Wake overlap ranks without ROLL-side weight loading.
+            # Weights are provided by ModelUpdateService from the CPU bucket cache (step 2).
+            result = ray.get(self.train_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
             ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
-            # Publish current weight version for the newly-woken workers.
-            # Version is the same cache_ready_step (expand does not train, no version bump).
+
+            # Step 2: Sync weights from CPU bucket cache to the newly-woken workers.
+            # Spec: _expand_workers must call sync_selected_workers explicitly so that
+            # workers receive weights before being activated for routing.
+            if hasattr(self, "_model_update_service") and self._model_update_service is not None:
+                ray.get(
+                    self._model_update_service.sync_selected_workers.remote(
+                        tgt_dp_ranks=dp_ranks_to_add,
+                    )
+                )
+
+            # Step 3+4: Publish current weight version (no version bump on expand).
             if self._lifecycle is not None:
                 self._current_weight_version = self._lifecycle.cache_ready_step
             return cast(Dict[str, Any], result)
