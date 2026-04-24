@@ -64,10 +64,14 @@ Gaps:
 
 Requirement source: `IMPLEMENTATION.md:139-154`, `docs/TASK2_IMPLEMENTATION.md:39-52`, `TASK2_REVIEW.md:17-21`.
 
+Status: IMPLEMENTED.
+
 Implementation mapping:
-- `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:2010-2062` implements `_rlix_get_bucket_size_bytes()`, resolving `worker.cfg['rlix']['bucket_size_bytes']` or `RLIX_BUCKET_SIZE_BYTES` and raising if neither is set.
-- `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:2065-2098` implements `_rlix_check_vram()`, checking `bucket_size_bytes + scratch` against available VRAM.
-- `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:1216-1244` performs the host-RAM fail-fast check from the actual packed `total_bytes`.
+- `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:2040-2092` implements `_rlix_get_bucket_size_bytes()`, resolving `worker.cfg['rlix']['bucket_size_bytes']` or `RLIX_BUCKET_SIZE_BYTES` and raising if neither is set.
+- `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:2095-2127` implements `_rlix_check_vram()`, checking `bucket_size_bytes + scratch` against available VRAM.
+- `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:1201-1209` now raises `RuntimeError` when a single tensor exceeds `bucket_size_bytes` before appending it to the current bucket batch.
+- `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:1223-1252` performs the host-RAM fail-fast check from the actual packed `total_bytes`.
+- `tests/integration/test_gate2_5_bucket_size_guard.py:117-182` covers the oversized-tensor guard and asserts that the production-source guard appears before `current_batch.append(...)`.
 
 Gaps:
 - `ModelUpdateService.__init__` still accepts `bucket_size_bytes=None` for tests or single-GPU setups, and the pipeline still passes `None` when `RLIX_BUCKET_SIZE_BYTES` is unset (`rlix/pipeline/model_update_service.py:43-79`, `rlix/pipeline/full_finetune_pipeline.py:453-467`). The sender-side build path now enforces explicit bucket sizing, but the service constructor itself remains looser than the repo docs describe.
@@ -131,24 +135,26 @@ Routing / routing-table notes:
 - The planning layer explicitly distinguishes same-GPU IPC targets from cross-GPU broadcast targets at `rlix/pipeline/model_update_service.py:205-228`.
 
 Gaps:
-- No repo-local gap in the route-classification table itself; the main gap is transport parity on the IPC branch, described in F6.3.
+- No repo-local gap remains in the route-classification table or in the IPC-vs-broadcast split itself (`rlix/pipeline/model_update_service.py:130-256`).
 
 ### F6.3 Requirement: same-GPU IPC transport must support producer/consumer protocol for `cpu_serialize` and `cuda_ipc`
 
 Requirement source: `IMPLEMENTATION.md:222-231`, `IMPLEMENTATION.md:284-289`, `TASK2_REVIEW.md:7-10`, `TASK2_REVIEW.md:20-22`.
+
+Status: IMPLEMENTED.
 
 Existing producer/consumer primitives:
 - `external/NeMo/nemo_rl/models/policy/utils.py:250-340` implements `stream_weights_via_ipc_zmq_impl()`, which builds a ping-pong IPC stream and emits `(cuda_ipc_handle, param_names, used_bytes)` payloads.
 - `external/NeMo/nemo_rl/models/policy/utils.py:386-393` implements `rebuild_cuda_tensor_from_ipc()`.
 - `external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:163-249` implements the native ZMQ IPC consumer `update_weights_via_ipc_zmq()`.
 
-Current selective-sync implementation:
-- `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:1345-1363` does not call the native ZMQ IPC path during selective sync; it builds a Python `payload` dict containing `param_names`, `shapes`, `dtypes`, `offsets`, `used_bytes`, and `cpu_uint8_bucket`, then invokes `update_parameter_in_bucket.remote(...)`.
-- `external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:361-412` implements `update_parameter_in_bucket(payload, ipc_local_ranks, model_update_transport, is_lora=False)`, but the method always reconstructs from the CPU bucket payload and never branches on `model_update_transport`.
-- `external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:370-379` explicitly documents only `"cpu_serialize"` support in the receiver.
+Selective-sync implementation:
+- `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:1355-1392` now branches on `model_update_transport` in the sender. For `cuda_ipc`, it synchronizes the staging stream, calls `get_handle_from_tensor(staging_buf)`, and sends a `cuda_ipc_handle` payload; for `cpu_serialize`, it still sends the packed `cpu_uint8_bucket`.
+- `external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:390-412` uses `self.rank` for the IPC local-rank mask, branches on `model_update_transport`, patches the CUDA IPC device index for the local worker, and rebuilds the staged GPU buffer via `rebuild_cuda_tensor` with no CPU roundtrip.
+- `tests/integration/test_gate2_5_cuda_ipc.py:1-25`, `tests/integration/test_gate2_5_cuda_ipc.py:77-207`, and `tests/integration/test_gate2_5_cuda_ipc.py:221-340` cover CUDA IPC handle generation, same-GPU tensor rebuild, and the receiver-side bucket update path.
 
 Gaps:
-- End-to-end selective-sync `cuda_ipc` is not yet implemented. The producer/consumer primitives exist in NeMo, but the selective-sync path does not route through them and the selective receiver ignores `model_update_transport` beyond accepting it in the signature (`IMPLEMENTATION.md:224-231`, `IMPLEMENTATION.md:288-289`, `external/NeMo/nemo_rl/models/policy/utils.py:250-340`, `external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:361-412`).
+- No repo-local implementation gap remains for selective-sync `cuda_ipc`; the same-GPU sender and receiver branches now support both `cpu_serialize` and `cuda_ipc` payloads (`external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:1355-1392`, `external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:361-430`).
 
 ### F6.4 Requirement: cross-GPU transport must create, use, and destroy a dynamic NCCL group per sync
 
@@ -175,35 +181,41 @@ Implementation mapping:
 - `external/NeMo/nemo_rl/models/generation/vllm/vllm_generation.py:858-962` exposes matching pass-through methods on the generation actor and awaits inner worker futures.
 
 Request / response schema:
-- `update_parameter_in_bucket(payload, ipc_local_ranks, model_update_transport, is_lora=False)` expects a dict with `param_names`, `shapes`, `dtypes`, `offsets`, `used_bytes`, and `cpu_uint8_bucket`, and returns via side effect / `None` after weight load (`external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:361-412`).
+- `update_parameter_in_bucket(payload, ipc_local_ranks, model_update_transport, is_lora=False)` expects a dict with `param_names`, `shapes`, `dtypes`, `offsets`, and `used_bytes`, plus `cpu_uint8_bucket` for `cpu_serialize` or `cuda_ipc_handle` for `cuda_ipc`, and returns via side effect / `None` after weight load (`external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:361-430`).
 - `broadcast_parameter(group_name, names, dtypes, shapes, broadcast_local_ranks, is_lora=False)` expects group metadata plus tensor metadata and returns via side effect / `None` after load (`external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:414-485`).
 - `verify_model(expected_stats)` expects `sum`, `max`, and `min` statistics and raises on mismatch (`external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:508-537`).
 - `finalize_weight_update()` runs `process_weights_after_loading(...)` and FP8 cache processing on the worker (`external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:538-549`).
 
 Gaps:
-- The API surface exists, but transport parity is incomplete because `update_parameter_in_bucket()` does not implement the `cuda_ipc` branch described by the same signature (`external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:361-412`).
+- No repo-local API-surface gap remains; `update_parameter_in_bucket()` now implements both the `cpu_serialize` and `cuda_ipc` branches described by the request schema (`external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:361-430`).
 
 ### F6.6 Requirement: pipeline-owned finalize and version publication after transport
 
 Requirement source: `IMPLEMENTATION.md:233-257`, `IMPLEMENTATION.md:260-317`, `docs/TASK2_IMPLEMENTATION.md:45-53`.
 
+Status: FIXED / IMPLEMENTED.
+
 Implementation mapping:
 - `rlix/pipeline/full_finetune_pipeline.py:536-543` calls `finalize_weight_update.remote()` for each expanded infer rank after `sync_selected_workers()` returns.
-- `rlix/pipeline/full_finetune_pipeline.py:550-555` publishes `_current_weight_version` to the trajectory collector after expand-time finalize.
-- `rlix/pipeline/full_finetune_pipeline.py:1118-1130` finalizes the active-refresh ranks returned by `sync_base_weights_to_active()` and publishes the updated version before releasing training GPUs.
+- `rlix/pipeline/full_finetune_pipeline.py:545-558` now calls `set_weight_version` before `expand_sampler`, so version publication happens before routing activation, matching spec lines 602-608.
+- `rlix/pipeline/full_finetune_pipeline.py:1118-1133` finalizes the active-refresh ranks returned by `sync_base_weights_to_active()` and publishes the updated version before releasing training GPUs.
 - `external/NeMo/nemo_rl/algorithms/grpo.py:2518-2546` registers the named `AsyncTrajectoryCollector` actor.
 - `external/NeMo/nemo_rl/algorithms/async_utils.py:344-353` implements `set_weight_version()`.
+- `tests/integration/test_gate2_5_trajectory_collector.py:112-216` covers the expand-time publish path and asserts `set_weight_version.remote(...)` appears before `expand_sampler.remote(...)` in `_expand_workers()`.
 
 Gaps:
-- No missing finalize/version-publish hook remains in the current tree; the live gap is test coverage, not the existence of the hooks.
+- No repo-local finalize/version-publish gap remains; the expand-time ordering bug is fixed and covered by Gate 2.5 targeted tests (`rlix/pipeline/full_finetune_pipeline.py:545-558`, `tests/integration/test_gate2_5_trajectory_collector.py:148-216`).
 
 ## Gate 2.5 Test Coverage Matrix
 
-The repo currently contains six Gate 2.5 integration files: `tests/integration/test_gate2_5_feature6.py`, `tests/integration/test_gate2_5_full.py`, `tests/integration/test_gate2_5_selective_sync.py`, `tests/integration/test_gate2_5_nccl_destroy.py`, `tests/integration/test_gate2_5_megatron_tp.py`, and `tests/integration/test_gate2_5_qwen_train_sync.py`.
+The repo currently contains nine Gate 2.5 integration files: `tests/integration/test_gate2_5_feature6.py`, `tests/integration/test_gate2_5_full.py`, `tests/integration/test_gate2_5_selective_sync.py`, `tests/integration/test_gate2_5_nccl_destroy.py`, `tests/integration/test_gate2_5_megatron_tp.py`, `tests/integration/test_gate2_5_qwen_train_sync.py`, `tests/integration/test_gate2_5_cuda_ipc.py`, `tests/integration/test_gate2_5_bucket_size_guard.py`, and `tests/integration/test_gate2_5_trajectory_collector.py`.
 
 | test file | spec requirement | status |
 |---|---|---|
 | `tests/integration/test_gate2_5_feature6.py` | F4.1 canonical bucket format and F6.6 ordering/finalize after sync (`tests/integration/test_gate2_5_feature6.py:1-22`, `tests/integration/test_gate2_5_feature6.py:121-189`, `tests/integration/test_gate2_5_feature6.py:253-309`, `tests/integration/test_gate2_5_feature6.py:357-390`) | `partial` — validates bucket packing, per-cycle NCCL teardown, finalize ordering, and routing activation, but uses hand-written NCCL/GPU test logic instead of `ModelUpdateService` or `vllm_backend` receiver RPCs (`tests/integration/test_gate2_5_feature6.py:171-247`). |
+| `tests/integration/test_gate2_5_cuda_ipc.py` | F6.3 same-GPU `cuda_ipc` producer/consumer transport (`tests/integration/test_gate2_5_cuda_ipc.py:1-25`, `tests/integration/test_gate2_5_cuda_ipc.py:77-207`, `tests/integration/test_gate2_5_cuda_ipc.py:221-340`) | `partial` — validates CUDA IPC handle generation, same-GPU zero-copy reconstruction, and the receiver-side bucket update path, but does not drive the full `ModelUpdateService` selective-sync stack end-to-end. |
+| `tests/integration/test_gate2_5_bucket_size_guard.py` | F4.4 bucket-size configuration, oversized-tensor fail-fast, and host-RAM guard (`tests/integration/test_gate2_5_bucket_size_guard.py:1-16`, `tests/integration/test_gate2_5_bucket_size_guard.py:54-182`, `tests/integration/test_gate2_5_bucket_size_guard.py:185-253`) | `partial` — covers explicit bucket-size configuration, the oversized single-tensor `RuntimeError`, and host-RAM fail-fast behavior, but does not execute the live VRAM guard through a full worker init path. |
+| `tests/integration/test_gate2_5_trajectory_collector.py` | F6.6 trajectory-collector version publication and expand-time ordering (`tests/integration/test_gate2_5_trajectory_collector.py:1-19`, `tests/integration/test_gate2_5_trajectory_collector.py:93-141`, `tests/integration/test_gate2_5_trajectory_collector.py:148-216`) | `partial` — covers init/expand/post-train version publication and verifies `set_weight_version` occurs before `expand_sampler`, but does not run a full Ray pipeline + coordinator integration path. |
 | `tests/integration/test_gate2_5_selective_sync.py` | F4.1 bucket format and F6.4 proper-subset NCCL broadcast lifecycle (`tests/integration/test_gate2_5_selective_sync.py:1-38`, `tests/integration/test_gate2_5_selective_sync.py:133-202`, `tests/integration/test_gate2_5_selective_sync.py:210-233`) | `partial` — exercises raw NCCL subgroup broadcast plus `BucketRecord` reconstruction, but does not call `ModelUpdateService`, `setup_collective_group()`, `broadcast_parameter()`, or `destroy_collective_group()` from the live transport stack (`tests/integration/test_gate2_5_selective_sync.py:65-70`, `tests/integration/test_gate2_5_selective_sync.py:136-202`). |
 | `tests/integration/test_gate2_5_nccl_destroy.py` | Gate 2.5 NCCL destroy/re-init stability prerequisite for F4/F6 transport reuse (`tests/integration/test_gate2_5_nccl_destroy.py:1-16`, `tests/integration/test_gate2_5_nccl_destroy.py:66-76`, `tests/integration/test_gate2_5_nccl_destroy.py:82-143`, `tests/integration/test_gate2_5_nccl_destroy.py:150-211`) | `covered` — directly validates `destroy_model_parallel()` / `initialize_model_parallel()` loops, VRAM release, stale-handle behavior, and repeated-cycle stability. |
 | `tests/integration/test_gate2_5_megatron_tp.py` | F4.3 owner-side CPU cache build and Gate 2.5 TP-shard offload/re-init (`tests/integration/test_gate2_5_megatron_tp.py:1-29`, `tests/integration/test_gate2_5_megatron_tp.py:171-185`, `tests/integration/test_gate2_5_megatron_tp.py:424-472`) | `partial` — covers real TP-sharded training, CPU cache build, VRAM release, and Megatron re-init; weight transfer now uses NCCL dynamic subset groups [0,2] and [1,3] per TP shard (shard 0: rank0→rank2, shard 1: rank1→rank3), migrated from gloo; does not yet call the live `ModelUpdateService` or `vllm_backend` receiver path (`tests/integration/test_gate2_5_megatron_tp.py:205-209`, `tests/integration/test_gate2_5_megatron_tp.py:203-253`). |
@@ -211,7 +223,4 @@ The repo currently contains six Gate 2.5 integration files: `tests/integration/t
 | `tests/integration/test_gate2_5_full.py` | Multi-pipeline isolation around F4 cache build/offload and repeated inference updates (`tests/integration/test_gate2_5_full.py:1-35`, `tests/integration/test_gate2_5_full.py:151-161`, `tests/integration/test_gate2_5_full.py:363-500`) | `partial` — validates offload/isolation and bit-exact pipeline A/B transfers; both weight-transfer phases now use NCCL dynamic subset groups: phase-A uses group [0,2,3] (rank0→ranks 2,3) and phase-B uses group [1,2,3] (rank1→ranks 2,3), migrated from gloo; gloo is retained for control-plane barriers and metadata exchange only; does not call the live selective transport stack (`tests/integration/test_gate2_5_full.py:180-248`, `tests/integration/test_gate2_5_full.py:181-278`, `tests/integration/test_gate2_5_full.py:299-313`). |
 
 Uncovered or not fully covered requirements:
-- F6.3 end-to-end same-GPU `cuda_ipc` selective transport has no Gate 2.5 coverage; none of the six files call `stream_weights_via_ipc_zmq_impl()`, `update_weights_via_ipc_zmq()`, or a selective-sync receiver branch that consumes CUDA IPC handles (`external/NeMo/nemo_rl/models/policy/utils.py:250-340`, `external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:163-249`, `external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:361-412`).
-- The actual `ModelUpdateService` + `vllm_backend.broadcast_parameter()` transport path is not covered end-to-end by the Gate 2.5 tests; the closest NCCL tests hand-roll `dist.new_group()` / `dist.broadcast()` directly, while the real selective path lives in `rlix/pipeline/model_update_service.py:258-463`, `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:1271-1403`, and `external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:414-485`.
-- F4.4 explicit bucket-size configuration and host-RAM guard have no direct Gate 2.5 assertion; the live guards are in `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:1216-1244` and `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:2010-2098`, but the Gate 2.5 files build `VersionedBucketCache` directly and do not exercise those worker hooks (`tests/integration/test_gate2_5_feature6.py:121-158`, `tests/integration/test_gate2_5_selective_sync.py:139-148`, `tests/integration/test_gate2_5_qwen_train_sync.py:166-177`).
-- F6.6 active-refresh publication through `sync_base_weights_to_active()` and `AsyncTrajectoryCollector.set_weight_version()` is not exercised in Gate 2.5; the code exists in `rlix/pipeline/coordinator.py:507-550`, `rlix/pipeline/full_finetune_pipeline.py:1112-1130`, `external/NeMo/nemo_rl/algorithms/grpo.py:2518-2546`, and `external/NeMo/nemo_rl/algorithms/async_utils.py:344-353`, but none of the six Gate 2.5 files instantiate the coordinator/pipeline/collector path.
+- The live selective transport stack is still not covered in one end-to-end run that goes through `ModelUpdateService`, the sender worker RPCs, and the receiver RPCs together; current Gate 2.5 coverage is split across targeted IPC, bucket-guard, trajectory-collector, and NCCL subgroup tests (`rlix/pipeline/model_update_service.py:258-463`, `external/NeMo/nemo_rl/models/policy/workers/megatron_policy_worker.py:1280-1492`, `external/NeMo/nemo_rl/models/generation/vllm/vllm_backend.py:361-507`).
