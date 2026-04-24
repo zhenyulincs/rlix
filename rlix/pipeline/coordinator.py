@@ -504,7 +504,7 @@ class PipelineCoordinator(Coordinator):
         finally:
             self._resize_sync_lock.release()
 
-    def sync_base_weights_to_active(self) -> None:
+    def sync_base_weights_to_active(self) -> List[int]:
         """Push trained base model weights to all currently-awake infer workers.
 
         Called by the pipeline after train_step + promote + offload, before releasing
@@ -528,7 +528,7 @@ class PipelineCoordinator(Coordinator):
         try:
             active_ranks = sorted(self._active_infer_dp_ranks)
             if not active_ranks:
-                return
+                return []
             if self._model_update_service is None:
                 model_update_service_name = f"{self._pipeline_id}_model_update_service"
                 self._model_update_service = get_actor_or_raise(
@@ -545,6 +545,7 @@ class PipelineCoordinator(Coordinator):
                     verify=self._verify_model_after_sync,
                 )
             )
+            return active_ranks
         finally:
             self._resize_sync_lock.release()
 

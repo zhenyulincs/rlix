@@ -99,6 +99,37 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
         self._current_weight_version: Optional[int] = None
         # ModelUpdateService Ray actor handle (Feature 6), set during initialize_pipeline.
         self._model_update_service: Any = None
+        # AsyncTrajectoryCollector Ray actor handle for set_weight_version (Feature 6).
+        # Injected by the training loop (grpo.py) via set_trajectory_collector().
+        self._trajectory_collector: Any = None
+
+    def set_trajectory_collector(self, collector: Any) -> None:
+        """Inject the AsyncTrajectoryCollector Ray actor handle (injection path).
+
+        Called by the training loop (grpo.py) after the collector is created.
+        The pipeline also lazily resolves the collector by name via
+        _get_trajectory_collector() when PIPELINE_ID and ROLL_RAY_NAMESPACE are set.
+        Spec: nemorl-port-plan.md lines 490, 538, 603.
+        """
+        self._trajectory_collector = collector
+
+    def _get_trajectory_collector(self) -> Any:
+        """Return the trajectory collector, lazily resolved by named Ray actor if needed."""
+        if self._trajectory_collector is not None:
+            return self._trajectory_collector
+        import os as _os
+        pipeline_id = _os.environ.get("PIPELINE_ID", "")
+        namespace = _os.environ.get("ROLL_RAY_NAMESPACE", "")
+        if not pipeline_id or not namespace:
+            return None
+        try:
+            self._trajectory_collector = ray.get_actor(
+                f"rlix:trajectory_collector:{pipeline_id}",
+                namespace=namespace,
+            )
+        except Exception:
+            pass
+        return self._trajectory_collector
 
     def _get_coordinator_handle(self) -> Any:
         """Resolve and cache the per-pipeline PipelineCoordinator actor handle.
@@ -303,7 +334,7 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                     ray.get(
                         [
                             w.promote_active_checkpoint.remote(
-                                checkpoint_version=int(init_checkpoint_version),
+                                version=int(init_checkpoint_version),
                             )
                             for w in self.actor_train.workers
                         ]
@@ -456,6 +487,9 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
             )
             self._lifecycle.mark_promoted(BucketCacheLifecycle._BASE_VERSION)
             self._current_weight_version = self._lifecycle.cache_ready_step
+            _tc = self._get_trajectory_collector()
+            if _tc is not None:
+                ray.get(_tc.set_weight_version.remote(self._current_weight_version))
 
             self._initialized = True
             return ActionResponse(success=True)
@@ -488,14 +522,10 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
         if not isinstance(dp_ranks_to_add, list) or not dp_ranks_to_add:
             raise ValueError("dp_ranks_to_add must be a non-empty list[int]")
         with self._infer_resize_lock:
-            # Step 1: Wake overlap ranks without ROLL-side weight loading.
-            # Weights are provided by ModelUpdateService from the CPU bucket cache (step 2).
-            result = ray.get(self.train_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
-            ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
-
-            # Step 2: Sync weights from CPU bucket cache to the newly-woken workers.
-            # Spec: _expand_workers must call sync_selected_workers explicitly so that
-            # workers receive weights before being activated for routing.
+            # Step 1: Sync weights from CPU bucket cache to the woken workers BEFORE
+            # routing is enabled.  Workers are Ray actors that accept remote calls even
+            # while shrunk; syncing here ensures weights land before rebalance_on_expand
+            # adds the ranks to active_dp_ranks (spec: nemorl-port-plan.md lines 589-609).
             if hasattr(self, "_model_update_service") and self._model_update_service is not None:
                 ray.get(
                     self._model_update_service.sync_selected_workers.remote(
@@ -503,9 +533,26 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                     )
                 )
 
+            # Step 1b: finalize_weight_update — pipeline-owned per spec line 624-632.
+            # Must run after all buckets land (sync_selected_workers returned) and before
+            # routing is activated so inference workers are fully ready.
+            finalize_refs = [
+                self.actor_infer.rank2worker[int(r)].finalize_weight_update.remote()
+                for r in dp_ranks_to_add
+            ]
+            ray.get(finalize_refs)
+
+            # Step 2: Wake overlap ranks and activate routing (skip_load=True — weights
+            # were already synced in step 1; ROLL only needs to update active_dp_ranks).
+            result = ray.get(self.train_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
+            ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
+
             # Step 3+4: Publish current weight version (no version bump on expand).
             if self._lifecycle is not None:
                 self._current_weight_version = self._lifecycle.cache_ready_step
+                _tc = self._get_trajectory_collector()
+                if _tc is not None:
+                    ray.get(_tc.set_weight_version.remote(self._current_weight_version))
             return cast(Dict[str, Any], result)
 
     def _ensure_initialized(self) -> None:
@@ -1063,11 +1110,25 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                         self.actor_train.offload_states(blocking=True)
 
                         # Feature 5/6: sync base weights to all currently-active infer dp ranks.
+                        # sync_selected_workers handles transport; finalize is pipeline-owned (spec line 624).
+                        # Coordinator returns the exact ranks that were synced (may be [] if all sleeping).
                         coordinator = self._get_coordinator_handle()
-                        ray.get(coordinator.sync_base_weights_to_active.remote())
+                        synced_ranks: List[int] = ray.get(coordinator.sync_base_weights_to_active.remote())
 
-                        # Publish version after sync completes so expand_sampler sees a consistent state.
+                        # finalize_weight_update: pipeline-owned, only for the synced ranks (spec line 488-490).
+                        if synced_ranks:
+                            finalize_refs = [
+                                self.actor_infer.rank2worker[int(r)].finalize_weight_update.remote()
+                                for r in synced_ranks
+                            ]
+                            ray.get(finalize_refs)
+
+                        # Publish version after sync+finalize completes.
                         self._current_weight_version = self._lifecycle.cache_ready_step
+                        _tc = self._get_trajectory_collector()
+                        if _tc is not None:
+                            ray.get(_tc.set_weight_version.remote(self._current_weight_version))
+                        # Spec: nemorl-port-plan.md lines 489-490, 536-538.
 
                         # Release actor_train GPUs immediately (not deferred to next step).
                         self._notify_release_cluster_gpus(

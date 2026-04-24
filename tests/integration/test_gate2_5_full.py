@@ -81,7 +81,9 @@ def _load_mod(name, file):
 
 _pd = REPO_ROOT / "rlix" / "pipeline"
 _bc = _load_mod("rlix.pipeline.bucket_cache", _pd / "bucket_cache.py")
-CPUBucketCache = _bc.CPUBucketCache
+_bucket_named_tensors = _bc._bucket_named_tensors
+VersionedBucketCache = _bc.VersionedBucketCache
+unpack_bucket_record = _bc.unpack_bucket_record
 
 
 # ---------------------------------------------------------------------------
@@ -146,14 +148,16 @@ def snapshot_hashes(model: Optional[nn.Module]) -> Dict[str, str]:
     return {name: tensor_hash(p.data) for name, p in model.named_parameters()}
 
 
-def build_cpu_cache(model: Optional[nn.Module]) -> Optional[CPUBucketCache]:
+def build_cpu_cache(model: Optional[nn.Module]) -> Optional[VersionedBucketCache]:
     if model is None:
         return None
-    cache = CPUBucketCache()
     with torch.no_grad():
-        for name, tensor in model.state_dict().items():
-            cache.store(name, shard_id=0, tensor=tensor.cpu().contiguous())
-    log(f"  cache built: {cache.size()} buckets")
+        named_tensors = [(name, t.cpu().contiguous()) for name, t in model.state_dict().items()]
+    record = _bucket_named_tensors(named_tensors)
+    cache = VersionedBucketCache()
+    cache.build_latest(-1, [record])
+    cache.promote(-1)
+    log(f"  cache built: 1 bucket, {len(named_tensors)} params")
     return cache
 
 
@@ -169,99 +173,79 @@ def measure_memory_release(model: Optional[nn.Module], rank: int) -> None:
     log(f"  VRAM: {before_mb:.0f}MB → {after_mb:.0f}MB  released {released_pct:.1f}%")
     if released_pct < VRAM_RELEASE_THRESHOLD_PCT:
         log(f"FAIL: rank{rank} VRAM release {released_pct:.1f}% < {VRAM_RELEASE_THRESHOLD_PCT}%")
-        dist.barrier()
         sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
-# Broadcast cache via gloo (pure CPU, no NCCL dtype restrictions)
+# NCCL broadcast — proper subset groups per pipeline phase
+# Spec: nemorl-port-plan.md lines 391, 1196-1201
+# Phase A: src=rank0, receivers=[2,3], group=[0,2,3] — proper subset of world [0,1,2,3]
+# Phase B: src=rank1, receivers=[2,3], group=[1,2,3] — proper subset of world [0,1,2,3]
+# gloo used only for control-plane (buf_size exchange + hash verification)
 # ---------------------------------------------------------------------------
 
-def broadcast_cache(
-    cache: Optional[CPUBucketCache],
+def nccl_broadcast_cache(
+    cache: Optional[VersionedBucketCache],
     src_rank: int,
     gloo_group: dist.ProcessGroup,
 ) -> Dict[str, Tuple[torch.Tensor, str]]:
-    """
-    Broadcast all buckets from src_rank to every rank in gloo_group.
-    Uses 3 CPU (gloo) broadcasts:
-      #1  float32 header  — n_buckets + elem-counts encoded as (hi>>20, lo&FFFFF)
-      #2  bfloat16 matrix — param names + per-bucket hashes
-      #3  bfloat16 flat   — all weight tensors concatenated
+    """Broadcast src_rank's cache to inference ranks via dynamic NCCL subset group.
 
-    Only ranks inside gloo_group call this function.
-    Returns {name: (tensor, expected_hash)} on non-src ranks.
+    Sequence (avoids gloo/NCCL ordering deadlock):
+      1. gloo: sender broadcasts buf_size to all ranks
+      2. ALL ranks: create NCCL group [src_rank, 2, 3]
+      3. NCCL: sender broadcasts packed uint8 buffer
+      4. gloo: sender broadcasts full-buffer hash for verification
     """
     received: Dict[str, Tuple[torch.Tensor, str]] = {}
+    rank = R()
+    repacked = None
+    all_params: list = []
 
-    if R() == src_rank:
-        assert cache is not None
-        buckets = list(cache.get_all_buckets().values())
-        n = len(buckets)
-        cpu_tensors = [b.tensor.to(dtype=torch.bfloat16).contiguous() for b in buckets]
-        names = [b.param_name for b in buckets]
-        n_elems = [t.numel() for t in cpu_tensors]
-        elem_hashes = [tensor_hash(t) for t in cpu_tensors]
-
-        # Broadcast #1: header (float32 CPU)
-        # n_elems encoded as (hi, lo) split at 2^20 so hi < 2^12, lo < 2^20 — both
-        # fit in float32 exact integer range (< 2^24)
-        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.float32)
-        header[0] = float(n)
-        for i, ne in enumerate(n_elems):
-            header[1 + 2 * i] = float(ne >> 20)
-            header[2 + 2 * i] = float(ne & 0xFFFFF)
-        dist.broadcast(header, src=src_rank, group=gloo_group)
-
-        # Broadcast #2: name+hash matrix (bfloat16 CPU)
-        # ASCII ordinals 0-127 are exact in bfloat16 (7-bit mantissa covers all)
-        meta_mat = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16)
-        for i, (name, h) in enumerate(zip(names, elem_hashes)):
-            nb = name.encode()
-            row_start = i * ROW
-            for j, b in enumerate(nb):
-                meta_mat[row_start + j] = float(b)
-            for j, c in enumerate(h):
-                meta_mat[row_start + 200 + j] = float(ord(c))
-        dist.broadcast(meta_mat, src=src_rank, group=gloo_group)
-
-        # Broadcast #3: flat weight data (bfloat16 CPU)
-        flat = torch.cat([t.view(-1) for t in cpu_tensors], dim=0)
-        dist.broadcast(flat, src=src_rank, group=gloo_group)
-
+    # Step 1: gloo size broadcast (all ranks, before NCCL group creation)
+    if rank == src_rank and cache is not None:
+        with cache._cache_lock:
+            active_buckets = cache.get_active_buckets()
+        for rec in active_buckets:
+            all_params.extend(unpack_bucket_record(rec))
+        repacked = _bucket_named_tensors(all_params)
+        meta_t = torch.tensor([repacked.cpu_uint8_bucket.numel()], dtype=torch.int64)
     else:
-        # Receive #1: header
-        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.float32)
-        dist.broadcast(header, src=src_rank, group=gloo_group)
-        n = int(header[0].item())
-        n_elems = []
-        for i in range(n):
-            hi = int(header[1 + 2 * i].item())
-            lo = int(header[2 + 2 * i].item())
-            n_elems.append((hi << 20) | lo)
+        meta_t = torch.zeros(1, dtype=torch.int64)
+    dist.broadcast(meta_t, src=src_rank, group=gloo_group)
+    buf_size = int(meta_t.item())
 
-        # Receive #2: name+hash matrix
-        meta_mat = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16)
-        dist.broadcast(meta_mat, src=src_rank, group=gloo_group)
-        names: list[str] = []
-        exp_hashes: list[str] = []
-        for i in range(n):
-            row = meta_mat[i * ROW: i * ROW + ROW]
-            name_len = next((j for j in range(200) if row[j] == 0), 200)
-            raw = row[:name_len].to(torch.int32).numpy().tolist()
-            names.append(bytes(raw).decode())
-            exp_hashes.append("".join(chr(int(row[200 + j].item())) for j in range(16)))
+    # Step 2: ALL ranks create NCCL group — [src, 2, 3] is proper subset of world [0,1,2,3]
+    nccl_group = dist.new_group(ranks=[src_rank] + INFER_RANKS, backend="nccl")
 
-        # Receive #3: flat weight data
-        total_elems = sum(n_elems)
-        flat = torch.zeros(total_elems, dtype=torch.bfloat16)
-        dist.broadcast(flat, src=src_rank, group=gloo_group)
+    # Step 3: NCCL broadcast
+    if rank == src_rank and repacked is not None:
+        gpu_buf = repacked.cpu_uint8_bucket.pin_memory().cuda()
+        dist.broadcast(gpu_buf, src=src_rank, group=nccl_group)
+    elif rank in INFER_RANKS:
+        gpu_buf = torch.zeros(buf_size, dtype=torch.uint8, device="cuda")
+        dist.broadcast(gpu_buf, src=src_rank, group=nccl_group)
+    # Non-member ranks (e.g. rank 1 during phase A, rank 0 during phase B): skip NCCL
 
-        offset = 0
-        for name, ne, eh in zip(names, n_elems, exp_hashes):
-            received[name] = (flat[offset: offset + ne].clone(), eh)
-            offset += ne
+    torch.cuda.synchronize()
+    if rank in [src_rank] + INFER_RANKS:
+        dist.barrier(group=nccl_group)
+        dist.destroy_process_group(nccl_group)
 
+    # Step 4: gloo hash exchange for full-buffer bit-exact verification
+    hash_t = torch.zeros(16, dtype=torch.uint8)
+    if rank == src_rank and repacked is not None:
+        h = tensor_hash(repacked.cpu_uint8_bucket)
+        for j, c in enumerate(h.encode()):
+            hash_t[j] = c
+    dist.broadcast(hash_t, src=src_rank, group=gloo_group)
+
+    if rank in INFER_RANKS:
+        cpu_buf = gpu_buf.cpu()
+        expected_hash = bytes(hash_t.tolist()).rstrip(b"\x00").decode()
+        received["_block"] = (cpu_buf, expected_hash)
+
+    dist.barrier(group=gloo_group)
     return received
 
 
@@ -274,20 +258,17 @@ def verify_weights(
     label: str,
     step: int,
 ) -> None:
-    """Hash-verify received weights against expected hashes embedded in protocol."""
+    """Hash-verify received NCCL buffer against sender's full-buffer hash."""
     if R() not in INFER_RANKS:
         return
-    mismatches = []
-    for name, (t, expected_hash) in received.items():
-        actual = tensor_hash(t)
-        if actual != expected_hash:
-            mismatches.append(f"{name}: {actual!r} != {expected_hash!r}")
-    if mismatches:
-        log(f"  FAIL step {step} pipeline {label}: {len(mismatches)} hash mismatches")
-        for m in mismatches[:5]:
-            log(f"    {m}")
+    if "_block" not in received:
+        return  # this rank didn't receive (bystander)
+    cpu_buf, expected_hash = received["_block"]
+    actual = tensor_hash(cpu_buf)
+    if actual != expected_hash:
+        log(f"  FAIL step {step} pipeline {label}: buffer hash {actual!r} != {expected_hash!r}")
         sys.exit(1)
-    log(f"  PASS step {step} pipeline {label}: {len(received)} weights bit-exact (rank {R()})")
+    log(f"  PASS step {step} pipeline {label}: {cpu_buf.numel()} bytes bit-exact via NCCL (rank {R()})")
 
 
 def verify_divergence(
@@ -298,17 +279,14 @@ def verify_divergence(
     """Assert that A and B have different weights — proves correct per-pipeline routing."""
     if R() not in INFER_RANKS:
         return
-    shared_names = set(received_a) & set(received_b)
-    same = sum(
-        1 for n in shared_names
-        if tensor_hash(received_a[n][0]) == tensor_hash(received_b[n][0])
-    )
-    if same == len(shared_names):
-        log(f"  FAIL step {step}: all {same} shared params have identical hashes — "
-            f"pipelines did not diverge (check seeds)")
+    if "_block" not in received_a or "_block" not in received_b:
+        return
+    hash_a = tensor_hash(received_a["_block"][0])
+    hash_b = tensor_hash(received_b["_block"][0])
+    if hash_a == hash_b:
+        log(f"  FAIL step {step}: A and B have identical buffer hashes — pipelines did not diverge")
         sys.exit(1)
-    log(f"  PASS step {step}: A≠B verified — {len(shared_names) - same}/{len(shared_names)} "
-        f"params differ (rank {R()})")
+    log(f"  PASS step {step}: A≠B verified — buffer hashes differ (rank {R()})")
 
 
 # ---------------------------------------------------------------------------
@@ -318,10 +296,9 @@ def verify_divergence(
 def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    # Use gloo as default backend: this test's only collectives are barriers and gloo
-    # broadcasts — no NCCL needed.  On PCIe-only hardware (no P2P/SHM), NCCL with
-    # device_id triggers an eager communicator init that takes >10 min to time out.
-    dist.init_process_group(backend="gloo")
+    # Use NCCL world — nccl_broadcast_cache creates proper NCCL subset groups.
+    # Lazy init (no device_id) so new_group(backend="nccl") works on PCIe hardware.
+    dist.init_process_group(backend="nccl")
 
     world_size = dist.get_world_size()
     log0(f"world_size={world_size}, GPU={torch.cuda.get_device_name(local_rank)}")
@@ -331,14 +308,13 @@ def main() -> None:
         dist.destroy_process_group()
         return
 
-    # The default group is already gloo — use it for all broadcasts and barriers.
-    # None == default group in all PyTorch distributed APIs.
-    gloo_world = None
-    log0("Process groups ready: default gloo group")
+    # gloo group for control-plane barriers and metadata exchange
+    gloo_world = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+    log0("Process groups ready: NCCL world + gloo control-plane")
 
     log0(f"Loading {MODEL_NAME} on training ranks...")
     model = load_model(local_rank)
-    dist.barrier()
+    dist.barrier(group=gloo_world)
     log0("Models loaded.")
 
     for step in range(1, N_STEPS + 1):
@@ -348,7 +324,7 @@ def main() -> None:
         # ----- Train both pipelines -----
         log0("  [train] both pipelines...")
         train_step(model, local_rank, step)
-        dist.barrier()
+        dist.barrier(group=gloo_world)
 
         # ----- Phase A isolation snapshots -----
         # Snapshot B's VRAM and weight hashes BEFORE A offloads.
@@ -372,7 +348,7 @@ def main() -> None:
         elif local_rank == PIPELINE_B_RANK:
             log(f"  [step {step}] Pipeline B: not the sender — would be free in production")
 
-        received_a = broadcast_cache(cache_a, src_rank=PIPELINE_A_RANK, gloo_group=gloo_world)
+        received_a = nccl_broadcast_cache(cache_a, src_rank=PIPELINE_A_RANK, gloo_group=gloo_world)
         verify_weights(received_a, label="A", step=step)
 
         # ----- Phase A isolation verification: B must be unaffected -----
@@ -382,7 +358,7 @@ def main() -> None:
             if delta > 10.0:
                 log(f"FAIL: Pipeline B VRAM changed during A's empty_cache: "
                     f"{b_vram_before_a:.1f} → {b_vram_after_a:.1f} MB (delta={delta:.1f})")
-                dist.barrier()
+                dist.barrier(group=gloo_world)
                 sys.exit(1)
             log(f"PASS: Pipeline B VRAM isolated during A offload "
                 f"({b_vram_before_a:.1f} → {b_vram_after_a:.1f} MB, delta={delta:.1f})")
@@ -391,7 +367,7 @@ def main() -> None:
             if corrupted:
                 log(f"FAIL: Pipeline B weights corrupted by A's empty_cache: "
                     f"{len(corrupted)}/{len(b_hashes_before_a)} params changed")
-                dist.barrier()
+                dist.barrier(group=gloo_world)
                 sys.exit(1)
             log(f"PASS: Pipeline B weights intact after A offload "
                 f"({len(b_hashes_before_a)} params verified unchanged)")
@@ -400,7 +376,7 @@ def main() -> None:
             model = model.to(f"cuda:{local_rank}")
             log("  Pipeline A: model reloaded to GPU")
 
-        dist.barrier()
+        dist.barrier(group=gloo_world)
 
         # ----- Phase A round-trip verification: A's weights survived CPU offload -----
         if local_rank == PIPELINE_A_RANK and model is not None and a_hashes_pre_offload:
@@ -409,12 +385,12 @@ def main() -> None:
             if drift:
                 log(f"FAIL: Pipeline A weights changed after CPU round-trip: "
                     f"{len(drift)}/{len(a_hashes_pre_offload)} params differ")
-                dist.barrier()
+                dist.barrier(group=gloo_world)
                 sys.exit(1)
             log(f"PASS: Pipeline A weights bit-exact after CPU round-trip "
                 f"({len(a_hashes_pre_offload)} params)")
 
-        dist.barrier()
+        dist.barrier(group=gloo_world)
 
         # ----- Phase B isolation snapshots -----
         # Snapshot A's VRAM and weight hashes (model just reloaded) BEFORE B offloads.
@@ -437,7 +413,7 @@ def main() -> None:
         elif local_rank == PIPELINE_A_RANK:
             log(f"  [step {step}] Pipeline A: not the sender — would be free in production")
 
-        received_b = broadcast_cache(cache_b, src_rank=PIPELINE_B_RANK, gloo_group=gloo_world)
+        received_b = nccl_broadcast_cache(cache_b, src_rank=PIPELINE_B_RANK, gloo_group=gloo_world)
         verify_weights(received_b, label="B", step=step)
 
         # ----- Phase B isolation verification: A must be unaffected -----
@@ -447,7 +423,7 @@ def main() -> None:
             if delta > 10.0:
                 log(f"FAIL: Pipeline A VRAM changed during B's empty_cache: "
                     f"{a_vram_before_b:.1f} → {a_vram_after_b:.1f} MB (delta={delta:.1f})")
-                dist.barrier()
+                dist.barrier(group=gloo_world)
                 sys.exit(1)
             log(f"PASS: Pipeline A VRAM isolated during B offload "
                 f"({a_vram_before_b:.1f} → {a_vram_after_b:.1f} MB, delta={delta:.1f})")
@@ -456,7 +432,7 @@ def main() -> None:
             if corrupted:
                 log(f"FAIL: Pipeline A weights corrupted by B's empty_cache: "
                     f"{len(corrupted)}/{len(a_hashes_before_b)} params changed")
-                dist.barrier()
+                dist.barrier(group=gloo_world)
                 sys.exit(1)
             log(f"PASS: Pipeline A weights intact after B offload "
                 f"({len(a_hashes_before_b)} params verified unchanged)")
@@ -465,7 +441,7 @@ def main() -> None:
             model = model.to(f"cuda:{local_rank}")
             log("  Pipeline B: model reloaded to GPU")
 
-        dist.barrier()
+        dist.barrier(group=gloo_world)
 
         # ----- Phase B round-trip verification: B's weights survived CPU offload -----
         if local_rank == PIPELINE_B_RANK and model is not None and b_hashes_pre_offload:
@@ -474,17 +450,17 @@ def main() -> None:
             if drift:
                 log(f"FAIL: Pipeline B weights changed after CPU round-trip: "
                     f"{len(drift)}/{len(b_hashes_pre_offload)} params differ")
-                dist.barrier()
+                dist.barrier(group=gloo_world)
                 sys.exit(1)
             log(f"PASS: Pipeline B weights bit-exact after CPU round-trip "
                 f"({len(b_hashes_pre_offload)} params)")
 
-        dist.barrier()
+        dist.barrier(group=gloo_world)
 
         # ----- Cross-check: A weights ≠ B weights -----
         log0("  [cross-check] verifying A ≠ B (no routing contamination)...")
         verify_divergence(received_a, received_b, step=step)
-        dist.barrier()
+        dist.barrier(group=gloo_world)
 
         log0(f"STEP {step} COMPLETE")
 

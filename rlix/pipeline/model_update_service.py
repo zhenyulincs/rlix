@@ -78,30 +78,6 @@ class ModelUpdateService:
         self.model_update_transport: str = model_update_transport
         self.bucket_size_bytes: Optional[int] = bucket_size_bytes
 
-        # Startup host-RAM budget guard (spec: nemorl-port-plan.md line 337-338).
-        # Estimate total cache bytes as world_size * mean_param_bytes; fail fast if
-        # it exceeds 80% of available host RAM to leave headroom for OS and other
-        # processes. Only runs when psutil is available.
-        if bucket_size_bytes is not None:
-            try:
-                import psutil
-                available_ram = psutil.virtual_memory().available
-                # Two-pointer cache keeps at most 2 full model copies in host RAM.
-                ram_budget = int(available_ram * 0.8)
-                two_copy_budget = 2 * bucket_size_bytes
-                if two_copy_budget > ram_budget:
-                    raise RuntimeError(
-                        f"[ModelUpdateService] Host RAM budget exceeded: "
-                        f"2 × bucket_size_bytes ({two_copy_budget >> 20} MB) > "
-                        f"80% of available RAM ({ram_budget >> 20} MB). "
-                        f"Reduce bucket_size_bytes or increase host RAM."
-                    )
-            except ImportError:
-                logger.warning(
-                    "[ModelUpdateService] psutil not installed — skipping host-RAM budget guard. "
-                    "Install psutil to enable the fail-fast check."
-                )
-
         # Nonce scopes NCCL group names to this service instance, avoiding collisions
         # when multiple services coexist (e.g. after a coordinator restart).
         self._sync_nonce = uuid.uuid4().hex[:8]
@@ -420,34 +396,45 @@ class ModelUpdateService:
                 "This is a fail-fast guard to avoid indefinite hangs in sync_selected_workers."
             ) from exc
         finally:
-            # Release only after the full barrier — on failure, remote workers
-            # may still hold the port; leaking the claim is safer than a collision.
-            if sync_completed:
-                self._release_master_port_claim(master_addr=master_addr, master_port=master_port)
-        # NCCL groups are destroyed inside selective_sync_active_cache (owner side) before returning.
-        # ray.get(sync_refs) above confirms teardown is complete.
+            # On failure: intentionally leak the port claim — remote workers may still hold
+            # the port and releasing it would risk collision on a future sync.
+            # On success: release is deferred to AFTER receiver teardown (Phase 4 below),
+            # so the claim covers the full sync+teardown cycle per spec (lines 380-389).
+            pass
 
-        # --- Phase 3: Worker-side finalization ---
-        # Feature 6 (spec: nemorl-port-plan.md:488-490, 504-509, 624-632):
-        # After all buckets land, each target worker must run finalize_weight_update()
-        # to complete post-loading processing (FP8 KV cache etc.).
-        finalize_refs = [
-            self.tgt_cluster.rank2worker[int(dp_rank)].finalize_weight_update.remote()
-            for dp_rank in tgt_dp_ranks
-        ]
-        self._ray_get_with_timeout(
-            finalize_refs,
-            timeout_s=self._timeout_s,
-            desc=(
-                "[ModelUpdateService] finalize_weight_update "
-                f"pipeline_id={self.pipeline_id} sync_id={sync_id} tgt_dp_ranks={tgt_dp_ranks}"
-            ),
-        )
-        logger.info(
-            f"[ModelUpdateService] finalize_weight_update_ok pipeline_id={self.pipeline_id} sync_id={sync_id}"
-        )
+        # --- Phase 4: Receiver-side NCCL group teardown ---
+        # The sender destroys its group inside selective_sync_active_cache before returning.
+        # Receivers must also destroy their side — the group_name is shared.
+        # Port claim is released AFTER teardown so it covers the full cycle.
+        # Spec: nemorl-port-plan.md lines 380-389.
+        if tgt_ranks_in_group:
+            teardown_refs = [
+                self.tgt_cluster.rank2worker[int(tgt_rank)].destroy_collective_group.remote(group_name)
+                for tgt_rank in tgt_ranks_in_group
+            ]
+            self._ray_get_with_timeout(
+                teardown_refs,
+                timeout_s=self._timeout_s,
+                desc=(
+                    "[ModelUpdateService] destroy_collective_group (receivers) "
+                    f"pipeline_id={self.pipeline_id} sync_id={sync_id} tgt_dp_ranks={tgt_dp_ranks}"
+                ),
+            )
+            logger.info(
+                "[ModelUpdateService] receiver_nccl_teardown_ok "
+                f"pipeline_id={self.pipeline_id} sync_id={sync_id}"
+            )
+
+        # Release port claim after full teardown cycle (spec: nemorl-port-plan.md lines 380-389).
+        if sync_completed:
+            self._release_master_port_claim(master_addr=master_addr, master_port=master_port)
 
         # --- Phase 5: Post-sync verification ---
+        # Spec (nemorl-port-plan.md line 624-632): finalize_weight_update() is owned
+        # by the PIPELINE, not ModelUpdateService — the pipeline calls it after
+        # sync_selected_workers() returns, because the pipeline controls the full
+        # expand sequence (sync → finalize → version_publish → activate_routing).
+        # ModelUpdateService does NOT call finalize here.
         # The cache owner returns weight_stats (checksums / norms) alongside the sync result.
         # We forward these to each target worker's verify_model to confirm weights landed correctly.
         if verify:

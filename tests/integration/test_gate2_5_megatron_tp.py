@@ -72,7 +72,10 @@ def _load_mod(name, file):
 
 _pd = REPO_ROOT / "rlix" / "pipeline"
 _bc = _load_mod("rlix.pipeline.bucket_cache", _pd / "bucket_cache.py")
-CPUBucketCache = _bc.CPUBucketCache
+BucketRecord = _bc.BucketRecord
+_bucket_named_tensors = _bc._bucket_named_tensors
+VersionedBucketCache = _bc.VersionedBucketCache
+unpack_bucket_record = _bc.unpack_bucket_record
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -166,16 +169,20 @@ def train_step(model: Optional[nn.Module], rank: int, step: int) -> None:
 # CPU cache helpers
 # ---------------------------------------------------------------------------
 
-def build_cpu_cache(model: Optional[nn.Module]) -> Optional[CPUBucketCache]:
+def build_cpu_cache(model: Optional[nn.Module]) -> Optional[VersionedBucketCache]:
     if model is None:
         return None
-    cache = CPUBucketCache()
     with torch.no_grad():
-        for name, tensor in model.state_dict().items():
-            if tensor is None:   # Megatron TP layers store None for disabled biases
-                continue
-            cache.store(name, shard_id=R(), tensor=tensor.cpu().contiguous())
-    log(f"  cache built: {cache.size()} buckets")
+        named_tensors = [
+            (name, tensor.cpu().contiguous())
+            for name, tensor in model.state_dict().items()
+            if tensor is not None  # Megatron TP layers store None for disabled biases
+        ]
+    record = _bucket_named_tensors(named_tensors)
+    cache = VersionedBucketCache()
+    cache.build_latest(-1, [record])
+    cache.promote(-1)
+    log(f"  cache built: 1 bucket, {len(named_tensors)} params")
     return cache
 
 
@@ -195,82 +202,107 @@ def measure_memory_release(model: Optional[nn.Module], rank: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Gloo broadcast (all via CPU, no NCCL dtype restrictions)
+# NCCL broadcast — proper subset group (spec: nemorl-port-plan.md lines 391, 1196-1201)
+# Gate 2.5 requires NCCL broadcast transport for cross-GPU TP ranks.
+# Shard 0: sender=rank0, receiver=rank2 → group [0,2]
+# Shard 1: sender=rank1, receiver=rank3 → group [1,3]
+# Each is a proper subset of world [0,1,2,3] to avoid the world=group hang.
 # ---------------------------------------------------------------------------
 
-MAX_PARAMS = 50
-ROW = 216
-
-def broadcast_shard(
-    cache: Optional[CPUBucketCache],
+def nccl_broadcast_shard(
+    cache: Optional[VersionedBucketCache],
     src_rank: int,
+    recv_rank: int,
+    model: Optional[nn.Module],
     gloo_group: dist.ProcessGroup,
 ) -> Dict[str, Tuple[torch.Tensor, str]]:
-    """Broadcast src_rank's weight shard to all ranks in gloo_group.
-    Returns {name: (tensor, expected_hash)} on non-src ranks.
-    All tensors stay on CPU (gloo transport).
+    """Broadcast src_rank's TP shard to recv_rank via dynamic NCCL group.
+
+    All 4 world ranks call this (PyTorch requires all ranks to call new_group).
+    Only src_rank and recv_rank participate in NCCL collectives.
     """
     received: Dict[str, Tuple[torch.Tensor, str]] = {}
+    rank = R()
 
-    if R() == src_rank:
-        buckets = list(cache.get_all_buckets().values())
-        n = len(buckets)
-        cpu_tensors = [b.tensor.to(dtype=torch.float32).contiguous() for b in buckets]
-        names = [b.param_name for b in buckets]
-        n_elems = [t.numel() for t in cpu_tensors]
-        elem_hashes = [tensor_hash(t) for t in cpu_tensors]
+    # ALL ranks must call new_group; only [src, recv] participate in NCCL collectives.
+    # [src, recv] is a proper subset of world [0,1,2,3] → avoids PCIe deadlock.
+    nccl_group = dist.new_group(ranks=[src_rank, recv_rank], backend="nccl")
 
-        # Header: float32 (n, hi_0, lo_0, ...) split at 2^20 for exact encoding
-        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.float32)
-        header[0] = float(n)
-        for i, ne in enumerate(n_elems):
-            header[1 + 2 * i] = float(ne >> 20)
-            header[2 + 2 * i] = float(ne & 0xFFFFF)
-        dist.broadcast(header, src=src_rank, group=gloo_group)
+    if rank == src_rank:
+        with cache._cache_lock:
+            active_buckets = cache.get_active_buckets()
+        all_params = []
+        for record in active_buckets:
+            all_params.extend(unpack_bucket_record(record))
 
-        # Metadata matrix: bfloat16 (ASCII chars < 128, exact)
-        meta = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16)
-        for i, (name, h) in enumerate(zip(names, elem_hashes)):
-            rs = i * ROW
-            for j, b in enumerate(name.encode()):
-                meta[rs + j] = float(b)
-            for j, c in enumerate(h):
-                meta[rs + 200 + j] = float(ord(c))
-        dist.broadcast(meta, src=src_rank, group=gloo_group)
+        # Re-pack into a single uint8 BucketRecord for NCCL broadcast
+        repacked = _bucket_named_tensors(all_params)
+        gpu_buf = repacked.cpu_uint8_bucket.pin_memory().cuda()
+        dist.broadcast(gpu_buf, src=src_rank, group=nccl_group)
 
-        # Flat weight data: float32
-        flat = torch.cat([t.view(-1) for t in cpu_tensors])
-        dist.broadcast(flat, src=src_rank, group=gloo_group)
+        torch.cuda.synchronize()
+        dist.barrier(group=nccl_group)
+        dist.destroy_process_group(nccl_group)
+
+        # Broadcast sender hashes via gloo for receiver verification
+        sender_hashes = {name: tensor_hash(t.float()) for name, t in all_params}
+        hash_flat = torch.zeros(len(all_params), 16, dtype=torch.uint8)
+        names_list = list(sender_hashes.keys())
+        for i, name in enumerate(names_list):
+            for j, c in enumerate(sender_hashes[name].encode()):
+                hash_flat[i, j] = c
+        dist.broadcast(hash_flat, src=src_rank, group=gloo_group)
+
+        for name, t in all_params:
+            received[name] = (t.float(), sender_hashes[name])
+
+    elif rank == recv_rank:
+        # Derive buffer size from local model (same architecture, same param shapes).
+        # Filter None — Megatron TP layers store None for disabled biases.
+        assert model is not None
+        local_named = [
+            (k, v.detach().cpu().contiguous())
+            for k, v in model.state_dict().items()
+            if v is not None
+        ]
+        dummy = _bucket_named_tensors(local_named)
+        buf_size = dummy.cpu_uint8_bucket.numel()
+
+        gpu_buf = torch.zeros(buf_size, dtype=torch.uint8, device="cuda")
+        dist.broadcast(gpu_buf, src=src_rank, group=nccl_group)
+
+        torch.cuda.synchronize()
+        dist.barrier(group=nccl_group)
+        dist.destroy_process_group(nccl_group)
+
+        # Receive sender hashes via gloo for verification
+        hash_flat = torch.zeros(len(dummy.param_names), 16, dtype=torch.uint8)
+        dist.broadcast(hash_flat, src=src_rank, group=gloo_group)
+        sender_hashes = {}
+        for i, name in enumerate(dummy.param_names):
+            sender_hashes[name] = bytes(hash_flat[i].tolist()).rstrip(b"\x00").decode()
+
+        # Reconstruct BucketRecord from received buffer using local metadata
+        recv_record = BucketRecord(
+            param_names=dummy.param_names,
+            shapes=dummy.shapes,
+            dtypes=dummy.dtypes,
+            offsets=dummy.offsets,
+            used_bytes=dummy.used_bytes,
+            cpu_uint8_bucket=gpu_buf.cpu(),
+        )
+        unpacked = unpack_bucket_record(recv_record)
+        for name, t in unpacked:
+            received[name] = (t.float(), sender_hashes.get(name, ""))
 
     else:
-        # Receive header
-        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.float32)
-        dist.broadcast(header, src=src_rank, group=gloo_group)
-        n = int(header[0].item())
-        n_elems = [(int(header[1 + 2 * i].item()) << 20) | int(header[2 + 2 * i].item())
-                   for i in range(n)]
+        # Bystander: participate in gloo barrier but skip NCCL collectives.
+        # Must receive the hash broadcast so gloo collective completes on all ranks.
+        # Model has 2 params (fc1.weight, fc2.weight) — fixed for this test.
+        hash_flat = torch.zeros(2, 16, dtype=torch.uint8)
+        dist.broadcast(hash_flat, src=src_rank, group=gloo_group)
 
-        # Receive metadata
-        meta = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16)
-        dist.broadcast(meta, src=src_rank, group=gloo_group)
-        names, exp_hashes = [], []
-        for i in range(n):
-            row = meta[i * ROW: i * ROW + ROW]
-            name_len = next((j for j in range(200) if row[j] == 0), 200)
-            raw = row[:name_len].to(torch.int32).numpy().tolist()
-            names.append(bytes(raw).decode())
-            exp_hashes.append("".join(chr(int(row[200 + j].item())) for j in range(16)))
-
-        # Receive flat data
-        total = sum(n_elems)
-        flat = torch.zeros(total, dtype=torch.float32)
-        dist.broadcast(flat, src=src_rank, group=gloo_group)
-
-        offset = 0
-        for name, ne, eh in zip(names, n_elems, exp_hashes):
-            received[name] = (flat[offset: offset + ne].clone(), eh)
-            offset += ne
-
+    dist.barrier(group=gloo_group)
     return received
 
 
@@ -396,7 +428,7 @@ def main() -> None:
         dist.barrier(group=gloo_world)
 
         # ----- Capture pre-sync state for divergence check on inference ranks -----
-        pre_sync_cache: Optional[CPUBucketCache] = None
+        pre_sync_cache: Optional[VersionedBucketCache] = None
         if local_rank in INFER_RANKS:
             pre_sync_cache = build_cpu_cache(model)
 
@@ -412,7 +444,7 @@ def main() -> None:
             }
 
         # ----- Training ranks: offload + destroy_model_parallel -----
-        cache: Optional[CPUBucketCache] = None
+        cache: Optional[VersionedBucketCache] = None
         if local_rank in TRAIN_RANKS:
             log(f"  [2] build CPU cache (rank {local_rank})...")
             cache = build_cpu_cache(model)
@@ -450,16 +482,20 @@ def main() -> None:
             log(f"PASS: inference weights intact during training offload "
                 f"({len(infer_hashes_before_offload)} params verified unchanged)")
 
-        # ----- Sync: each training rank broadcasts its shard to ALL ranks -----
-        # Phase rank0: rank 0's shard (fc1 col 0..ffn/2-1, fc2 row 0..ffn/2-1) → all
-        log0("  [5a] sync training rank 0 shard → all ranks...")
+        # ----- Sync via NCCL proper-subset groups (spec: nemorl-port-plan.md lines 391) -----
+        # Phase A: rank 0's shard → rank 2, NCCL group [0,2]
+        log0("  [5a] sync training rank 0 shard → rank 2 via NCCL [0,2]...")
         cache0 = cache if local_rank == 0 else None
-        received_from_0 = broadcast_shard(cache0, src_rank=0, gloo_group=gloo_world)
+        received_from_0 = nccl_broadcast_shard(
+            cache0, src_rank=0, recv_rank=2, model=model, gloo_group=gloo_world
+        )
 
-        # Phase rank1: rank 1's shard → all
-        log0("  [5b] sync training rank 1 shard → all ranks...")
+        # Phase B: rank 1's shard → rank 3, NCCL group [1,3]
+        log0("  [5b] sync training rank 1 shard → rank 3 via NCCL [1,3]...")
         cache1 = cache if local_rank == 1 else None
-        received_from_1 = broadcast_shard(cache1, src_rank=1, gloo_group=gloo_world)
+        received_from_1 = nccl_broadcast_shard(
+            cache1, src_rank=1, recv_rank=3, model=model, gloo_group=gloo_world
+        )
 
         dist.barrier(group=gloo_world)
 
@@ -475,7 +511,12 @@ def main() -> None:
         # ----- Check inference had different weights BEFORE sync (divergence) -----
         log0("  [7] verify inference weights diverged from training before sync...")
         if local_rank == 2 and pre_sync_cache is not None:
-            pre = {b.param_name: b.tensor.float() for b in list(pre_sync_cache.get_all_buckets().values())}
+            with pre_sync_cache._cache_lock:
+                _pre_records = pre_sync_cache.get_active_buckets()
+            _pre_pairs: list = []
+            for _r in _pre_records:
+                _pre_pairs.extend(unpack_bucket_record(_r))
+            pre = {name: t.float() for name, t in _pre_pairs}
             different = sum(
                 1 for name, (t, _) in received_from_0.items()
                 if name in pre and tensor_hash(t) != tensor_hash(pre[name])
@@ -486,7 +527,12 @@ def main() -> None:
                 log(f"  PASS step {step}: {different}/{len(received_from_0)} params diverged "
                     f"from rank0 before sync (rank 2)")
         if local_rank == 3 and pre_sync_cache is not None:
-            pre = {b.param_name: b.tensor.float() for b in list(pre_sync_cache.get_all_buckets().values())}
+            with pre_sync_cache._cache_lock:
+                _pre_records = pre_sync_cache.get_active_buckets()
+            _pre_pairs = []
+            for _r in _pre_records:
+                _pre_pairs.extend(unpack_bucket_record(_r))
+            pre = {name: t.float() for name, t in _pre_pairs}
             different = sum(
                 1 for name, (t, _) in received_from_1.items()
                 if name in pre and tensor_hash(t) != tensor_hash(pre[name])

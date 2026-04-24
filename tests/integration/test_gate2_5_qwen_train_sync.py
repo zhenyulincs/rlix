@@ -66,7 +66,9 @@ def _load_mod(name, file):
 
 _pd = REPO_ROOT / "rlix" / "pipeline"
 _bc = _load_mod("rlix.pipeline.bucket_cache", _pd / "bucket_cache.py")
-CPUBucketCache = _bc.CPUBucketCache
+_bucket_named_tensors = _bc._bucket_named_tensors
+VersionedBucketCache = _bc.VersionedBucketCache
+unpack_bucket_record = _bc.unpack_bucket_record
 
 
 # ---------------------------------------------------------------------------
@@ -161,15 +163,17 @@ def snapshot_hashes(model: nn.Module) -> Dict[str, str]:
 # Build CPU bucket cache (rank 0 = cache owner)
 # ---------------------------------------------------------------------------
 
-def build_cpu_cache(model: nn.Module) -> Optional[CPUBucketCache]:
+def build_cpu_cache(model: nn.Module) -> Optional[VersionedBucketCache]:
     """Gather weights to CPU cache on rank 0. Other ranks return None."""
     if R() != SENDER_RANK or model is None:
         return None
-    cache = CPUBucketCache()
     with torch.no_grad():
-        for name, tensor in model.state_dict().items():
-            cache.store(name, shard_id=0, tensor=tensor.cpu().contiguous())
-    log0(f"  cache built: {cache.size()} buckets")
+        named_tensors = [(name, tensor.cpu().contiguous()) for name, tensor in model.state_dict().items()]
+    record = _bucket_named_tensors(named_tensors)
+    cache = VersionedBucketCache()
+    cache.build_latest(-1, [record])
+    cache.promote(-1)
+    log0(f"  cache built: 1 bucket, {len(named_tensors)} params")
     return cache
 
 
@@ -202,86 +206,76 @@ def measure_memory_release(model: nn.Module, rank: int) -> None:
 # ---------------------------------------------------------------------------
 
 def selective_sync(
-    cache: Optional[CPUBucketCache],
+    cache: Optional[VersionedBucketCache],
     step: int,
     gloo_group: dist.ProcessGroup,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Broadcast all buckets from rank 0 to all ranks via gloo (CPU).
+    """Broadcast weights from rank 0 → inference ranks [2,3] via dynamic NCCL group.
 
-    All 3 broadcasts use gloo to avoid NCCL on SYS-topology PCIe hardware
-    where P2P and SHM are unavailable — NCCL hangs on first collective init.
+    Spec (nemorl-port-plan.md lines 391, 1196-1201):
+    Gate 2.5 requires NCCL broadcast transport for cross-GPU TP ranks.
+    NCCL group [0,2,3] is a proper subset of world [0,1,2,3].
 
-    Inference ranks (2, 3) collect received weights; rank 1 discards.
+    Sequence (avoids gloo/NCCL ordering deadlock):
+      1. gloo: sender broadcasts (buf_size, n_params) to ALL ranks
+      2. ALL ranks: create NCCL group [0,2,3]
+      3. NCCL: sender broadcasts packed uint8 buffer to [2,3]
+      4. ALL: barrier + NCCL group destroy
+      5. gloo: sender broadcasts param hashes for bit-exact verification
     """
     received: Dict[str, torch.Tensor] = {}
+    rank = R()
 
-    MAX_PARAMS = 400  # upper bound on parameter count
-    ROW = 216          # 200 name bytes + 16 hash chars per param
-
-    if R() == SENDER_RANK and cache is not None:
-        buckets = list(cache.get_all_buckets().values())
-        n = len(buckets)
-
-        cpu_tensors = [b.tensor.to(dtype=torch.bfloat16).contiguous() for b in buckets]
-        names = [b.param_name for b in buckets]
-        n_elems = [t.numel() for t in cpu_tensors]
-        elem_hashes = [tensor_hash(t) for t in cpu_tensors]
-
-        # Broadcast #1: fixed-size header — float32 CPU (gloo)
-        # n_elems encoded as (hi, lo) split at 2^20 so each part < 2^24 (exact in float32)
-        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.float32)
-        header[0] = float(n)
-        for i, ne in enumerate(n_elems):
-            header[1 + 2 * i] = float(ne >> 20)
-            header[2 + 2 * i] = float(ne & 0xFFFFF)
-        dist.broadcast(header, src=SENDER_RANK, group=gloo_group)
-
-        # Broadcast #2: name/hash matrix — bfloat16 CPU (gloo)
-        meta_mat = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16)
-        for i, (name, h) in enumerate(zip(names, elem_hashes)):
-            nb = name.encode()
-            row_start = i * ROW
-            for j, b in enumerate(nb):
-                meta_mat[row_start + j] = float(b)
-            for j, c in enumerate(h):
-                meta_mat[row_start + 200 + j] = float(ord(c))
-        dist.broadcast(meta_mat, src=SENDER_RANK, group=gloo_group)
-
-        # Broadcast #3: flat weight data — bfloat16 CPU (gloo)
-        flat_cpu = torch.cat([t.view(-1) for t in cpu_tensors], dim=0)
-        dist.broadcast(flat_cpu, src=SENDER_RANK, group=gloo_group)
-
+    # Step 1: gloo size exchange so ALL ranks know buf_size before NCCL alloc
+    repacked = None
+    all_params: list = []
+    if rank == SENDER_RANK and cache is not None:
+        with cache._cache_lock:
+            active_buckets = cache.get_active_buckets()
+        for record in active_buckets:
+            all_params.extend(unpack_bucket_record(record))
+        repacked = _bucket_named_tensors(all_params)
+        meta_t = torch.tensor(
+            [repacked.cpu_uint8_bucket.numel(), len(all_params)], dtype=torch.int64
+        )
     else:
-        # Receive #1: header
-        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.float32)
-        dist.broadcast(header, src=SENDER_RANK, group=gloo_group)
-        n = int(header[0].item())
-        n_elems = [(int(header[1 + 2 * i].item()) << 20) | int(header[2 + 2 * i].item())
-                   for i in range(n)]
+        meta_t = torch.zeros(2, dtype=torch.int64)
+    dist.broadcast(meta_t, src=SENDER_RANK, group=gloo_group)
+    buf_size, n_params = int(meta_t[0].item()), int(meta_t[1].item())
 
-        # Receive #2: name/hash matrix
-        meta_mat = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16)
-        dist.broadcast(meta_mat, src=SENDER_RANK, group=gloo_group)
-        names: list[str] = []
-        exp_hashes: list[str] = []
-        for i in range(n):
-            row = meta_mat[i * ROW: i * ROW + ROW]
-            name_len = next((j for j in range(200) if row[j] == 0), 200)
-            raw = row[:name_len].to(torch.int32).numpy().tolist()
-            names.append(bytes(raw).decode())
-            exp_hashes.append("".join(chr(int(row[200 + j].item())) for j in range(16)))
+    # Step 2: ALL ranks create NCCL group (proper subset [0,2,3])
+    nccl_group = dist.new_group(ranks=[SENDER_RANK] + INFER_RANKS, backend="nccl")
 
-        # Receive #3: flat weight data
-        total_elems = sum(n_elems)
-        flat_cpu = torch.zeros(total_elems, dtype=torch.bfloat16)
-        dist.broadcast(flat_cpu, src=SENDER_RANK, group=gloo_group)
+    # Step 3: NCCL broadcast — sender stages CPU→GPU, receivers allocate
+    if rank == SENDER_RANK and repacked is not None:
+        gpu_buf = repacked.cpu_uint8_bucket.pin_memory().cuda()
+        dist.broadcast(gpu_buf, src=SENDER_RANK, group=nccl_group)
+    elif rank in INFER_RANKS:
+        gpu_buf = torch.zeros(buf_size, dtype=torch.uint8, device="cuda")
+        dist.broadcast(gpu_buf, src=SENDER_RANK, group=nccl_group)
+    # rank 1: not in nccl_group, skips NCCL collectives
 
-        if R() in INFER_RANKS:
-            offset = 0
-            for name, ne, eh in zip(names, n_elems, exp_hashes):
-                received[name] = (flat_cpu[offset: offset + ne].clone(), eh)
-                offset += ne
+    # Step 4: sync + barrier + destroy
+    torch.cuda.synchronize()
+    if rank in [SENDER_RANK] + INFER_RANKS:
+        dist.barrier(group=nccl_group)
+        dist.destroy_process_group(nccl_group)
+
+    # Step 5: gloo hash exchange — sender broadcasts full-buffer hash for bit-exact check.
+    # Per-param metadata not needed: full uint8 buffer hash is sufficient for NCCL
+    # transport verification (any bit flip would change the hash).
+    hash_t = torch.zeros(16, dtype=torch.uint8)
+    if rank == SENDER_RANK and repacked is not None:
+        full_hash = tensor_hash(repacked.cpu_uint8_bucket)
+        for j, c in enumerate(full_hash.encode()):
+            hash_t[j] = c
+    dist.broadcast(hash_t, src=SENDER_RANK, group=gloo_group)
+
+    if rank in INFER_RANKS:
+        cpu_buf = gpu_buf.cpu()
+        expected_hash = bytes(hash_t.tolist()).rstrip(b"\x00").decode()
+        received["_block"] = (cpu_buf, expected_hash)
+        log(f"  selective_sync step {step}: received {buf_size} bytes NCCL")
 
     dist.barrier(group=gloo_group)
     return received
@@ -297,27 +291,24 @@ def verify_transmission(
     step: int,
 ) -> None:
     """
-    Inference ranks verify each received tensor matches the expected hash
-    embedded in the protocol metadata during selective_sync.
+    Inference ranks verify received NCCL buffer is bit-exact vs sender.
+
+    With the NCCL transport, received is {_block: (cpu_uint8_buf, expected_hash)}.
+    The hash is of the full packed uint8 buffer — any bit flip would cause a mismatch.
     """
     if R() not in INFER_RANKS:
         return
 
-    mismatches: list[str] = []
-    for name, (received_t, expected_hash) in received.items():
-        actual_hash = tensor_hash(received_t)
-        if actual_hash != expected_hash:
-            mismatches.append(
-                f"{name}: hash {actual_hash!r} != expected {expected_hash!r}"
-            )
+    if "_block" not in received:
+        log(f"  WARN step {step}: no received data (inference ranks have no cache)")
+        return
 
-    if mismatches:
-        log(f"  FAIL step {step}: {len(mismatches)} hash mismatches:")
-        for m in mismatches[:5]:
-            log(f"    {m}")
+    cpu_buf, expected_hash = received["_block"]
+    actual_hash = tensor_hash(cpu_buf)
+    if actual_hash != expected_hash:
+        log(f"  FAIL step {step}: buffer hash {actual_hash!r} != expected {expected_hash!r}")
         sys.exit(1)
-    else:
-        log(f"  PASS step {step}: all {len(received)} weights verified bit-exact (rank {R()})")
+    log(f"  PASS step {step}: {cpu_buf.numel()} bytes verified bit-exact via NCCL (rank {R()})")
 
 
 # ---------------------------------------------------------------------------
@@ -327,12 +318,12 @@ def verify_transmission(
 def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    # Use gloo as default backend — this test's only collectives are barriers and
-    # gloo broadcasts.  NCCL with device_id triggers eager multi-communicator init
-    # that hangs on PCIe-only hardware (no P2P/SHM, socket fallback takes >10 min).
-    dist.init_process_group(backend="gloo")
-    # Alias for existing call sites — same as default group since backend is gloo.
-    gloo_group = None
+    # Use NCCL world backend — selective_sync now uses dynamic NCCL subset groups.
+    # Lazy NCCL init (no device_id) allows dist.new_group(backend="nccl") to create
+    # proper subset groups without deadlock on PCIe socket transport.
+    dist.init_process_group(backend="nccl")
+    # Separate gloo group for barriers (avoids using NCCL world for control-plane ops)
+    gloo_group = dist.new_group(ranks=list(range(dist.get_world_size())), backend="gloo")
 
     world_size = dist.get_world_size()
     log0(f"world_size={world_size}, GPU={torch.cuda.get_device_name(local_rank)}")
@@ -355,7 +346,7 @@ def main() -> None:
         # 1. Train
         log0("  [1] train_step...")
         fake_train_step(model, local_rank)
-        dist.barrier()
+        dist.barrier(group=gloo_group)
 
         # 2. Snapshot weights (hash) before any sync
         log0("  [2] snapshot weight hashes...")
@@ -364,26 +355,26 @@ def main() -> None:
         # 3. Build CPU cache
         log0("  [3] building CPU bucket cache...")
         cache = build_cpu_cache(model)
-        dist.barrier()
+        dist.barrier(group=gloo_group)
 
         # 4. Measure VRAM release after offloading model
         log0("  [4] measuring VRAM release after offload...")
         measure_memory_release(model, local_rank)
-        dist.barrier()
+        dist.barrier(group=gloo_group)
 
-        # 5. Selective sync: rank 0 → ranks 2,3
-        log0("  [5] selective sync via gloo...")
+        # 5. Selective sync: rank 0 → ranks 2,3 via NCCL group [0,2,3]
+        log0("  [5] selective sync via NCCL [0,2,3]...")
         received = selective_sync(cache, step, gloo_group)
 
         # 6. Bit-exact hash verification
         log0("  [6] verifying bit-exact transmission...")
         verify_transmission(snapshot, received, step)
-        dist.barrier()
+        dist.barrier(group=gloo_group)
 
         # 7. Reload model on training ranks for next step
         if local_rank in TRAIN_RANKS and model is not None:
             model = model.to(f"cuda:{local_rank}")
-        dist.barrier()
+        dist.barrier(group=gloo_group)
 
         log0(f"STEP {step} COMPLETE")
 
