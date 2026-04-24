@@ -28,7 +28,7 @@ GPU hardware used for testing: Vast.ai instance 35236058, 4× RTX A5000
 | 2026-04-24 | `is_lora: bool = False` added to `update_parameter_in_bucket` and `broadcast_parameter` |
 | 2026-04-24 | Trajectory collector injected from `grpo.py` into pipeline via `set_trajectory_collector` |
 | 2026-04-24 | All `vllm_generation.py` pass-through methods now await sub-worker futures before returning (phase barrier fix) |
-| 2026-04-24 | Receiver uses `unpack_bucket_record()` (from `bucket_cache.py`) — eliminates inline tensor reconstruction in `vllm_backend.py` |
+| 2026-04-24 | Receiver uses `unpack_bucket_record()` for `cpu_serialize` path; `cuda_ipc` path reconstructs inline from the GPU buffer (no CPU roundtrip) |
 | 2026-04-24 | Old `2 × bucket_size_bytes` RAM guard removed from `ModelUpdateService.__init__` (superseded by per-model check in `build_latest_bucket_cache`) |
 | 2026-04-24 | Port claim now released AFTER receiver-side NCCL teardown (was before); failure intentionally leaks claim (spec lines 380-389) |
 | 2026-04-24 | Phase list in doc corrected — `finalize_weight_update` is pipeline-owned, not a ModelUpdateService phase |
@@ -295,8 +295,9 @@ it lazily via `_get_trajectory_collector()` and calls `set_weight_version.remote
 
 | Item | Status |
 |------|--------|
-| Same-GPU CUDA IPC receiver (`"cuda_ipc"` transport) | **IMPLEMENTED** (2026-04-24). Sender sends IPC handle; receiver uses `rebuild_cuda_tensor` for zero-copy. Test: `test_gate2_5_cuda_ipc.py`. Remaining gap: ZMQ IPC path (used by ROLL's ping-pong buffering) not yet ported — the current CUDA IPC path goes through Ray RPC, not ZMQ. |
+| Same-GPU CUDA IPC via ZMQ (ping-pong buffering) | Deferred. The current `cuda_ipc` path sends IPC handles via Ray RPC (works correctly). ROLL's original uses ZMQ sockets for ping-pong double buffering to overlap communication. ZMQ not installed in the NeMo RL environment; Ray RPC achieves equivalent result without ZMQ. |
 | `wake_up_partial()` / `activate_dp_ranks()` in `_expand_workers` | Deferred to Feature 2. These `VllmGeneration` sleep/wake methods are not yet implemented. Current code uses ROLL's `expand_sampler(skip_load=True)` for the equivalent routing-activation effect. |
+| `_cache_ready_step` publication under sender `_cache_lock` | Architectural constraint: `_cache_lock` is on the training worker Ray actor; `_cache_ready_step` is in `BucketCacheLifecycle` on the pipeline actor. These are in different Ray processes — they cannot share the same lock. The spec intent (prevent concurrent build racing sync) is achieved: `_cache_lock` covers the full transport window, and `mark_promoted` is called after the transport completes. |
 
 ### Known intentional extras (code does more than spec requires)
 
