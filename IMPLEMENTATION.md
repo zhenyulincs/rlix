@@ -33,6 +33,9 @@ GPU hardware used for testing: Vast.ai instance 35236058, 4× RTX A5000
 | 2026-04-24 | Port claim now released AFTER receiver-side NCCL teardown (was before); failure intentionally leaks claim (spec lines 380-389) |
 | 2026-04-24 | Phase list in doc corrected — `finalize_weight_update` is pipeline-owned, not a ModelUpdateService phase |
 | 2026-04-24 | Trajectory collector named as Ray actor (`rlix:trajectory_collector:{pipeline_id}`) in `grpo.py`; pipeline resolves it lazily by name via `_get_trajectory_collector()` |
+| 2026-04-24 | **F6.3 IMPLEMENTED**: cuda_ipc sender sends IPC handle via `get_handle_from_tensor`; receiver uses `self.rank` (not `dist.get_rank()`) + zero-copy `rebuild_cuda_tensor` (no CPU roundtrip) |
+| 2026-04-24 | **F4.4 IMPLEMENTED**: `build_latest_bucket_cache` raises `RuntimeError` for single tensor > `bucket_size_bytes` before append |
+| 2026-04-24 | **F6.6 ordering FIXED**: `set_weight_version` called BEFORE `expand_sampler` in `_expand_workers` (spec lines 602-608) |
 
 ---
 
@@ -224,11 +227,15 @@ NOTE: finalize_weight_update is NOT called inside ModelUpdateService.
 `selective_sync_active_cache` accepts `model_update_transport` (default `"cpu_serialize"`).
 The sender passes this to `update_parameter_in_bucket.remote(payload, local_ranks, model_update_transport)`.
 
-**Current receiver support**: only `"cpu_serialize"` is implemented in `vllm_backend.py`
-(copies the CPU uint8 bucket into the infer worker's state dict). The `"cuda_ipc"` path is
-wired on the sender side but **not yet implemented** on the receiver. Setting
-`RLIX_MODEL_UPDATE_TRANSPORT=cuda_ipc` will cause the receiver to fall back or error until
-receiver-side CUDA IPC support is added.
+**Both `"cpu_serialize"` and `"cuda_ipc"` are now implemented end-to-end** (2026-04-24):
+
+- `"cpu_serialize"`: payload contains `cpu_uint8_bucket` (CPU uint8 tensor). Receiver
+  uses `pin_memory().to(device)` DMA then unpacks via `unpack_bucket_record`.
+- `"cuda_ipc"`: sender calls `get_handle_from_tensor(staging_buf)` to produce a CUDA IPC
+  handle tuple; payload contains `cuda_ipc_handle`. Receiver calls
+  `rebuild_cuda_tensor(*ipc_args)` for zero-copy GPU tensor reconstruction (no CPU roundtrip).
+  Rank mask uses `self.rank` (vLLM worker local rank), not `dist.get_rank()`.
+  Required for colocated workers (NCCL cannot form a group on the same GPU, spec line 316).
 
 ### `finalize_weight_update` — pipeline-owned (spec: nemorl-port-plan.md line 624-632)
 
@@ -262,12 +269,15 @@ injection path (fallback when env vars are unavailable).
 Spec (nemorl-port-plan.md lines 589-609): sync must complete before routing is activated.
 Correct order implemented:
 ```
-1. sync_selected_workers(tgt_dp_ranks)          ← weights land before ranks become routable
-2. finalize_weight_update on synced ranks        ← pipeline-owned post-bucket hook
-3. expand_sampler(dp_ranks, skip_load=True)      ← rebalance_on_expand → routing active
-4. _current_weight_version = cache_ready_step
-5. trajectory_collector.set_weight_version(v)   ← resolved via named Ray actor
+1. sync_selected_workers(tgt_dp_ranks)           ← weights land before ranks become routable
+2. finalize_weight_update on synced ranks         ← pipeline-owned post-bucket hook
+3. _current_weight_version = cache_ready_step
+4. trajectory_collector.set_weight_version(v)    ← BEFORE routing activation (spec lines 602-608)
+5. expand_sampler(dp_ranks, skip_load=True)       ← rebalance_on_expand → routing active
 ```
+Note: set_weight_version is called BEFORE expand_sampler (fixed 2026-04-24). Previously it
+was after, which meant newly expanded ranks could serve requests before the collector saw
+the correct weight version.
 Note: `mark_dp_ranks_inactive` / `wake_up_partial` / `activate_dp_ranks` are Feature 2
 methods not yet implemented; `expand_sampler(skip_load=True)` provides the equivalent
 routing-activation effect via ROLL's scheduler.
@@ -285,7 +295,7 @@ it lazily via `_get_trajectory_collector()` and calls `set_weight_version.remote
 
 | Item | Status |
 |------|--------|
-| Same-GPU CUDA IPC receiver (`"cuda_ipc"` transport) | Deferred. Receiver only supports `"cpu_serialize"`. CUDA IPC requires vllm_backend changes when sender and receiver share a physical GPU. Not a correctness issue when no colocated GPUs exist (all cross-GPU setups use NCCL). |
+| Same-GPU CUDA IPC receiver (`"cuda_ipc"` transport) | **IMPLEMENTED** (2026-04-24). Sender sends IPC handle; receiver uses `rebuild_cuda_tensor` for zero-copy. Test: `test_gate2_5_cuda_ipc.py`. Remaining gap: ZMQ IPC path (used by ROLL's ping-pong buffering) not yet ported — the current CUDA IPC path goes through Ray RPC, not ZMQ. |
 | `wake_up_partial()` / `activate_dp_ranks()` in `_expand_workers` | Deferred to Feature 2. These `VllmGeneration` sleep/wake methods are not yet implemented. Current code uses ROLL's `expand_sampler(skip_load=True)` for the equivalent routing-activation effect. |
 
 ### Known intentional extras (code does more than spec requires)
