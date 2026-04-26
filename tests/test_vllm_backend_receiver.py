@@ -89,7 +89,13 @@ def _make_torch_stub():
                 return t
             raise NotImplementedError
 
-        def to(self, device):
+        def pin_memory(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def to(self, device, non_blocking=False):
             return self
 
         def sum(self):

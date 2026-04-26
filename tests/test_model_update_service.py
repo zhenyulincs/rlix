@@ -229,6 +229,7 @@ def _make_svc(mod, ray_stub, src_devices_by_rank, tgt_devices_by_rank, tgt_dp_ra
     svc._master_addr_by_src_rank = {}
     svc._timeout_s = None
     svc._pg_timeout_s = None
+    svc.model_update_transport = "cpu_serialize"
 
     # Patch _get_master_addr and get_free_port
     svc._get_master_addr = MagicMock(return_value="127.0.0.1")
@@ -259,6 +260,8 @@ def test_build_comm_plan_ipc_when_same_gpu(monkeypatch):
     assert len(plan_entry["ipc_targets"]) == 1
     assert plan_entry["ipc_targets"][0]["dp_rank"] == 0
     assert tgt_ranks_in_group == []  # No NCCL group needed for IPC-only
+    assert plan_entry["sync_id"] == "s1"
+    assert plan_entry["model_update_transport"] == "cpu_serialize"
 
 
 def test_build_comm_plan_broadcast_when_different_gpu(monkeypatch):
@@ -278,6 +281,8 @@ def test_build_comm_plan_broadcast_when_different_gpu(monkeypatch):
     assert plan_entry["ipc_targets"] == []
     assert 0 in plan_entry["broadcast_local_ranks_by_dp_rank"]
     assert tgt_ranks_in_group == [0]
+    assert plan_entry["sync_id"] == "s2"
+    assert plan_entry["model_update_transport"] == "cpu_serialize"
 
 
 # ---------------------------------------------------------------------------

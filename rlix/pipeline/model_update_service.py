@@ -251,6 +251,10 @@ class ModelUpdateService:
             ipc_targets=ipc_targets,
             # Per-worker broadcast local rank masks so owner knows which ranks joined NCCL.
             broadcast_local_ranks_by_dp_rank=broadcast_local_ranks_by_dp_rank,
+            # Transport mode and sync_id forwarded via comm_plan so they reach the NeMo
+            # strategy without requiring the ROLL worker wrapper to accept them as parameters.
+            model_update_transport=self.model_update_transport,
+            sync_id=sync_id,
         )
         comm_plan = {src_rank: comm_plan_args}
         return comm_plan, group_name, sorted(tgt_ranks_in_group)
@@ -376,7 +380,6 @@ class ModelUpdateService:
                         tgt_device_mapping=tgt_device_mapping,
                         tgt_num_gpus_per_worker=int(tgt_num_gpus_per_worker),
                         adapters_to_sync=adapters_to_sync,
-                        model_update_transport=self.model_update_transport,
                     )
                 )
             sync_results = self._ray_get_with_timeout(
