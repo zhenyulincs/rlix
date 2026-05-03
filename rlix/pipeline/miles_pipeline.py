@@ -343,7 +343,7 @@ class MilesPipeline:
                     args=args,
                     num_nodes=int(getattr(args, "actor_num_nodes", 1)),
                     num_gpus_per_node=int(getattr(args, "actor_num_gpus_per_node", 1)),
-                    pg=pgs["train"],
+                    pg=pgs["actor"],
                     num_gpus_per_actor=0.01,  # RLix mode: tiny reservation, real isolation via PG + CVD
                     role="actor",
                     with_ref=(getattr(args, "kl_coef", 0) != 0 or getattr(args, "use_kl_loss", False)),
