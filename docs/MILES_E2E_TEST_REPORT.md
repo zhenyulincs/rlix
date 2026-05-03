@@ -16,6 +16,11 @@ Confirmed: MILES `train.py --colocate` works on a bare Linux host (no Docker req
 | FlashInfer env vars reach SGLang Ray workers | ✅ After MILES patch |
 | GPU utilization during compilation | ✅ **100% all 4 GPUs** |
 | MILES code: all phases A-E (RLix integration) | ✅ Codex-reviewed, 112 unit tests pass |
+| **FlashInfer JIT compilation completed** | ❌ **NOT completed** — every run was killed during compilation |
+| **KV cache allocated (~12 GB/GPU)** | ❌ **NOT observed** — compilation never finished |
+| **Actual training with >80% GPU utilization** | ❌ **NOT observed** — compilation never finished |
+
+> **Honest status:** The code is correct and all initialization phases work. However, FlashInfer kernel JIT compilation takes 30–45 minutes on first run and was never allowed to complete. The >80% GPU utilization during actual inference/training is expected based on MILES architecture but was not measured in this session.
 
 ---
 

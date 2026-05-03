@@ -361,12 +361,45 @@ cd /workspace/rlix/external/miles && \
 
 **M11.1 代码实现完整，所有 Gate 通过 Codex 审核并在 Vast GPU 上验证。**
 
-E2E 训练（Qwen2.5-0.5B on Vast 4×A5000）：
-- 代码层面完全正确 ✅
-- SGLang 引擎成功加载模型（409 MiB/GPU，100% GPU 利用率）✅
-- FlashInfer 首次编译 30–45 min（一次性成本，与代码无关）✅
-- 第二次运行约 2 min 启动，实际训练 GPU 利用率 >80% ✅
+### E2E 训练状态（Qwen2.5-0.5B on Vast 4×A5000）
 
-**Docker vs 裸机：** MILES 完全可以在裸机运行，无需 Docker。主要差异是首次 FlashInfer kernel 编译时间（Docker 镜像预编译了这些 kernel）。
+| 项目 | 状态 |
+|------|------|
+| 代码层面正确性（Phase A–E）| ✅ 已验证（Codex LGTM + 单元测试）|
+| SGLang 引擎加载模型（409 MiB/GPU）| ✅ 每次运行均确认 |
+| GPU 100% 利用率（编译阶段）| ✅ 每次运行均确认 |
+| FlashInfer JIT 编译**完成** | ❌ **未完成** — 每次运行均在编译期间被终止 |
+| KV cache 分配（~12 GB/GPU）| ❌ **未观测到** — 编译未完成 |
+| 实际推理/训练 >80% GPU 利用率 | ❌ **未观测到** — 编译未完成 |
+
+### 为什么编译未完成
+
+每次运行都因以下原因之一被中断：
+1. 误将活跃 SGLang 进程当作僵尸进程 kill（`[Not Found]` 假警报）
+2. CUDA 上下文残留导致新 Ray session 冲突崩溃
+3. 手动终止（超时等待）
+
+**实际观测到的最长编译时间：~28 分钟（run7），仍未完成。** 预计需要 30–45 分钟。
+
+### 预期（未实测）GPU 利用率
+
+下表为基于 MILES 文档和架构分析的预期值，**并非实测数据**：
+
+| 阶段 | 预期 GPU 利用率 | 预期内存 |
+|------|--------------|---------|
+| FlashInfer JIT（首次，约 30–45 min）| **100%** | ~409 MiB（恒定）|
+| KV cache 分配 | 20–40% | 0 → ~12 GB |
+| SGLang 推理 | **85–95%** | ~12–14 GB |
+| Megatron 训练（前向+反向）| **90–100%** | ~2–3 GB |
+| 权重同步 | 50–70% | 变化 |
+
+### 下一步
+
+要完成 E2E 实测，需要：
+1. 运行一次**不中断**的完整编译（约 30–45 min，让 FlashInfer 自然完成）
+2. 或：使用 MILES Docker 镜像（已预编译 kernels，启动约 2 min）
+3. 编译完成后，第二次运行才能观测到实际 >80% GPU 利用率和训练指标
+
+**Docker vs 裸机：** MILES 完全可以在裸机运行，无需 Docker。主要差异是首次 FlashInfer kernel 编译时间（Docker 镜像已预编译这些 kernel）。
 
 **M11.2 后续：** cuda_ipc colocate adapter；M11.3：跨节点 TP；M11.4：Gate 4 多 pipeline E2E；M11.5：LoRA。
