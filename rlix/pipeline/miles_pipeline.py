@@ -331,15 +331,50 @@ class MilesPipeline:
 
             train_init_succeeded = False
             try:
-                # Steps 1b-5: create RayTrainGroup, init, build cache, offload.
-                # Implemented in Phase C when cpu_bucket_cache is available.
-                # For Phase A smoke-test, we record that steps would happen here.
-                logger.info(
-                    "[MilesPipeline] initialize_pipeline Phase 1 stub: "
-                    "train alloc succeeded. Phase C will fill Steps 1b-5. "
-                    "pipeline_id=%s", self._pipeline_id
+                from miles.ray.actor_group import RayTrainGroup
+                from miles.utils.async_utils import run
+                from miles.ray.placement_group import create_placement_groups
+
+                # Step 1b: Create RayTrainGroup.
+                # Phase E: RLix mode uses MilesPlacementProvider.get_train_workers() instead of create_placement_groups.
+                # Phase C (first build): use standalone placement_groups as placeholder.
+                pgs = create_placement_groups(args)
+                self.actor_train = RayTrainGroup(
+                    args=args,
+                    num_nodes=int(getattr(args, "actor_num_nodes", 1)),
+                    num_gpus_per_node=int(getattr(args, "actor_num_gpus_per_node", 1)),
+                    pg=pgs["train"],
+                    num_gpus_per_actor=0.01,  # RLix mode: tiny reservation, real isolation via PG + CVD
+                    role="actor",
+                    with_ref=(getattr(args, "kl_coef", 0) != 0 or getattr(args, "use_kl_loss", False)),
                 )
+
+                # Step 2: init (loads model to GPU).
+                run(self.actor_train.init())
+
+                # Step 3: onload (wake if init auto-slept; needed for cache build).
+                if getattr(args, "offload_train", False):
+                    run(self.actor_train.onload())
+
+                # Step 4: build base CPU bucket cache (GPU has weights; all ranks gather).
+                run(self.actor_train.build_cpu_bucket_cache(step=-1))
+                self._cache_ready_step = -1
+
+                # Step 5: offload training GPU + destroy NCCL groups (partial overlap: release overlap GPUs).
+                run(self.actor_train.offload())
+
                 train_init_succeeded = True
+
+            except Exception:
+                # M4: on failure, hard-kill train actors before finally release.
+                if self.actor_train is not None:
+                    for h in getattr(self.actor_train, "_actor_handles", []):
+                        try:
+                            ray.kill(h, no_restart=True)
+                        except Exception:
+                            pass
+                    self.actor_train = None
+                raise
             finally:
                 if not train_init_succeeded and self.actor_train is not None:
                     for h in getattr(self.actor_train, "_actor_handles", []):
@@ -373,8 +408,19 @@ class MilesPipeline:
             # ----------------------------------------------------------------
             actor_infer_allocated = False
             try:
-                # Step 6.5 + Steps 7-10: implemented in Phase C / Phase E.
-                # For Phase A smoke-test, request infer GPUs and bootstrap active set.
+                from miles.ray.placement_group import create_placement_groups, create_rollout_manager
+                from miles.utils.async_utils import run
+
+                # Step 6.5: collect cache owner actor handle (must run before infer allocation).
+                roles = run(self.actor_train.collect_cache_owner_roles())
+                # roles: list of (global_rank, is_owner, actor_handle)
+                cache_owner_handles = [(r, h) for r, is_owner, h in roles if is_owner]
+                assert len(cache_owner_handles) == 1, (
+                    f"Expected exactly 1 cache owner (pp0+dp0+tp0+cp0); got {len(cache_owner_handles)}"
+                )
+                _, self._cache_owner_actor = cache_owner_handles[0]
+
+                # Step 7: request actor_infer GPUs (GENERATION priority; long-lived allocation).
                 allocated_infer_gpus = self._request_cluster_gpus(
                     cluster_id=self._actor_infer_cluster_id,
                     priority=Priority.GENERATION,
@@ -382,25 +428,45 @@ class MilesPipeline:
                 )
                 actor_infer_allocated = True
 
-                gpus_per_engine = int(args.rollout_num_gpus_per_engine)
                 n_infer = int(args.rollout_num_gpus)
+                gpus_per_engine = int(args.rollout_num_gpus_per_engine)
                 engine_count = n_infer // gpus_per_engine
-                # M1: assert full GENERATION allocation.
+                # M1: assert full GENERATION allocation (partial allocation bootstrap = follow-up).
                 expected_infer_gpus = set(range(n_infer))
                 assert set(allocated_infer_gpus) == expected_infer_gpus, (
                     f"M1: first build requires full GENERATION allocation; "
-                    f"got {sorted(allocated_infer_gpus)} vs declared {sorted(expected_infer_gpus)}. "
-                    f"Partial allocation subset bootstrap is a follow-up."
+                    f"got {sorted(allocated_infer_gpus)} vs declared {sorted(expected_infer_gpus)}."
                 )
 
-                # Step 10: bootstrap coordinator active engine set.
+                # Step 8: create RolloutManager (Phase E: use MilesPlacementProvider; Phase C: standalone).
+                from miles.ray.rollout import RolloutManager as _RolloutManager
+                pgs = create_placement_groups(args)
+                self.actor_infer = _RolloutManager.options(
+                    namespace=get_pipeline_namespace(self._pipeline_id),
+                    name=f"rlix:rollout_manager:{self._pipeline_id}",
+                ).remote(args, pgs["rollout"])
+
+                # Step 9: engine_count sanity check.
+                actual_count = ray.get(self.actor_infer.get_engine_count.remote())
+                assert actual_count == engine_count, (
+                    f"RolloutManager engine_count mismatch: got {actual_count}, expected {engine_count}"
+                )
+
+                # Initialize engine lifecycle map for F2 sleep/wake.
+                ray.get(self.actor_infer.initialize_rlix_engine_map.remote())
+
+                # Step 10: bootstrap coordinator active set + register model update resources.
                 coordinator = self._get_coordinator_handle()
                 ray.get(coordinator.bootstrap_active_engines.remote(set(range(engine_count))))
+                ray.get(coordinator.register_model_update_resources.remote(
+                    cache_owner_actor=self._cache_owner_actor,
+                    rollout_manager=self.actor_infer,
+                ))
 
                 logger.info(
-                    "[MilesPipeline] initialize_pipeline Phase 2 stub complete. "
-                    "engine_count=%d pipeline_id=%s (Phase C fills Steps 6.5/8/9/10 fully)",
-                    engine_count, self._pipeline_id,
+                    "[MilesPipeline] initialize_pipeline complete. "
+                    "engine_count=%d cache_ready_step=%d pipeline_id=%s",
+                    engine_count, self._cache_ready_step, self._pipeline_id,
                 )
 
             except Exception:
@@ -461,22 +527,116 @@ class MilesPipeline:
         ray.get(self.actor_infer.shrink_engines.remote(engine_indices))
 
     def expand_engines(self, engine_indices: List[int]) -> None:
-        """Wake overlap engines + sync weights + activate routing (Phase B/C)."""
-        if self.actor_infer is None:
-            raise RuntimeError(
-                f"expand_engines called before actor_infer initialized. "
-                f"pipeline_id={self._pipeline_id!r}"
-            )
-        ray.get(self.actor_infer.expand_engines.remote(engine_indices))
+        """Wake overlap engines + sync weights + finalize + version publish + activate routing (F5+6)."""
+        self._expand_workers(engine_indices)
 
     def _after_training(self, step: int) -> None:
-        """Post-training hook: build cache → offload → active refresh → version publish (Phase C)."""
-        raise NotImplementedError(
-            f"_after_training is implemented in Phase C. step={step} pipeline_id={self._pipeline_id!r}"
+        """Post-training hook (F5+6):
+          1. build_cpu_bucket_cache(step) — all ranks gather, cache owner stores
+          2. _cache_ready_step = step
+          3. offload training GPU + destroy NCCL groups
+          4. sync_base_weights_to_active → active refresh for non-overlap engines
+          5. finalize_weight_update on synced engines
+          6. version publish + notify_release_cluster_gpus(actor_train)
+
+        Ordering invariant: notify_release_cluster_gpus MUST be after sync+finalize
+        to ensure active engines have consistent weights before GPU is released.
+        """
+        from miles.utils.async_utils import run
+
+        # Step 1-2: build cache (all ranks participate in HF gather).
+        run(self.actor_train.build_cpu_bucket_cache(step))
+        self._cache_ready_step = step
+
+        # Step 3: offload overlap GPUs + destroy Megatron NCCL groups.
+        run(self.actor_train.offload())
+
+        # Step 4: active refresh — push to non-overlap engines that are still serving.
+        coordinator = self._get_coordinator_handle()
+        synced_engines: List[int] = ray.get(coordinator.sync_base_weights_to_active.remote())
+
+        # Step 5: finalize_weight_update on synced engines (pipeline-owned, per spec §F5+6).
+        if synced_engines:
+            finalize_refs = [
+                self.actor_infer.finalize_engine.remote(idx)
+                for idx in synced_engines
+            ]
+            ray.get(finalize_refs)
+
+        # Step 6: version publish.
+        self._current_weight_version = self._cache_ready_step
+        if self.actor_infer is not None:
+            ray.get(self.actor_infer.set_weight_version.remote(self._current_weight_version))
+
+        # Release actor_train GPUs to scheduler (must be AFTER sync+finalize).
+        self._notify_release_cluster_gpus(
+            cluster_id=self._actor_train_cluster_id,
+            global_step=step,
+        )
+        logger.info(
+            "[MilesPipeline] _after_training complete step=%d version=%d pipeline_id=%s",
+            step, self._current_weight_version, self._pipeline_id,
+        )
+
+    def _expand_workers(self, engine_indices: List[int]) -> None:
+        """Expand path (F5+6): wake engines → sync weights → finalize → version publish → activate routing.
+
+        Version validation: confirms the cache version matches `_cache_ready_step` before
+        syncing — prevents a newly woken engine from receiving a stale or inconsistent cache.
+
+        Called by resize_infer when coordinator receives dp_ranks_to_add from scheduler.
+        Version publish must happen BEFORE routing activates (spec §F5+6 ordering).
+        """
+        if self.actor_infer is None:
+            raise RuntimeError(f"_expand_workers called before actor_infer initialized. pipeline_id={self._pipeline_id!r}")
+
+        # Version validation: confirm cache is consistent before syncing.
+        if self._cache_ready_step is None:
+            raise RuntimeError(
+                f"_expand_workers called before cache is built (cache_ready_step is None). "
+                f"pipeline_id={self._pipeline_id!r}"
+            )
+        actual_cache_step = ray.get(self._cache_owner_actor.get_cache_ready_step.remote())
+        if actual_cache_step != self._cache_ready_step:
+            raise RuntimeError(
+                f"Cache version mismatch: pipeline expects _cache_ready_step={self._cache_ready_step} "
+                f"but cache owner reports {actual_cache_step}. "
+                f"Sync state inconsistency. pipeline_id={self._pipeline_id!r}"
+            )
+
+        # F2: wake engines (resume_memory_occupation + enable router admission).
+        ray.get(self.actor_infer.wake_partial.remote(engine_indices))
+
+        # Sync weights from CPU cache to newly-woken engines.
+        coordinator = self._get_coordinator_handle()
+        import uuid as _uuid
+        sync_id = f"{self._pipeline_id}_expand_{_uuid.uuid4().hex[:8]}"
+        # MilesModelUpdateService.sync_selected_workers handles transport routing.
+        svc_name = f"rlix:miles_model_update_service:{self._pipeline_id}"
+        namespace = get_pipeline_namespace(self._pipeline_id)
+        svc = ray.get_actor(svc_name, namespace=namespace)
+        ray.get(svc.sync_selected_workers.remote(
+            sync_id=sync_id,
+            tgt_engine_indices=engine_indices,
+        ))
+
+        # Finalize weight update on newly-synced engines.
+        finalize_refs = [self.actor_infer.finalize_engine.remote(idx) for idx in engine_indices]
+        ray.get(finalize_refs)
+
+        # Version publish BEFORE routing activates (spec ordering invariant).
+        if self._current_weight_version is not None:
+            ray.get(self.actor_infer.set_weight_version.remote(
+                self._current_weight_version, engine_indices
+            ))
+
+        logger.info(
+            "[MilesPipeline] _expand_workers complete engines=%s version=%s pipeline_id=%s",
+            engine_indices, self._current_weight_version, self._pipeline_id,
         )
 
     def _finalize_weight_update(self, engine_indices: List[int]) -> None:
-        """Call finalize_weight_update on each target engine (Phase C)."""
+        """Call finalize_weight_update on each target engine."""
         if self.actor_infer is None:
             return
         refs = [
