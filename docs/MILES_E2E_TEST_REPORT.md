@@ -2,7 +2,17 @@
 
 ## Summary
 
-Confirmed: MILES `train.py --colocate` works on a bare Linux host (no Docker required). The code is correct. All initialization phases succeed. The blocker is a first-run FlashInfer kernel JIT compilation that takes **30–45 minutes** on a fresh machine. This is standard ML framework behavior (vLLM/FlashInfer on first boot) and has nothing to do with the MILES or RLix code.
+**Root cause of all E2E failures: wrong installation method.**
+
+MILES official documentation explicitly states: *"we strongly recommend users to use our latest Docker image, which comes pre-configured with all dependencies."* The Docker image contains **patched versions of SGLang and Megatron-LM** that pip-installed versions do not have. Using bare-metal pip installs caused:
+
+1. FlashInfer JIT compilation on first run takes **30–45 minutes** (Docker image has pre-compiled kernels → ~2 min startup)
+2. Residual CUDA zombie contexts from `kill -9` (Docker provides clean isolation)
+3. Missing SGLang patches from MILES' `external/sglang/3rdparty/`
+
+**Correct approach on Vast.ai:** Create an instance using `radixark/miles:latest` as the base image, not a bare Ubuntu instance.
+
+The MILES and RLix code is correct — the issue was entirely the installation method.
 
 ---
 

@@ -1,5 +1,30 @@
 # Vast.ai Setup Guide — MILES RLix Integration Tests
 
+> **重要：** MILES 官方文档要求使用 Docker 镜像（`radixark/miles:latest`），因为其中包含 sglang 和 Megatron 的 **临时补丁**，这些补丁在 pip 安装版本中不存在。在 Vast.ai 上正确的做法是在创建实例时选择 MILES Docker 镜像作为基础镜像，而非裸 Ubuntu 实例。
+
+## 正确的 Vast.ai 实例配置（使用 MILES Docker 镜像）
+
+在 Vast.ai 控制台搜索实例时，在 "Image" 字段填写：
+
+```
+radixark/miles:latest
+```
+
+创建命令（使用 vastai CLI）：
+```bash
+vastai create instance <OFFER_ID> \
+  --image radixark/miles:latest \
+  --disk 80 \
+  --env '-e PYTHONBUFFERED=16 -e PYTHONPATH=/root/Megatron-LM' \
+  --args '--ipc=host --shm-size=16g'
+```
+
+这样 SSH 进去后 miles、sglang（含补丁）、Megatron-LM 已全部预装，无需手动安装。
+
+---
+
+## 为什么裸机安装失败
+
 ## Hardware
 
 | Field | Value |
@@ -13,17 +38,34 @@
 | Driver | 535.54.03 |
 | SSH | `ssh -i ~/.ssh/general_private_key -p 45678 root@ssh9.vast.ai` (check `vastai ssh-url <id>` after each start) |
 
-## One-Time Environment Setup
+## 裸机安装失败的原因
+
+MILES 内部维护了 sglang 和 Megatron-LM 的**临时补丁**：
+- `external/sglang/3rdparty/` 中有针对 cpu_serialize 路径、weight sync 的补丁
+- Megatron-LM 使用 `radixark/Megatron-LM@miles-main` 分支（非 NVIDIA 官方）
+- sglang 使用特定版本，而非 PyPI 最新版
+
+裸机手动安装（pip install sglang）得到的是未打补丁版本，导致：
+1. FlashInfer JIT 在首次运行时需要编译 20+ 个 CUDA kernel，耗时 30–45 分钟
+2. Docker 镜像已预编译这些 kernel，启动仅需 ~2 分钟
+
+---
+
+## One-Time Environment Setup (Using MILES Docker Image)
 
 ```bash
-# Activate working Python venv (has torch 2.9.1+cu128)
-source /root/rlix/.venv/bin/activate
+# SSH into instance using MILES Docker image
+# Inside the container:
+cd /root/miles
+git pull  # update to latest miles
+pip install -e . --no-deps  # update miles without touching deps
 
-# Get SSH connection info
-vastai ssh-url 35236058
+# Clone rlix
+cd /root && git clone https://github.com/zhenyulincs/rlix.git
+cd rlix && git checkout task11-miles-rlix
 ```
 
-### Step 1 — Clone rlix and initialize submodules
+### Step 1 — Clone rlix and initialize submodules (legacy bare-metal, not recommended)
 ```bash
 cd /workspace
 git clone https://github.com/zhenyulincs/rlix.git rlix_test

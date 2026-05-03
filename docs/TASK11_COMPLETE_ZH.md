@@ -228,9 +228,54 @@ wrapper: Ray auto-deref → bytes → `/dev/shm/miles_cpu_bucket_{uuid}.pt` → 
 
 ---
 
-## 8. Vast 裸机配置指南
+## 8. Vast 配置指南（正确方式：使用 MILES Docker 镜像）
 
-### 实例信息
+### 为什么裸机安装失败
+
+MILES 官方文档明确说明：
+> "我们强烈建议用户使用我们的最新 Docker 镜像，其中预配置了所有依赖项"
+
+原因：MILES 内部对 sglang 和 Megatron-LM 有**临时补丁**（存放在 `external/sglang/3rdparty/`），这些补丁只在 Docker 镜像中存在，pip 安装的版本不包含。裸机安装的 sglang 在首次运行时需要编译 20+ 个 CUDA kernel（30–45 min），而 Docker 镜像已预编译。
+
+### 正确的 Vast.ai 实例配置
+
+在 Vast.ai 上创建实例时，**选择 MILES Docker 镜像作为基础镜像**：
+
+```bash
+# vastai CLI 创建实例
+vastai create instance <OFFER_ID> \
+  --image radixark/miles:latest \
+  --disk 80 \
+  --env '-e PYTHONBUFFERED=16'
+```
+
+SSH 进去后 miles、sglang（含补丁）、Megatron-LM 已全部预装。
+
+### 在 Docker 实例内运行 RLix 集成
+
+```bash
+# 更新 miles
+cd /root/miles && git pull && pip install -e . --no-deps
+
+# 克隆 rlix
+cd /root && git clone https://github.com/zhenyulincs/rlix.git
+cd rlix && git checkout task11-miles-rlix
+git submodule update --init external/miles
+
+# 启动 Ray
+ray start --head --num-gpus=4 --disable-usage-stats
+
+# 运行 RLix + MILES 集成测试（参见 run_miles_rlix.py）
+export PYTHONPATH=/root/Megatron-LM:/root/miles
+export RLIX_CONTROL_PLANE=rlix
+python examples/rlix/run_miles_rlix.py \
+  --model-path /root/Qwen2.5-0.5B \
+  --actor-num-gpus-per-node 2 \
+  --rollout-num-gpus 4 --rollout-num-gpus-per-engine 2 \
+  ...
+```
+
+### 实例信息（旧裸机实例，仅参考）
 
 - ID：35236058
 - GPU：4× NVIDIA RTX A5000（24 GB each）
