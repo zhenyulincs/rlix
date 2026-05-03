@@ -68,6 +68,8 @@ output/
 external/*
 !external/ROLL
 !external/NeMo
+!external/miles
+!external/sglang
 
 ## Internal / personal files (not for release)
 #CLAUDE.md
