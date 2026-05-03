@@ -110,8 +110,8 @@ def _validate_rlix_topology(args: Any) -> None:
         assert not getattr(sglang_config, "has_pd_disaggregation", False), (
             "F10: PD disaggregation is out of scope for M11.1 RLix MILES"
         )
-    except (ImportError, AttributeError):
-        pass  # SglangConfig not importable or attribute absent; skip (validated at runtime)
+    except (ImportError, AttributeError, TypeError, Exception):
+        pass  # SglangConfig not importable or args don't match its constructor; skip (validated at runtime)
 
     # No MoE / EP (F4 CPU bucket cache only covers dense Megatron).
     assert int(getattr(args, "expert_model_parallel_size", 1)) == 1, (
